@@ -1,0 +1,28 @@
+[package]
+name = "rust-rb"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+description = "High-performance SPSC and MPSC ring buffers with selectable wait strategies. A faithful Rust port of cpp-fastchan."
+license = "MIT"
+repository = "https://github.com/geseq/rust-rb"
+readme = "README.md"
+keywords = ["spsc", "mpsc", "ringbuffer", "queue", "lockfree"]
+categories = ["concurrency", "data-structures"]
+
+[lib]
+name = "rust_rb"
+path = "src/lib.rs"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[profile.bench]
+lto = true
+codegen-units = 1
+
+[[example]]
+name = "bench"
+path = "examples/bench.rs"
