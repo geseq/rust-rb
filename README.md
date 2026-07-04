@@ -163,7 +163,10 @@ use std::os::fd::AsFd;
 let fd = memfd("my-ring")?;
 // SAFETY: the region is only accessed by cooperating rust-rb handles.
 let (mut tx, rx) = unsafe { BytesRingBuffer::create_shm(fd.as_fd(), 1 << 20)? };
-// hand the fd to another process; it attaches its half:
+// create_shm returns (and leases) BOTH halves; release the one the peer
+// will own, then hand the fd over so it can attach:
+drop(rx);
+// in the peer process:
 // let mut rx = unsafe { BytesRingBuffer::attach_shm_consumer(fd.as_fd())? };
 ```
 
@@ -171,12 +174,19 @@ let (mut tx, rx) = unsafe { BytesRingBuffer::create_shm(fd.as_fd(), 1 << 20)? };
 - The region carries a validated header (magic/version/ring kind/element
   size/architecture/capacity, cursor sanity) — accidents are rejected;
   adversarial peers are out of scope, hence the `unsafe` constructors.
-- **Crash recovery**: each side leases its role (pid) in the header. If a
-  process dies, `recover_shm` reclaims the dead leases and returns both
-  halves with *everything published still intact and drainable* — a record
-  only becomes visible through the producer's single `Release` cursor store,
-  so a mid-write crash just leaves an invisible partial record whose space is
-  reused. Verified by a child-process crash test in `tests/shm.rs`.
+- **Crash recovery**: each side holds an opaque lease token in the header
+  (released on drop, guarded so stale handles can't revoke a successor).
+  Recovery is an explicit, unconditional takeover — the caller asserts the
+  previous holder is gone (liveness is knowledge only the application has;
+  pids are namespace-relative and deliberately not used):
+  `force_attach_shm_producer`/`_consumer` replace one dead side while the
+  peer keeps running, `recover_shm` takes over both. Everything published is
+  intact and drainable — a record only becomes visible through the
+  producer's single `Release` cursor store, so a mid-write crash leaves an
+  invisible partial record whose space is reused. Consumer-side recovery is
+  **at-least-once**: up to the deferred-publish window (`capacity / 8`, max
+  4096 bytes / 64 elements) of already-consumed messages may be delivered
+  again. Verified by a child-process crash test in `tests/shm.rs`.
 - Only the spin wait strategies (`CrossProcess`) are allowed: `CvWait`'s
   mutex/condvar are process-local.
 - Element rings require `T: ShmItem` (plain data, valid for peer-written bit

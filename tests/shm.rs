@@ -10,7 +10,7 @@
 use std::os::fd::{AsFd, AsRawFd};
 
 use rust_rb::spsc_bytes::BytesRingBuffer;
-use rust_rb::wait::PauseWait;
+use rust_rb::wait::{PauseWait, YieldWait};
 use rust_rb::{memfd, RingBuffer};
 
 #[test]
@@ -91,14 +91,6 @@ fn attach_validates_and_leases_conflict() {
     let err = unsafe { RingBuffer::<u64>::attach_shm_consumer(fd.as_fd()) };
     assert!(err.is_err());
 
-    // Recovery must refuse while the holders are alive.
-    // SAFETY: cooperating handles only.
-    let err = match unsafe { BytesRingBuffer::recover_shm(fd.as_fd()) } {
-        Err(e) => e,
-        Ok(_) => panic!("recovery must refuse while holders are alive"),
-    };
-    assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
-
     drop(tx);
     drop(rx);
 
@@ -116,6 +108,10 @@ fn attach_validates_and_leases_conflict() {
 #[test]
 fn crash_recovery_drains_everything_published() {
     let fd = memfd("rb-crash-recovery").unwrap();
+    // memfd() sets close-on-exec by default; this child is the intended
+    // inheritor, so clear it for this one fd.
+    // SAFETY: valid fd; clearing FD_CLOEXEC is benign.
+    unsafe { libc::fcntl(fd.as_fd().as_raw_fd(), libc::F_SETFD, 0) };
 
     let status = std::process::Command::new(std::env::current_exe().unwrap())
         .arg("--exact")
@@ -147,16 +143,17 @@ fn crash_recovery_drains_everything_published() {
 }
 
 /// Not a real test: the crash-recovery child. Runs only when the parent
-/// spawns this binary with the env var set; ignored otherwise.
+/// spawns this binary with the env var set; a plain `--include-ignored` run
+/// without the variable is a silent no-op.
 #[test]
 #[ignore = "child-process entry for crash_recovery_drains_everything_published"]
 fn crash_child_entry() {
     use std::os::fd::{FromRawFd, OwnedFd};
 
-    let fd_num: i32 = std::env::var("RUST_RB_SHM_CHILD_FD")
-        .expect("child entry requires RUST_RB_SHM_CHILD_FD")
-        .parse()
-        .expect("fd number");
+    let Ok(fd_var) = std::env::var("RUST_RB_SHM_CHILD_FD") else {
+        return; // not spawned by the parent test
+    };
+    let fd_num: i32 = fd_var.parse().expect("fd number");
     // SAFETY: the parent passed this inherited, open memfd.
     let fd = unsafe { OwnedFd::from_raw_fd(fd_num) };
 
@@ -169,4 +166,64 @@ fn crash_child_entry() {
     // set to our (soon dead) pid, deferred consumer state is irrelevant, and
     // only the producer's published cursor matters.
     std::process::exit(0);
+}
+
+/// Recovery is an unconditional takeover, and the guarded lease release
+/// means the *old* handles' drops cannot revoke the new holder's leases.
+#[test]
+fn recover_is_force_and_old_drops_cannot_revoke() {
+    let fd = memfd("rb-force-recover").unwrap();
+    // SAFETY: fresh private memfd.
+    let (mut old_tx, old_rx) = unsafe { BytesRingBuffer::create_shm(fd.as_fd(), 4096) }.unwrap();
+    old_tx.push(b"before");
+
+    // Force-recover while the old handles are still alive (the unsafe
+    // contract normally forbids this; here the "old holders" cooperate by
+    // never touching the ring again).
+    // SAFETY: the old handles are not used after this point.
+    let (mut tx, mut rx) = unsafe { BytesRingBuffer::recover_shm(fd.as_fd()) }.unwrap();
+    assert_eq!(&*rx.pop(), b"before", "published data survives recovery");
+
+    // Old handles drop AFTER the takeover: their guarded release must not
+    // free the new tokens...
+    drop(old_tx);
+    drop(old_rx);
+    // ...so attaching still conflicts with the (new) live holders.
+    // SAFETY: cooperating handles only.
+    assert!(
+        unsafe { BytesRingBuffer::<PauseWait, PauseWait>::attach_shm_producer(fd.as_fd()) }
+            .is_err(),
+        "guarded release: stale drops must not revoke the recovered leases"
+    );
+
+    tx.push(b"after");
+    assert_eq!(&*rx.pop(), b"after");
+}
+
+/// Single-side takeover: the producer "crashes" (its handle is leaked, the
+/// lease stays set) while the consumer keeps running; force_attach replaces
+/// just the producer role.
+#[test]
+fn force_attach_replaces_dead_producer_single_side() {
+    let fd = memfd("rb-force-single").unwrap();
+    // SAFETY: fresh private memfd.
+    let (mut tx, mut rx) = unsafe { BytesRingBuffer::create_shm(fd.as_fd(), 4096) }.unwrap();
+    tx.push(b"from-old-producer");
+    std::mem::forget(tx); // simulated crash: lease left set, no drop
+
+    // A polite attach refuses (the lease looks held)...
+    // SAFETY: cooperating handles only.
+    assert!(
+        unsafe { BytesRingBuffer::<PauseWait, PauseWait>::attach_shm_producer(fd.as_fd()) }
+            .is_err()
+    );
+    // ...the force attach takes over, publishing resumes seamlessly.
+    // SAFETY: the old producer is gone (leaked, never used again).
+    let mut tx2 =
+        unsafe { BytesRingBuffer::<YieldWait, YieldWait>::force_attach_shm_producer(fd.as_fd()) }
+            .unwrap();
+    tx2.push(b"from-new-producer");
+
+    assert_eq!(&*rx.pop(), b"from-old-producer");
+    assert_eq!(&*rx.pop(), b"from-new-producer");
 }

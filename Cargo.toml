@@ -14,6 +14,9 @@ categories = ["concurrency", "data-structures"]
 name = "rust_rb"
 path = "src/lib.rs"
 
+[package.metadata.docs.rs]
+all-features = true
+
 [features]
 # Shared-memory-backed rings (Linux): memfd/mmap constructors, leases,
 # crash recovery. Adds a `libc` dependency; no effect on other targets.
