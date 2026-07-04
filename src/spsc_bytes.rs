@@ -40,7 +40,9 @@
 use std::cell::UnsafeCell;
 use std::ptr::NonNull;
 
-use crate::cursor::{channel, shared_is_empty, ConsumerCore, ProducerCore};
+use crate::cursor::{
+    channel, publish_batch, shared_is_empty, ConsumerCore, ProducerCore, SlotCleanup,
+};
 use crate::wait::{WaitStrategy, YieldWait};
 
 /// The buffer word type: `u64` so the base is 8-aligned (a `Box<[u8]>`
@@ -52,6 +54,15 @@ use crate::wait::{WaitStrategy, YieldWait};
 /// instant UB over uninitialized memory. Zeroing costs one pass at
 /// construction and nothing on the hot path.
 type Word = UnsafeCell<u64>;
+
+// The byte ring's slots are plain words with nothing to drop, and its cursors
+// are byte-granular, so the engine's teardown slot-walk is skipped.
+impl SlotCleanup for Word {
+    const NEEDS_CLEANUP: bool = false;
+
+    #[inline]
+    unsafe fn cleanup(&self) {}
+}
 
 /// Size of the length header preceding each payload.
 const HEADER: usize = 4;
@@ -100,21 +111,11 @@ unsafe fn decode_record(base: *const u8, mask: usize, mut cur: usize) -> (usize,
     (cur, len, unsafe { base.add(pos + HEADER) })
 }
 
-/// The deferred-publish bound for the consumer's adaptive publish (see
-/// `Msg::drop`): `capacity / 8` bytes, clamped to 4096 — the byte-ring analog
-/// of `spsc::publish_batch`'s 64-element cap, bounding the absolute amount of
-/// freed-but-unpublished space a blocked producer can be waiting behind.
-#[inline(always)]
-const fn publish_batch_bytes(capacity: usize) -> usize {
-    let batch = capacity / 8;
-    if batch == 0 {
-        1
-    } else if batch > 4096 {
-        4096
-    } else {
-        batch
-    }
-}
+/// The byte ring's clamp for the shared publish-batch policy: at most 4096
+/// bytes of deferred, already-consumed progress — bounding the absolute
+/// amount of freed-but-unpublished space a blocked producer can be waiting
+/// behind.
+const MAX_PUBLISH_BATCH_BYTES: usize = 4096;
 
 #[inline(always)]
 const fn max_message_len(capacity: usize) -> usize {
@@ -464,11 +465,13 @@ where
     /// `f` sees it, and progress is published even if `f` panics, so an
     /// unwound drain never re-delivers already-processed messages.
     pub fn drain<F: FnMut(&[u8])>(&mut self, mut f: F) -> usize {
-        let end = if self.core.has_item() {
-            self.core.write_cursor_cache
-        } else {
+        // Unconditionally refresh the view of the producer's cursor: the
+        // contract is "everything currently in the ring", which a stale
+        // non-empty cache must not bound.
+        let end = self.core.refresh();
+        if end.wrapping_sub(self.core.read_cursor) == 0 {
             return 0;
-        };
+        }
 
         // Publish on exit — including an unwind out of `f`.
         struct FlushOnDrop<'a, P: WaitStrategy, C: WaitStrategy>(&'a mut BytesConsumer<P, C>);
@@ -582,7 +585,18 @@ impl<P: WaitStrategy, C: WaitStrategy> Drop for Msg<'_, P, C> {
         // and the clamp bounds how much freed space a blocked producer can
         // transiently not see.
         let c = &mut self.consumer.core;
-        let batch = publish_batch_bytes(c.capacity());
-        c.advance(record_len(self.len), batch);
+        let capacity = c.capacity();
+        // Watermark = capacity / 2: a byte producer blocks whenever
+        // contiguous space runs short (free < pad + record), which can happen
+        // well below exactly full — and the frame decoder consumes wrap
+        // padding into the cursor before this advance, further skewing plain
+        // occupancy. Records are capped at capacity / 2, so any blocked
+        // producer implies occupancy above this watermark, guaranteeing the
+        // immediate release the engine's liveness rule promises.
+        c.advance(
+            record_len(self.len),
+            publish_batch(capacity, MAX_PUBLISH_BATCH_BYTES),
+            capacity / 2,
+        );
     }
 }

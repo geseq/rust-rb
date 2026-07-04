@@ -1,1 +1,2 @@
 {"id":"int-e65bb54a","kind":"field_change","created_at":"2026-07-04T13:24:45.503425307Z","actor":"geseq","issue_id":"rust-rb-qtt","extra":{"field":"status","new_value":"closed","old_value":"in_progress","reason":"Closed"}}
+{"id":"int-bce21b0a","kind":"field_change","created_at":"2026-07-04T15:24:08.009339372Z","actor":"geseq","issue_id":"rust-rb-088","extra":{"field":"status","new_value":"closed","old_value":"open","reason":"Closed"}}

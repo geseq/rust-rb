@@ -55,11 +55,36 @@ impl<T> SlotCleanup for UnsafeCell<MaybeUninit<T>> {
     }
 }
 
-impl SlotCleanup for UnsafeCell<u64> {
-    const NEEDS_CLEANUP: bool = false;
+/// The deferred-publish bound for the adaptive publish: `capacity / 8`
+/// cursor units, clamped to `[1, max_batch]`. Each ring picks its own
+/// `max_batch` (64 elements for the fixed ring, 4096 bytes for the byte
+/// ring) — one policy, per-ring constants.
+#[inline(always)]
+pub(crate) const fn publish_batch(capacity: usize, max_batch: usize) -> usize {
+    let batch = capacity / 8;
+    if batch == 0 {
+        1
+    } else if batch > max_batch {
+        max_batch
+    } else {
+        batch
+    }
+}
 
-    #[inline]
-    unsafe fn cleanup(&self) {}
+/// The wrap-safe fullness predicate: would writing `needed` more units past
+/// `write` overrun a `capacity`-unit ring whose consumer has read up to
+/// `read`? The single source of truth for "full" (used by the space check
+/// and the producer wait predicate).
+#[inline(always)]
+const fn lacks_space(write: usize, needed: usize, read: usize, capacity: usize) -> bool {
+    write.wrapping_add(needed).wrapping_sub(read) > capacity
+}
+
+/// The wrap-safe emptiness predicate (used by the item check and the
+/// consumer wait predicate).
+#[inline(always)]
+const fn no_item(write: usize, read: usize) -> bool {
+    write.wrapping_sub(read) == 0
 }
 
 /// The state both handles share, kept alive by an `Arc`.
@@ -134,12 +159,12 @@ where
 
     // Cache the constants each side needs on its hot path. These `NonNull`s
     // stay valid for as long as the `Arc<Shared>` the core holds is alive.
-    let buf = unsafe { NonNull::new_unchecked(inner.buffer.as_ptr().cast_mut()) };
+    // The buffer pointer is derived from the whole-slice `as_ptr` (not a
+    // first-element reference) so it keeps provenance over every slot.
+    let buf = NonNull::new(inner.buffer.as_ptr().cast_mut()).expect("buffer is non-null");
     let mask = inner.mask;
-    let next_free =
-        unsafe { NonNull::new_unchecked((&*inner.write_cursor as *const AtomicUsize).cast_mut()) };
-    let reader =
-        unsafe { NonNull::new_unchecked((&*inner.read_cursor as *const AtomicUsize).cast_mut()) };
+    let next_free = NonNull::from(&*inner.write_cursor);
+    let reader = NonNull::from(&*inner.read_cursor);
 
     (
         ProducerCore {
@@ -202,20 +227,10 @@ where
     #[inline(always)]
     pub(crate) fn has_space(&mut self, needed: usize) -> bool {
         let capacity = self.mask + 1;
-        if self
-            .write_cursor
-            .wrapping_add(needed)
-            .wrapping_sub(self.read_cursor_cache)
-            > capacity
-        {
+        if lacks_space(self.write_cursor, needed, self.read_cursor_cache, capacity) {
             // SAFETY: `reader` is a `NonNull` into the live `inner`.
             self.read_cursor_cache = unsafe { (*self.reader.as_ptr()).load(Ordering::Acquire) };
-            if self
-                .write_cursor
-                .wrapping_add(needed)
-                .wrapping_sub(self.read_cursor_cache)
-                > capacity
-            {
+            if lacks_space(self.write_cursor, needed, self.read_cursor_cache, capacity) {
                 return false;
             }
         }
@@ -227,11 +242,16 @@ where
     #[inline(always)]
     pub(crate) fn wait_for_space(&mut self, needed: usize) {
         while !self.has_space(needed) {
-            let target = self.write_cursor.wrapping_add(needed);
+            let write = self.write_cursor;
             let capacity = self.mask + 1;
             let reader = self.reader.as_ptr();
             self.inner.producer_wait.wait(|| {
-                target.wrapping_sub(unsafe { (*reader).load(Ordering::Acquire) }) <= capacity
+                !lacks_space(
+                    write,
+                    needed,
+                    unsafe { (*reader).load(Ordering::Acquire) },
+                    capacity,
+                )
             });
         }
     }
@@ -251,6 +271,15 @@ where
     #[inline(always)]
     pub(crate) fn capacity(&self) -> usize {
         self.mask + 1
+    }
+
+    /// Pointer to the slot the write cursor designates. `cursor & mask` is
+    /// always in `0..capacity`, so the pointer is in bounds without a bounds
+    /// check; the caller must have confirmed the slot is free before writing.
+    #[inline(always)]
+    pub(crate) fn slot_ptr(&self) -> *mut B {
+        // SAFETY: in bounds by masking; `buf` is a live allocation.
+        unsafe { self.buf.as_ptr().add(self.write_cursor & self.mask) }
     }
 }
 
@@ -304,14 +333,25 @@ where
     /// cursor at most once.
     #[inline(always)]
     pub(crate) fn has_item(&mut self) -> bool {
-        if self.write_cursor_cache.wrapping_sub(self.read_cursor) == 0 {
-            // SAFETY: `next_free` is a `NonNull` into the live `inner`.
-            self.write_cursor_cache = unsafe { (*self.next_free.as_ptr()).load(Ordering::Acquire) };
-            if self.write_cursor_cache.wrapping_sub(self.read_cursor) == 0 {
+        if no_item(self.write_cursor_cache, self.read_cursor) {
+            self.refresh();
+            if no_item(self.write_cursor_cache, self.read_cursor) {
                 return false;
             }
         }
         true
+    }
+
+    /// Unconditionally reload the cached view of the producer's cursor
+    /// (`Acquire`) and return it. `drain`-style batch consumers need this:
+    /// `has_item` alone skips the reload while the stale cache still shows
+    /// items, which must not bound a "consume everything currently here"
+    /// operation.
+    #[inline(always)]
+    pub(crate) fn refresh(&mut self) -> usize {
+        // SAFETY: `next_free` is a `NonNull` into the live `inner`.
+        self.write_cursor_cache = unsafe { (*self.next_free.as_ptr()).load(Ordering::Acquire) };
+        self.write_cursor_cache
     }
 
     /// Spin/park (per the consumer wait strategy) until data arrives.
@@ -320,9 +360,9 @@ where
         while !self.has_item() {
             let read_cursor = self.read_cursor;
             let next_free = self.next_free.as_ptr();
-            self.inner.consumer_wait.wait(|| {
-                unsafe { (*next_free).load(Ordering::Acquire) }.wrapping_sub(read_cursor) != 0
-            });
+            self.inner
+                .consumer_wait
+                .wait(|| !no_item(unsafe { (*next_free).load(Ordering::Acquire) }, read_cursor));
         }
     }
 
@@ -334,10 +374,18 @@ where
     /// ring is full. So the publish rule adapts to the regime the consumer
     /// can already see for free:
     ///
-    /// * **Was full** (occupancy per the latest view == capacity): publish
-    ///   immediately so a producer blocked on a full ring is released by the
-    ///   first consume that sees it. This fires once per cursor-reload cycle,
-    ///   not per element, so it does not reintroduce the ping-pong.
+    /// * **Observed over the full watermark** (occupancy per the latest view
+    ///   exceeds `full_watermark`): publish immediately so a producer blocked
+    ///   for space is released by the first consume that observes the
+    ///   pressure. The fixed ring passes `mask` (fires only at exactly full,
+    ///   once per cursor-reload cycle — no ping-pong). The byte ring passes
+    ///   `capacity / 2`: its producer blocks whenever contiguous space runs
+    ///   out (`free < pad + record`, which can happen well below exactly
+    ///   full, and wrap padding consumed by the frame decoder further skews
+    ///   plain occupancy), and since records are capped at `capacity / 2`,
+    ///   any blocked byte producer implies occupancy above that watermark —
+    ///   its publishes above the watermark are per-message, which the
+    ///   bandwidth-bound byte ring absorbs without measurable cost.
     /// * **Caught up** (the ring looks empty after this consume): publish
     ///   immediately — the line is uncontended, and this is the
     ///   latency-sensitive regime. Identical to the per-element publish of
@@ -355,10 +403,11 @@ where
     /// until the consumer's next flush (at most `batch` units of consumption
     /// away, or the consumer catching up or dropping).
     #[inline(always)]
-    pub(crate) fn advance(&mut self, amount: usize, batch: usize) {
-        let was_full = self.write_cursor_cache.wrapping_sub(self.read_cursor) > self.mask;
+    pub(crate) fn advance(&mut self, amount: usize, batch: usize, full_watermark: usize) {
+        let over_watermark =
+            self.write_cursor_cache.wrapping_sub(self.read_cursor) > full_watermark;
         self.read_cursor = self.read_cursor.wrapping_add(amount);
-        if was_full
+        if over_watermark
             || self.read_cursor == self.write_cursor_cache
             || self.read_cursor.wrapping_sub(self.published) >= batch
         {
@@ -405,6 +454,14 @@ where
     #[inline(always)]
     pub(crate) fn capacity(&self) -> usize {
         self.mask + 1
+    }
+
+    /// Pointer to the slot the read cursor designates (in bounds by masking;
+    /// see `ProducerCore::slot_ptr`).
+    #[inline(always)]
+    pub(crate) fn slot_ptr(&self) -> *mut B {
+        // SAFETY: in bounds by masking; `buf` is a live allocation.
+        unsafe { self.buf.as_ptr().add(self.read_cursor & self.mask) }
     }
 }
 

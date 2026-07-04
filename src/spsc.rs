@@ -42,7 +42,8 @@ use std::mem::MaybeUninit;
 use std::sync::Arc;
 
 use crate::cursor::{
-    channel, shared_is_empty, shared_is_full, shared_len, ConsumerCore, ProducerCore, Shared,
+    channel, publish_batch, shared_is_empty, shared_is_full, shared_len, ConsumerCore,
+    ProducerCore, Shared,
 };
 use crate::wait::{WaitStrategy, YieldWait};
 
@@ -50,22 +51,9 @@ use crate::wait::{WaitStrategy, YieldWait};
 /// ordered by the cursor atomics.
 type Slot<T> = UnsafeCell<MaybeUninit<T>>;
 
-/// The deferred-publish bound for the consumer's adaptive publish:
-/// `capacity / 8`, clamped to `[1, 64]`. Large enough to amortize the release
-/// store and keep a full-queue producer off the consumer's cache line, small
-/// enough that the producer never sees more than 12.5% of the buffer as
-/// phantom occupancy.
-#[inline(always)]
-const fn publish_batch(capacity: usize) -> usize {
-    let batch = capacity / 8;
-    if batch == 0 {
-        1
-    } else if batch > 64 {
-        64
-    } else {
-        batch
-    }
-}
+/// The fixed ring's clamp for the shared publish-batch policy: at most 64
+/// elements of deferred, already-consumed progress.
+const MAX_PUBLISH_BATCH: usize = 64;
 
 /// Builder/namespace for constructing an SPSC ring buffer.
 ///
@@ -177,23 +165,13 @@ where
         Some(WriteSlot { producer: self })
     }
 
-    /// Pointer to the slot the write cursor designates.
-    ///
-    /// `index & mask` is always in `0..capacity`, so the pointer is in
-    /// bounds; skipping the bounds check keeps the hot path branch-free, as
-    /// in the C++ `contents_[i & mask]`. The caller must have confirmed the
-    /// slot is free before writing through it.
+    /// Pointer to the slot the write cursor designates. The caller must have
+    /// confirmed the slot is free before writing through it.
     #[inline(always)]
     fn slot(&self) -> *mut MaybeUninit<T> {
-        // SAFETY: in bounds, see above; `buf` is a live allocation.
-        unsafe {
-            (*self
-                .core
-                .buf
-                .as_ptr()
-                .add(self.core.write_cursor & self.core.mask))
-            .get()
-        }
+        // SAFETY: the core hands back an in-bounds slot pointer; `get` on the
+        // `UnsafeCell` is how the single producer accesses its storage.
+        unsafe { (*self.core.slot_ptr()).get() }
     }
 
     /// Common tail of `push`/`try_push`: store the value and publish it.
@@ -342,19 +320,11 @@ where
         Some(PopRef { consumer: self })
     }
 
-    /// Pointer to the slot the read cursor designates (in bounds by masking;
-    /// see `Producer::slot`).
+    /// Pointer to the slot the read cursor designates.
     #[inline(always)]
     fn slot(&self) -> *mut MaybeUninit<T> {
-        // SAFETY: in bounds; `buf` is a live allocation.
-        unsafe {
-            (*self
-                .core
-                .buf
-                .as_ptr()
-                .add(self.core.read_cursor & self.core.mask))
-            .get()
-        }
+        // SAFETY: the core hands back an in-bounds slot pointer.
+        unsafe { (*self.core.slot_ptr()).get() }
     }
 
     /// Common tail of `pop`/`try_pop`: move the value out and release the
@@ -373,8 +343,11 @@ where
     /// batched while backed up).
     #[inline(always)]
     fn advance_one(&mut self) {
-        let batch = publish_batch(self.core.capacity());
-        self.core.advance(1, batch);
+        let capacity = self.core.capacity();
+        // Watermark = mask: the immediate flush fires only when the queue was
+        // observed exactly full (a blocked element producer needs one slot).
+        self.core
+            .advance(1, publish_batch(capacity, MAX_PUBLISH_BATCH), capacity - 1);
     }
 
     /// Number of elements currently queued. Exact on this side: uses the
