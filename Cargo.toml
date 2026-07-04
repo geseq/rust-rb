@@ -44,3 +44,8 @@ path = "examples/bench.rs"
 [[example]]
 name = "bench_bytes"
 path = "examples/bench_bytes.rs"
+
+[[example]]
+name = "bench_shm"
+path = "examples/bench_shm.rs"
+required-features = ["shm"]

@@ -197,6 +197,7 @@ drop(rx);
 ```
 cargo run --release --example bench          # fixed-size ring
 cargo run --release --example bench_bytes    # variable-size ring
+cargo run --release --features shm --example bench_shm   # shm rings (Linux)
 ```
 
 For meaningful numbers, pin the producer and consumer to dedicated cores, e.g.
@@ -214,6 +215,13 @@ strategies, saturating producer:
 | `BytesRingBuffer` (cap 64 KiB) | 8 B/msg | ~4.9 ns/msg, ~205 M msgs/s | ~1.6 GB/s |
 | `BytesRingBuffer` (cap 64 KiB) | 64 B/msg | ~13 ns/msg, ~77 M msgs/s | ~5 GB/s |
 | `BytesRingBuffer` (cap 64 KiB) | 256 B/msg | ~27–46 ns/msg, ~25–37 M msgs/s | ~6–9 GB/s |
+| shm `RingBuffer<i64>`, same process | 8 B/element | ~1.13 ns/op, ~880 M msgs/s | — |
+| shm `RingBuffer<i64>`, **cross-process** | 8 B/element | ~1.3–1.7 ns/op, ~580–795 M msgs/s | — |
+| shm `BytesRingBuffer`, **cross-process** | 8 B/msg | ~6.2 ns/msg, ~162 M msgs/s | ~1.3 GB/s |
+
+The shm same-process row matching the heap ring is the point: the backing is
+free (identical hot path, different memory). Cross-process numbers include
+real scheduler/IPC noise and vary more run to run.
 
 The two benchmarks measure different work: the fixed-size ring hands off
 8-byte values (pure queue overhead — the C++ original measures ~2.4 ns/op on
