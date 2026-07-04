@@ -13,13 +13,13 @@
 
 use std::time::Instant;
 
-use rust_rb::spsc::Spsc;
+use rust_rb::spsc::RingBuffer;
 use rust_rb::wait::{NoOpWait, PauseWait, WaitStrategy, YieldWait};
 
 const NUM_ITERATIONS: i64 = 100_000_000;
 const CAPACITY: usize = 32_768;
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn pin(core: usize) {
     // SAFETY: zero-initialising a cpu_set_t and calling the libc affinity
     // helpers with valid arguments is sound.
@@ -31,15 +31,15 @@ fn pin(core: usize) {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
 fn pin(_core: usize) {}
 
-fn run<P, G>(name: &str, cores: Option<(usize, usize)>)
+fn run<P, C>(name: &str, cores: Option<(usize, usize)>)
 where
     P: WaitStrategy + Send + Sync + 'static,
-    G: WaitStrategy + Send + Sync + 'static,
+    C: WaitStrategy + Send + Sync + 'static,
 {
-    let (mut tx, mut rx) = Spsc::<i64, CAPACITY, P, G>::new();
+    let (mut tx, mut rx) = RingBuffer::<i64, P, C>::with_wait_strategies(CAPACITY);
     let consumer_core = cores.map(|(_, c)| c);
 
     let consumer = std::thread::spawn(move || {
@@ -48,7 +48,7 @@ where
         }
         let mut consumed: i64 = 0;
         while consumed < NUM_ITERATIONS {
-            let _ = rx.get();
+            let _ = rx.pop();
             consumed += 1;
         }
     });
@@ -59,14 +59,15 @@ where
 
     let start = Instant::now();
     for i in 0..NUM_ITERATIONS {
-        tx.put(i);
+        tx.push(i);
     }
     consumer.join().unwrap();
     let elapsed = start.elapsed();
 
     let ns_per_op = elapsed.as_nanos() as f64 / NUM_ITERATIONS as f64;
+    let mops = NUM_ITERATIONS as f64 / elapsed.as_secs_f64() / 1e6;
     println!(
-        "{name:<14} {ns_per_op:>5.2} ns/op   {:>5} ms",
+        "{name:<14} {ns_per_op:>5.2} ns/op   {mops:>6.1} M msgs/s   {:>5} ms",
         elapsed.as_millis()
     );
 }
