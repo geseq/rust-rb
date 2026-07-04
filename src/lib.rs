@@ -76,6 +76,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 mod cache_padded;
+mod cursor;
 
 pub mod spsc;
 pub mod spsc_bytes;
