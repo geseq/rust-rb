@@ -9,6 +9,7 @@
 //! CPU and let the caller re-check the loop condition), matching the C++ where
 //! only [`CvWait`] consults the predicate.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
@@ -78,6 +79,10 @@ impl WaitStrategy for NoOpWait {
 pub struct CvWait {
     mutex: Mutex<()>,
     cv: Condvar,
+    /// Set (under the mutex) while the peer is inside [`wait`](Self::wait).
+    /// Lets `notify` skip the mutex entirely on the hot path when nobody is
+    /// parked — which is the overwhelmingly common case.
+    waiting: AtomicBool,
 }
 
 impl Default for CvWait {
@@ -86,6 +91,7 @@ impl Default for CvWait {
         Self {
             mutex: Mutex::new(()),
             cv: Condvar::new(),
+            waiting: AtomicBool::new(false),
         }
     }
 }
@@ -94,19 +100,28 @@ impl WaitStrategy for CvWait {
     #[inline]
     fn wait<P: FnMut() -> bool>(&self, mut pred: P) {
         let guard = self.mutex.lock().unwrap();
+        self.waiting.store(true, Ordering::Release);
         // wait_timeout_while returns immediately if `pred` is already satisfied,
         // mirroring `cv_.wait_for(lock, 100ns, p)`.
         let _ = self
             .cv
             .wait_timeout_while(guard, Duration::from_nanos(100), |_| !pred())
             .unwrap();
+        self.waiting.store(false, Ordering::Release);
     }
 
     #[inline]
     fn notify(&self) {
-        // Take the lock so we never signal between a waiter's predicate check
-        // and its park, which would otherwise be a lost wake-up.
-        let _guard = self.mutex.lock().unwrap();
-        self.cv.notify_all();
+        // Fast path: nobody is parked (or about to park), so there is nothing
+        // to wake and we avoid the mutex altogether. If the waiter is racing
+        // us into `wait` and we read a stale `false`, its predicate re-check
+        // under the lock — or, at worst, the 100 ns timeout — recovers, which
+        // is the same guarantee the C++ original's lock-free notify provides.
+        if self.waiting.load(Ordering::Acquire) {
+            // Take the lock so we never signal between the waiter's predicate
+            // check and its park, which would otherwise be a lost wake-up.
+            let _guard = self.mutex.lock().unwrap();
+            self.cv.notify_all();
+        }
     }
 }
