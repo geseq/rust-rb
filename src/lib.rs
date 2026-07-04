@@ -14,8 +14,8 @@
 //! // Capacity is rounded up to the next power of two (1024 here).
 //! let (mut tx, mut rx) = Spsc::<u64, 1000>::new();
 //!
-//! tx.put(42);
-//! assert_eq!(rx.get(), 42);
+//! tx.push(42);
+//! assert_eq!(rx.pop(), 42);
 //! ```
 //!
 //! Pick wait strategies explicitly (defaults are [`YieldWait`] for both sides,
@@ -26,9 +26,9 @@
 //! use rust_rb::wait::PauseWait;
 //!
 //! let (mut tx, mut rx) = Spsc::<i32, 4096, PauseWait, PauseWait>::new();
-//! assert!(tx.try_put(1).is_ok());
-//! assert_eq!(rx.try_get(), Some(1));
-//! assert_eq!(rx.try_get(), None);
+//! assert!(tx.try_push(1).is_ok());
+//! assert_eq!(rx.try_pop(), Some(1));
+//! assert_eq!(rx.try_pop(), None);
 //! ```
 //!
 //! The producer and consumer move to their respective threads; the buffer lives
@@ -46,10 +46,10 @@
 //! // Capacity is in bytes, rounded up to the next power of two.
 //! let (mut tx, mut rx) = SpscBytes::<4096>::new();
 //!
-//! tx.put(b"tick");
-//! tx.put(b"a longer message");
-//! assert_eq!(&*rx.get(), b"tick");
-//! assert_eq!(&*rx.get(), b"a longer message");
+//! tx.push(b"tick");
+//! tx.push(b"a longer message");
+//! assert_eq!(&*rx.pop(), b"tick");
+//! assert_eq!(&*rx.pop(), b"a longer message");
 //! ```
 //!
 //! [`YieldWait`]: wait::YieldWait

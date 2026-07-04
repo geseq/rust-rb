@@ -5,7 +5,7 @@ Rust. A faithful port of the SPSC queue from
 [`cpp-fastchan`](https://github.com/geseq/cpp-fastchan), keeping every design
 choice that makes the original fast and adding compile-time safety on top.
 
-Gets and puts can each be **blocking** or **non-blocking**, and the blocking
+Pushes and pops can each be **blocking** or **non-blocking**, and the blocking
 wait behaviour is selectable: spin with a CPU pause hint, yield the thread, spin
 with no hint, or park on a condition variable.
 
@@ -17,15 +17,16 @@ use rust_rb::spsc::Spsc;
 // Capacity is rounded up to the next power of two (1024 here).
 let (mut tx, mut rx) = Spsc::<u64, 1000>::new();
 
-tx.put(1);
-tx.put(2);
-tx.put(3);
+tx.push(1);
+tx.push(2);
+tx.push(3);
 
-assert_eq!(rx.get(), 1);
-assert_eq!(rx.get(), 2);
+assert_eq!(rx.pop(), 1);
+assert_eq!(rx.pop(), 2);
 ```
 
-`Spsc::<T, N, Put, Get>::new()` returns a `(Producer, Consumer)` pair. Move each
+`Spsc::<T, N, P, C>::new()` returns a `(Producer, Consumer)` pair (`P`/`C` are
+the producer- and consumer-side wait strategies). Move each
 half to its thread; the buffer lives in a shared `Arc` and is freed when both
 halves drop. Neither half is `Clone`, so the single-producer / single-consumer
 contract — left to the programmer in the C++ original — is enforced by the type
@@ -45,8 +46,8 @@ let (mut tx, mut rx) = Spsc::<i32, 4096, PauseWait, PauseWait>::new();
 
 | Producer            | Consumer             | Behaviour                              |
 | ------------------- | -------------------- | -------------------------------------- |
-| `put(v)`            | `get() -> T`         | block (using the wait strategy)        |
-| `try_put(v) -> Result<(), T>` | `try_get() -> Option<T>` | return immediately when full / empty |
+| `push(v)`            | `pop() -> T`         | block (using the wait strategy)        |
+| `try_push(v) -> Result<(), T>` | `try_pop() -> Option<T>` | return immediately when full / empty |
 
 Both halves also expose `len()`, `is_empty()`, `is_full()`, and `capacity()`.
 
@@ -88,7 +89,7 @@ publish side:
   (max 64) elements while the queue is *backed up*. In the backed-up regime a
   per-element publish lets the polling producer steal the cursor's cache line
   between every store, collapsing both threads into a lockstep line ping-pong;
-  deferring amortizes the transfer and lets the producer put in bursts. On a
+  deferring amortizes the transfer and lets the producer push in bursts. On a
   Grace (Neoverse V2) core pair this takes the saturated spin-strategy
   benchmark from ~135 M to ~860 M msgs/s, roughly twice the C++ original's
   best on the same cores. The trade-off: while (and only while) the queue is
@@ -108,8 +109,8 @@ use rust_rb::spsc_bytes::SpscBytes;
 // Capacity is in *bytes*, rounded up to the next power of two.
 let (mut tx, mut rx) = SpscBytes::<4096>::new();
 
-tx.put(b"tick");                 // copy in
-assert_eq!(&*rx.get(), b"tick"); // zero-copy view, released on drop
+tx.push(b"tick");                 // copy in
+assert_eq!(&*rx.pop(), b"tick"); // zero-copy view, released on drop
 ```
 
 Each message is framed as a 4-byte length header plus the payload, rounded up
@@ -122,8 +123,8 @@ message can always be written eventually, whatever the cursor positions.
 
 | Producer | Consumer | Behaviour |
 | -------- | -------- | --------- |
-| `put(&[u8])` | `get() -> Msg` | block (using the wait strategy) |
-| `try_put(&[u8]) -> bool` | `try_get() -> Option<Msg>` | return immediately when full / empty |
+| `push(&[u8])` | `pop() -> Msg` | block (using the wait strategy) |
+| `try_push(&[u8]) -> bool` | `try_pop() -> Option<Msg>` | return immediately when full / empty |
 | `claim(len)` / `try_claim(len)` | `drain(f) -> usize` | zero-copy write slot / batched consume |
 
 `claim` returns a `WriteSlot` that dereferences to the payload slice, so you

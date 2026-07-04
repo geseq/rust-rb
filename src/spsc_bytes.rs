@@ -22,7 +22,7 @@
 //! (`capacity / 2 - 4` bytes) can always be written eventually, no matter
 //! where the cursors sit. Without the cap, a large message could arrive at an
 //! unlucky offset where padding plus record exceed the whole buffer and never
-//! fit, deadlocking a blocking `put`.
+//! fit, deadlocking a blocking `push`.
 //!
 //! # Why it is fast
 //!
@@ -41,7 +41,7 @@
 //!   so a full-ring producer's polling cannot force a cache-line ping-pong on
 //!   every message;
 //! * zero-copy on both sides: [`claim`](BytesProducer::claim) hands the
-//!   producer a slice to serialize into directly, [`get`](BytesConsumer::get)
+//!   producer a slice to serialize into directly, [`pop`](BytesConsumer::pop)
 //!   hands the consumer a borrowed view of the payload in place, and
 //!   [`drain`](BytesConsumer::drain) consumes every available message with a
 //!   single cursor publish.
@@ -88,7 +88,7 @@ impl<const N: usize> AssertCapacity<N> {
     const NON_ZERO: () = assert!(N > 0, "capacity must be greater than zero");
 }
 
-struct Inner<P, G> {
+struct Inner<P, C> {
     /// The byte buffer, stored as `u64` words so the base is 8-aligned (a
     /// `Box<[u8]>` allocation only guarantees alignment 1). All access goes
     /// through raw `u8` pointers; the words are never read as `u64`s.
@@ -102,35 +102,35 @@ struct Inner<P, G> {
     /// (Acquire).
     read_cursor: CachePadded<AtomicUsize>,
 
-    put_wait: P,
-    get_wait: G,
+    producer_wait: P,
+    consumer_wait: C,
 }
 
 // SAFETY: the buffer bytes are only ever written by the single producer and
 // read by the single consumer, ordered by the atomic cursors, exactly as in
 // `spsc::Inner`. The payload is plain bytes, so there is no `T: Send` to ask.
-unsafe impl<P: Send + Sync, G: Send + Sync> Send for Inner<P, G> {}
-unsafe impl<P: Send + Sync, G: Send + Sync> Sync for Inner<P, G> {}
+unsafe impl<P: Send + Sync, C: Send + Sync> Send for Inner<P, C> {}
+unsafe impl<P: Send + Sync, C: Send + Sync> Sync for Inner<P, C> {}
 
 /// Builder/namespace for constructing a variable-size-message SPSC ring.
 ///
 /// `N` is the requested minimum capacity in **bytes**; the real capacity is
-/// `N` rounded up to the next power of two (and at least 8). `P` and `G` are
-/// the put-side and get-side [`WaitStrategy`]s, as in [`crate::spsc::Spsc`].
-pub struct SpscBytes<const N: usize, P = YieldWait, G = YieldWait>(
-    core::marker::PhantomData<(P, G)>,
+/// `N` rounded up to the next power of two (and at least 8). `P` and `C` are
+/// the push-side and pop-side [`WaitStrategy`]s, as in [`crate::spsc::Spsc`].
+pub struct SpscBytes<const N: usize, P = YieldWait, C = YieldWait>(
+    core::marker::PhantomData<(P, C)>,
 );
 
-impl<const N: usize, P, G> SpscBytes<N, P, G>
+impl<const N: usize, P, C> SpscBytes<N, P, C>
 where
     P: WaitStrategy + Send + Sync,
-    G: WaitStrategy + Send + Sync,
+    C: WaitStrategy + Send + Sync,
 {
     /// Create the ring and return its producer and consumer halves.
     ///
     /// `N == 0` is rejected at compile time.
     #[allow(clippy::new_ret_no_self)] // intentionally returns the producer/consumer pair
-    pub fn new() -> (BytesProducer<P, G>, BytesConsumer<P, G>) {
+    pub fn new() -> (BytesProducer<P, C>, BytesConsumer<P, C>) {
         let () = AssertCapacity::<N>::NON_ZERO;
         let capacity = N.next_power_of_two().max(8);
 
@@ -142,8 +142,8 @@ where
             mask: capacity - 1,
             write_cursor: CachePadded::new(AtomicUsize::new(0)),
             read_cursor: CachePadded::new(AtomicUsize::new(0)),
-            put_wait: P::default(),
-            get_wait: G::default(),
+            producer_wait: P::default(),
+            consumer_wait: C::default(),
         });
 
         // Cache the hot-path constants in each handle, as `spsc` does.
@@ -181,7 +181,7 @@ where
 }
 
 /// The producing half of an [`SpscBytes`]. Owns the private write cursor.
-pub struct BytesProducer<P, G> {
+pub struct BytesProducer<P, C> {
     buf: NonNull<u8>,
     mask: usize,
     /// Our published cursor (cached `NonNull` into `inner`).
@@ -192,16 +192,16 @@ pub struct BytesProducer<P, G> {
     write_cursor: usize,
     /// Cached snapshot of the consumer's `read_cursor`.
     read_cursor_cache: usize,
-    inner: Arc<Inner<P, G>>,
+    inner: Arc<Inner<P, C>>,
 }
 
 // SAFETY: as for `spsc::Producer` — only producer-private state plus atomics.
-unsafe impl<P: Send + Sync, G: Send + Sync> Send for BytesProducer<P, G> {}
+unsafe impl<P: Send + Sync, C: Send + Sync> Send for BytesProducer<P, C> {}
 
-impl<P, G> BytesProducer<P, G>
+impl<P, C> BytesProducer<P, C>
 where
     P: WaitStrategy,
-    G: WaitStrategy,
+    C: WaitStrategy,
 {
     /// Block until there is room, then enqueue a copy of `msg`.
     ///
@@ -210,7 +210,7 @@ where
     /// Panics if `msg.len() > self.max_message_len()` — such a message could
     /// never be sent, so waiting for room would deadlock.
     #[inline]
-    pub fn put(&mut self, msg: &[u8]) {
+    pub fn push(&mut self, msg: &[u8]) {
         let (pad, total) = self.frame(msg.len());
         self.wait_for_space(total);
         // SAFETY: `frame` sized the record and `wait_for_space` confirmed
@@ -226,19 +226,19 @@ where
     /// Panics if `msg.len() > self.max_message_len()`.
     #[inline]
     #[must_use]
-    pub fn try_put(&mut self, msg: &[u8]) -> bool {
+    pub fn try_push(&mut self, msg: &[u8]) -> bool {
         let (pad, total) = self.frame(msg.len());
         if !self.has_space(total) {
             return false;
         }
-        // SAFETY: as in `put`.
+        // SAFETY: as in `push`.
         unsafe { self.write_frame(pad, msg.len(), Some(msg.as_ptr())) };
         true
     }
 
     /// Block until there is room for a `len`-byte message, then return a
     /// [`WriteSlot`] to serialize it into — the zero-copy alternative to
-    /// [`put`](Self::put). The message is published when the slot is
+    /// [`push`](Self::push). The message is published when the slot is
     /// [committed](WriteSlot::commit); dropping the slot uncommitted abandons
     /// the space for reuse by the next claim.
     ///
@@ -246,7 +246,7 @@ where
     ///
     /// Panics if `len > self.max_message_len()`.
     #[inline]
-    pub fn claim(&mut self, len: usize) -> WriteSlot<'_, P, G> {
+    pub fn claim(&mut self, len: usize) -> WriteSlot<'_, P, C> {
         let (pad, total) = self.frame(len);
         self.wait_for_space(total);
         let payload = self.payload_ptr(pad);
@@ -265,7 +265,7 @@ where
     ///
     /// Panics if `len > self.max_message_len()`.
     #[inline]
-    pub fn try_claim(&mut self, len: usize) -> Option<WriteSlot<'_, P, G>> {
+    pub fn try_claim(&mut self, len: usize) -> Option<WriteSlot<'_, P, C>> {
         let (pad, total) = self.frame(len);
         if !self.has_space(total) {
             return None;
@@ -309,7 +309,7 @@ where
     }
 
     /// Check for `total` free bytes, reloading the consumer's cursor at most
-    /// once — the same reload-once shape as `spsc::Producer::try_put`.
+    /// once — the same reload-once shape as `spsc::Producer::try_push`.
     #[inline]
     fn has_space(&mut self, total: usize) -> bool {
         let capacity = self.mask + 1;
@@ -331,7 +331,7 @@ where
             let target = self.write_cursor.wrapping_add(total);
             let capacity = self.mask + 1;
             let reader = self.reader.as_ptr();
-            self.inner.put_wait.wait(|| {
+            self.inner.producer_wait.wait(|| {
                 target <= unsafe { (*reader).load(Ordering::Acquire) }.wrapping_add(capacity)
             });
         }
@@ -374,8 +374,8 @@ where
             (*self.next_free.as_ptr()).store(cur, Ordering::Release);
         }
 
-        // Wake a consumer blocked in `get`. A no-op for the spin strategies.
-        self.inner.get_wait.notify();
+        // Wake a consumer blocked in `pop`. A no-op for the spin strategies.
+        self.inner.consumer_wait.notify();
     }
 
     /// Whether the ring currently holds no messages.
@@ -405,8 +405,8 @@ where
 ///
 /// The slice's initial contents are unspecified (whatever the ring last held
 /// there) — write your message before reading anything back.
-pub struct WriteSlot<'a, P: WaitStrategy, G: WaitStrategy> {
-    producer: &'a mut BytesProducer<P, G>,
+pub struct WriteSlot<'a, P: WaitStrategy, C: WaitStrategy> {
+    producer: &'a mut BytesProducer<P, C>,
     /// Payload start, cached at claim time (the same handle-caching idea as
     /// the cursors: compute `(cursor + pad) & mask` once, not on every deref).
     payload: NonNull<u8>,
@@ -414,7 +414,7 @@ pub struct WriteSlot<'a, P: WaitStrategy, G: WaitStrategy> {
     len: usize,
 }
 
-impl<P: WaitStrategy, G: WaitStrategy> WriteSlot<'_, P, G> {
+impl<P: WaitStrategy, C: WaitStrategy> WriteSlot<'_, P, C> {
     /// Publish the message. Writes the headers and makes the record visible
     /// to the consumer with one `Release` store.
     #[inline]
@@ -429,7 +429,7 @@ impl<P: WaitStrategy, G: WaitStrategy> WriteSlot<'_, P, G> {
     }
 }
 
-impl<P: WaitStrategy, G: WaitStrategy> core::ops::Deref for WriteSlot<'_, P, G> {
+impl<P: WaitStrategy, C: WaitStrategy> core::ops::Deref for WriteSlot<'_, P, C> {
     type Target = [u8];
 
     #[inline]
@@ -440,7 +440,7 @@ impl<P: WaitStrategy, G: WaitStrategy> core::ops::Deref for WriteSlot<'_, P, G> 
     }
 }
 
-impl<P: WaitStrategy, G: WaitStrategy> core::ops::DerefMut for WriteSlot<'_, P, G> {
+impl<P: WaitStrategy, C: WaitStrategy> core::ops::DerefMut for WriteSlot<'_, P, C> {
     #[inline]
     fn deref_mut(&mut self) -> &mut [u8] {
         // SAFETY: as for `deref`.
@@ -449,7 +449,7 @@ impl<P: WaitStrategy, G: WaitStrategy> core::ops::DerefMut for WriteSlot<'_, P, 
 }
 
 /// The consuming half of an [`SpscBytes`]. Owns the private read cursor.
-pub struct BytesConsumer<P, G> {
+pub struct BytesConsumer<P, C> {
     buf: NonNull<u8>,
     mask: usize,
     /// The producer's published cursor (cached `NonNull` into `inner`).
@@ -466,10 +466,10 @@ pub struct BytesConsumer<P, G> {
     published: usize,
     /// Cached snapshot of the producer's `write_cursor`.
     write_cursor_cache: usize,
-    inner: Arc<Inner<P, G>>,
+    inner: Arc<Inner<P, C>>,
 }
 
-impl<P, G> Drop for BytesConsumer<P, G> {
+impl<P, C> Drop for BytesConsumer<P, C> {
     fn drop(&mut self) {
         // Publish any deferred progress so a surviving producer sees the
         // freed bytes. (No `notify`: it would need a `WaitStrategy` bound,
@@ -482,18 +482,18 @@ impl<P, G> Drop for BytesConsumer<P, G> {
 }
 
 // SAFETY: as for `spsc::Consumer`.
-unsafe impl<P: Send + Sync, G: Send + Sync> Send for BytesConsumer<P, G> {}
+unsafe impl<P: Send + Sync, C: Send + Sync> Send for BytesConsumer<P, C> {}
 
-impl<P, G> BytesConsumer<P, G>
+impl<P, C> BytesConsumer<P, C>
 where
     P: WaitStrategy,
-    G: WaitStrategy,
+    C: WaitStrategy,
 {
     /// Block until a message is available, then return a zero-copy view of
     /// it. The message is released (its bytes freed for the producer) when
     /// the returned [`Msg`] drops.
     #[inline]
-    pub fn get(&mut self) -> Msg<'_, P, G> {
+    pub fn pop(&mut self) -> Msg<'_, P, C> {
         while self.read_cursor >= self.write_cursor_cache {
             // SAFETY: `next_free` is a `NonNull` into the live `inner`.
             self.write_cursor_cache = unsafe { (*self.next_free.as_ptr()).load(Ordering::Acquire) };
@@ -501,7 +501,7 @@ where
                 let read_cursor = self.read_cursor;
                 let next_free = self.next_free.as_ptr();
                 self.inner
-                    .get_wait
+                    .consumer_wait
                     .wait(|| read_cursor < unsafe { (*next_free).load(Ordering::Acquire) });
             }
         }
@@ -512,7 +512,7 @@ where
     /// Return the next message without blocking, or `None` if the ring is
     /// empty.
     #[inline]
-    pub fn try_get(&mut self) -> Option<Msg<'_, P, G>> {
+    pub fn try_pop(&mut self) -> Option<Msg<'_, P, C>> {
         if self.read_cursor >= self.write_cursor_cache {
             // SAFETY: `next_free` is a `NonNull` into the live `inner`.
             self.write_cursor_cache = unsafe { (*self.next_free.as_ptr()).load(Ordering::Acquire) };
@@ -529,7 +529,7 @@ where
     /// after the last message — one `Release` store (and one wake-up) for the
     /// whole batch, the cheapest way to drain a busy ring. The flip side is
     /// that the producer sees no space freed until the batch completes, so
-    /// keep `f` short or prefer [`get`](Self::get) when the producer is
+    /// keep `f` short or prefer [`pop`](Self::pop) when the producer is
     /// starved for space.
     pub fn drain<F: FnMut(&[u8])>(&mut self, mut f: F) -> usize {
         // SAFETY: `next_free` is a `NonNull` into the live `inner`.
@@ -568,19 +568,19 @@ where
     }
 
     /// Publish the private read cursor to the shared atomic and wake a
-    /// producer blocked in `put`. The wake-up is a no-op for spin strategies.
+    /// producer blocked in `push`. The wake-up is a no-op for spin strategies.
     #[inline(always)]
     fn flush(&mut self) {
         // SAFETY: `reader` is a `NonNull` into the live `inner`.
         unsafe { (*self.reader.as_ptr()).store(self.read_cursor, Ordering::Release) };
         self.published = self.read_cursor;
-        self.inner.put_wait.notify();
+        self.inner.producer_wait.notify();
     }
 
-    /// Common tail of `get`/`try_get`: availability is already confirmed;
+    /// Common tail of `pop`/`try_pop`: availability is already confirmed;
     /// skip padding and wrap the record at the read cursor.
     #[inline(always)]
-    fn next_msg(&mut self) -> Msg<'_, P, G> {
+    fn next_msg(&mut self) -> Msg<'_, P, C> {
         let base = self.buf.as_ptr();
         let mask = self.mask;
 
@@ -637,8 +637,8 @@ where
 /// Dereferences to the payload bytes, which live in the ring itself. The
 /// message is released — its bytes handed back to the producer and the read
 /// cursor published — when this drops. Copy out anything you need to keep.
-pub struct Msg<'a, P: WaitStrategy, G: WaitStrategy> {
-    consumer: &'a mut BytesConsumer<P, G>,
+pub struct Msg<'a, P: WaitStrategy, C: WaitStrategy> {
+    consumer: &'a mut BytesConsumer<P, C>,
     /// Payload start, cached when the record was framed (the same
     /// handle-caching idea as the cursors: compute `cursor & mask` once, not
     /// on every deref).
@@ -646,7 +646,7 @@ pub struct Msg<'a, P: WaitStrategy, G: WaitStrategy> {
     len: usize,
 }
 
-impl<P: WaitStrategy, G: WaitStrategy> core::ops::Deref for Msg<'_, P, G> {
+impl<P: WaitStrategy, C: WaitStrategy> core::ops::Deref for Msg<'_, P, C> {
     type Target = [u8];
 
     #[inline]
@@ -657,7 +657,7 @@ impl<P: WaitStrategy, G: WaitStrategy> core::ops::Deref for Msg<'_, P, G> {
     }
 }
 
-impl<P: WaitStrategy, G: WaitStrategy> Drop for Msg<'_, P, G> {
+impl<P: WaitStrategy, C: WaitStrategy> Drop for Msg<'_, P, C> {
     #[inline]
     fn drop(&mut self) {
         let c = &mut *self.consumer;
@@ -678,6 +678,6 @@ impl<P: WaitStrategy, G: WaitStrategy> Drop for Msg<'_, P, G> {
 }
 
 #[inline]
-fn is_empty<P, G>(inner: &Inner<P, G>) -> bool {
+fn is_empty<P, C>(inner: &Inner<P, C>) -> bool {
     inner.read_cursor.load(Ordering::Acquire) >= inner.write_cursor.load(Ordering::Acquire)
 }

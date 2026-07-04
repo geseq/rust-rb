@@ -2,7 +2,7 @@
 //!
 //! Pushes `NUM_MESSAGES` payloads of each size through a 64 KiB ring and
 //! reports nanoseconds per message and effective payload bandwidth, for both
-//! the per-message `get` path and the batched `drain` path.
+//! the per-message `pop` path and the batched `drain` path.
 //!
 //! ```text
 //! cargo run --release --example bench_bytes            # unpinned
@@ -32,12 +32,12 @@ fn pin(core: usize) {
 #[cfg(not(unix))]
 fn pin(_core: usize) {}
 
-fn run<P, G>(name: &str, msg_len: usize, drain: bool, cores: Option<(usize, usize)>)
+fn run<P, C>(name: &str, msg_len: usize, drain: bool, cores: Option<(usize, usize)>)
 where
     P: WaitStrategy + Send + Sync + 'static,
-    G: WaitStrategy + Send + Sync + 'static,
+    C: WaitStrategy + Send + Sync + 'static,
 {
-    let (mut tx, mut rx) = SpscBytes::<CAPACITY, P, G>::new();
+    let (mut tx, mut rx) = SpscBytes::<CAPACITY, P, C>::new();
     let consumer_core = cores.map(|(_, c)| c);
 
     let consumer = std::thread::spawn(move || {
@@ -52,7 +52,7 @@ where
             }
         } else {
             while consumed < NUM_MESSAGES {
-                bytes += rx.get().len();
+                bytes += rx.pop().len();
                 consumed += 1;
             }
         }
@@ -66,7 +66,7 @@ where
     let msg = vec![0xa5u8; msg_len];
     let start = Instant::now();
     for _ in 0..NUM_MESSAGES {
-        tx.put(&msg);
+        tx.push(&msg);
     }
     consumer.join().unwrap();
     let elapsed = start.elapsed();
@@ -95,7 +95,7 @@ fn main() {
     // Run twice, as the fixed-size benchmark does, to let caches settle.
     for _ in 0..2 {
         for &len in &[8usize, 64, 256] {
-            run::<PauseWait, PauseWait>("BYTES_Pause_get", len, false, cores);
+            run::<PauseWait, PauseWait>("BYTES_Pause_pop", len, false, cores);
             run::<PauseWait, PauseWait>("BYTES_Pause_drain", len, true, cores);
             run::<NoOpWait, NoOpWait>("BYTES_NoOp_drain", len, true, cores);
         }

@@ -16,9 +16,9 @@ use std::time::Duration;
 /// Behaviour shared by every wait strategy.
 ///
 /// Implementors must be cheap to default-construct: the queue builds one
-/// instance for the put side and one for the get side.
+/// instance for the push side and one for the pop side.
 pub trait WaitStrategy: Default {
-    /// Called while a blocking `put`/`get` is parked waiting for progress.
+    /// Called while a blocking `push`/`pop` is parked waiting for progress.
     ///
     /// `pred` returns `true` once the waited-for condition holds. Spin
     /// strategies ignore it; blocking strategies may use it to avoid lost

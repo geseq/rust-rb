@@ -34,12 +34,12 @@ fn pin(core: usize) {
 #[cfg(not(unix))]
 fn pin(_core: usize) {}
 
-fn run<P, G>(name: &str, cores: Option<(usize, usize)>)
+fn run<P, C>(name: &str, cores: Option<(usize, usize)>)
 where
     P: WaitStrategy + Send + Sync + 'static,
-    G: WaitStrategy + Send + Sync + 'static,
+    C: WaitStrategy + Send + Sync + 'static,
 {
-    let (mut tx, mut rx) = Spsc::<i64, CAPACITY, P, G>::new();
+    let (mut tx, mut rx) = Spsc::<i64, CAPACITY, P, C>::new();
     let consumer_core = cores.map(|(_, c)| c);
 
     let consumer = std::thread::spawn(move || {
@@ -48,7 +48,7 @@ where
         }
         let mut consumed: i64 = 0;
         while consumed < NUM_ITERATIONS {
-            let _ = rx.get();
+            let _ = rx.pop();
             consumed += 1;
         }
     });
@@ -59,7 +59,7 @@ where
 
     let start = Instant::now();
     for i in 0..NUM_ITERATIONS {
-        tx.put(i);
+        tx.push(i);
     }
     consumer.join().unwrap();
     let elapsed = start.elapsed();

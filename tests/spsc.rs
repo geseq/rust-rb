@@ -12,25 +12,25 @@ const ITERATIONS_MULTIPLIER: usize = 100;
 
 /// `chan_size = (iterations / 2) + 1`, matching the C++ test. With
 /// `ITERATIONS == 4096` this rounds up to a capacity of exactly 4096.
-fn make<P, G>() -> (Producer<i32, P, G>, Consumer<i32, P, G>)
+fn make<P, C>() -> (Producer<i32, P, C>, Consumer<i32, P, C>)
 where
     P: WaitStrategy + Send + Sync,
-    G: WaitStrategy + Send + Sync,
+    C: WaitStrategy + Send + Sync,
 {
-    Spsc::<i32, { (ITERATIONS / 2) + 1 }, P, G>::new()
+    Spsc::<i32, { (ITERATIONS / 2) + 1 }, P, C>::new()
 }
 
-fn fill_blocking<P, G>()
+fn fill_blocking<P, C>()
 where
     P: WaitStrategy + Send + Sync,
-    G: WaitStrategy + Send + Sync,
+    C: WaitStrategy + Send + Sync,
 {
-    let (mut tx, rx) = make::<P, G>();
+    let (mut tx, rx) = make::<P, C>();
     assert_eq!(tx.len(), 0);
     assert!(tx.is_empty());
 
     for i in 0..ITERATIONS {
-        tx.put(i as i32);
+        tx.push(i as i32);
         assert_eq!(tx.len(), i + 1);
         assert!(!tx.is_empty());
         if i < ITERATIONS - 1 {
@@ -46,77 +46,77 @@ where
     drop(rx);
 }
 
-fn fill_nonblocking<P, G>()
+fn fill_nonblocking<P, C>()
 where
     P: WaitStrategy + Send + Sync,
-    G: WaitStrategy + Send + Sync,
+    C: WaitStrategy + Send + Sync,
 {
-    let (mut tx, rx) = make::<P, G>();
+    let (mut tx, rx) = make::<P, C>();
     for i in 0..ITERATIONS {
-        assert!(tx.try_put(i as i32).is_ok());
+        assert!(tx.try_push(i as i32).is_ok());
         assert_eq!(tx.len(), i + 1);
     }
-    // Now full: try_put must hand the value back.
-    assert_eq!(tx.try_put(-1), Err(-1));
+    // Now full: try_push must hand the value back.
+    assert_eq!(tx.try_push(-1), Err(-1));
     assert!(tx.is_full());
     drop(rx);
 }
 
-fn put_get_blocking<P, G>()
+fn push_pop_blocking<P, C>()
 where
     P: WaitStrategy + Send + Sync,
-    G: WaitStrategy + Send + Sync,
+    C: WaitStrategy + Send + Sync,
 {
-    let (mut tx, mut rx) = make::<P, G>();
+    let (mut tx, mut rx) = make::<P, C>();
     for i in 0..ITERATIONS {
-        tx.put(i as i32);
+        tx.push(i as i32);
     }
     for i in 0..ITERATIONS {
-        assert_eq!(rx.get(), i as i32);
+        assert_eq!(rx.pop(), i as i32);
     }
     assert!(rx.is_empty());
     assert_eq!(rx.len(), 0);
 }
 
-fn put_get_nonblocking<P, G>()
+fn push_pop_nonblocking<P, C>()
 where
     P: WaitStrategy + Send + Sync,
-    G: WaitStrategy + Send + Sync,
+    C: WaitStrategy + Send + Sync,
 {
-    let (mut tx, mut rx) = make::<P, G>();
+    let (mut tx, mut rx) = make::<P, C>();
     for i in 0..ITERATIONS {
-        while tx.try_put(i as i32).is_err() {}
+        while tx.try_push(i as i32).is_err() {}
     }
     for i in 0..ITERATIONS {
-        let mut v = rx.try_get();
+        let mut v = rx.try_pop();
         while v.is_none() {
-            v = rx.try_get();
+            v = rx.try_pop();
         }
         assert_eq!(v, Some(i as i32));
     }
     assert!(rx.is_empty());
 }
 
-fn multithreaded<P, G>()
+fn multithreaded<P, C>()
 where
     P: WaitStrategy + Send + Sync + 'static,
-    G: WaitStrategy + Send + Sync + 'static,
+    C: WaitStrategy + Send + Sync + 'static,
 {
-    let (mut tx, mut rx) = make::<P, G>();
+    let (mut tx, mut rx) = make::<P, C>();
     let total = (ITERATIONS_MULTIPLIER * ITERATIONS) as i32;
 
     let producer = std::thread::spawn(move || {
         for i in 1..=total {
-            while tx.try_put(i).is_err() {}
+            while tx.try_push(i).is_err() {}
         }
     });
 
     let consumer = std::thread::spawn(move || {
         let mut i = 1;
         while i <= total {
-            let mut v = rx.try_get();
+            let mut v = rx.try_pop();
             while v.is_none() {
-                v = rx.try_get();
+                v = rx.try_pop();
             }
             assert_eq!(v, Some(i));
             i += 1;
@@ -128,16 +128,16 @@ where
     consumer.join().unwrap();
 }
 
-fn exercise<P, G>()
+fn exercise<P, C>()
 where
     P: WaitStrategy + Send + Sync + 'static,
-    G: WaitStrategy + Send + Sync + 'static,
+    C: WaitStrategy + Send + Sync + 'static,
 {
-    fill_blocking::<P, G>();
-    fill_nonblocking::<P, G>();
-    put_get_blocking::<P, G>();
-    put_get_nonblocking::<P, G>();
-    multithreaded::<P, G>();
+    fill_blocking::<P, C>();
+    fill_nonblocking::<P, C>();
+    push_pop_blocking::<P, C>();
+    push_pop_nonblocking::<P, C>();
+    multithreaded::<P, C>();
 }
 
 #[test]
@@ -188,11 +188,11 @@ fn drops_remaining_elements() {
     {
         let (mut tx, mut rx) = Spsc::<Counted, 16>::new();
         for _ in 0..10 {
-            tx.put(Counted(drops.clone()));
+            tx.push(Counted(drops.clone()));
         }
         // Consume 3, leaving 7 in the buffer to be dropped with the queue.
         for _ in 0..3 {
-            drop(rx.get());
+            drop(rx.pop());
         }
         assert_eq!(drops.load(Ordering::Relaxed), 3);
     }
@@ -221,7 +221,7 @@ fn consumer_state_methods() {
 
     // Fill the queue
     for i in 0..16 {
-        tx.put(i);
+        tx.push(i);
     }
 
     // Consumer sees full queue
@@ -230,14 +230,14 @@ fn consumer_state_methods() {
     assert!(rx.is_full());
 
     // Consume one item
-    rx.get();
+    rx.pop();
     assert_eq!(rx.len(), 15);
     assert!(!rx.is_empty());
     assert!(!rx.is_full());
 
     // Empty the queue
     for _ in 0..15 {
-        rx.get();
+        rx.pop();
     }
     assert_eq!(rx.len(), 0);
     assert!(rx.is_empty());
@@ -264,21 +264,21 @@ fn exact_capacity_boundary() {
 
     // Fill exactly to capacity
     for i in 0..4 {
-        tx.put(i);
+        tx.push(i);
     }
 
     // Verify is_full() returns true
     assert!(tx.is_full());
     assert!(rx.is_full());
 
-    // Verify try_put() fails and returns the value
-    assert_eq!(tx.try_put(-1), Err(-1));
+    // Verify try_push() fails and returns the value
+    assert_eq!(tx.try_push(-1), Err(-1));
 
     // Consume one
-    assert_eq!(rx.get(), 0);
+    assert_eq!(rx.pop(), 0);
 
-    // Verify try_put() succeeds
-    assert!(tx.try_put(100).is_ok());
+    // Verify try_push() succeeds
+    assert!(tx.try_push(100).is_ok());
     assert_eq!(tx.len(), 4);
 }
 
@@ -315,12 +315,12 @@ fn non_primitive_types() {
 
     // Move items into the queue
     for i in 0..8 {
-        tx.put(MovabilityTracker::new(i));
+        tx.push(MovabilityTracker::new(i));
     }
 
     // Verify correct move semantics through queue
     for i in 0..8 {
-        let item = rx.get();
+        let item = rx.pop();
         assert_eq!(item.id, i);
     }
 
@@ -333,11 +333,11 @@ fn non_primitive_types_string() {
     let (mut tx, mut rx) = Spsc::<String, 8>::new();
 
     for i in 0..4 {
-        tx.put(format!("item_{}", i));
+        tx.push(format!("item_{}", i));
     }
 
     for i in 0..4 {
-        let s = rx.get();
+        let s = rx.pop();
         assert_eq!(s, format!("item_{}", i));
     }
 }
@@ -346,7 +346,7 @@ fn non_primitive_types_string() {
 // 5. TIGHT INTERLEAVING (LOW)
 // -----------------------------------------------------------------------------
 
-/// Stress test tight put-one/get-one interleaving across threads.
+/// Stress test tight push-one/pop-one interleaving across threads.
 /// Exercises cache-line bouncing and verifies all values are correct.
 #[test]
 fn tight_interleaving() {
@@ -355,17 +355,17 @@ fn tight_interleaving() {
 
     let producer = std::thread::spawn(move || {
         for i in 0..iterations {
-            while tx.try_put(i).is_err() {
-                // Spin until we can put
+            while tx.try_push(i).is_err() {
+                // Spin until we can push
             }
         }
     });
 
     let consumer = std::thread::spawn(move || {
         for i in 0..iterations {
-            let mut val = rx.try_get();
+            let mut val = rx.try_pop();
             while val.is_none() {
-                val = rx.try_get();
+                val = rx.try_pop();
             }
             assert_eq!(val, Some(i));
         }
@@ -397,7 +397,7 @@ impl Drop for CountedDrop {
 }
 
 /// Test dropping consumer with items in buffer.
-/// Put 10 items, consume 3, drop consumer (leaving 7 items).
+/// Push 10 items, consume 3, drop consumer (leaving 7 items).
 /// Verify remaining 7 items are dropped.
 #[test]
 fn consumer_only_drop() {
@@ -406,13 +406,13 @@ fn consumer_only_drop() {
     {
         let (mut tx, mut rx) = Spsc::<CountedDrop, 16>::new();
         for i in 0..10 {
-            tx.put(CountedDrop::new(i, drops.clone()));
+            tx.push(CountedDrop::new(i, drops.clone()));
         }
 
         // Consume 3 (keeping them alive in this scope)
         let mut consumed = Vec::new();
         for _ in 0..3 {
-            consumed.push(rx.get());
+            consumed.push(rx.pop());
         }
 
         // At this point 3 items are consumed (held in consumed Vec), 7 remain in buffer
@@ -491,10 +491,10 @@ fn wrapping_arithmetic_documentation() {
     // Exercise many cycles
     for _ in 0..100 {
         for i in 0..16 {
-            tx.put(i);
+            tx.push(i);
         }
         for i in 0..16 {
-            assert_eq!(rx.get(), i);
+            assert_eq!(rx.pop(), i);
         }
     }
 }
@@ -512,13 +512,13 @@ fn cv_wait_spurious_wakeup_stress() {
 
     let producer = std::thread::spawn(move || {
         for i in 0..iterations {
-            tx.put(i);
+            tx.push(i);
         }
     });
 
     let consumer = std::thread::spawn(move || {
         for i in 0..iterations {
-            assert_eq!(rx.get(), i);
+            assert_eq!(rx.pop(), i);
         }
     });
 
@@ -526,7 +526,7 @@ fn cv_wait_spurious_wakeup_stress() {
     consumer.join().unwrap();
 }
 
-/// Another CvWait stress test with put-one/get-one interleaving.
+/// Another CvWait stress test with push-one/pop-one interleaving.
 #[test]
 fn cv_wait_tight_interleaving() {
     let (mut tx, mut rx) = Spsc::<i32, 2, YieldWait, CvWait>::new();
@@ -534,7 +534,7 @@ fn cv_wait_tight_interleaving() {
 
     let producer = std::thread::spawn(move || {
         for i in 0..iterations {
-            while tx.try_put(i).is_err() {
+            while tx.try_push(i).is_err() {
                 // Spin briefly
             }
         }
@@ -542,9 +542,9 @@ fn cv_wait_tight_interleaving() {
 
     let consumer = std::thread::spawn(move || {
         for i in 0..iterations {
-            let mut val = rx.try_get();
+            let mut val = rx.try_pop();
             while val.is_none() {
-                val = rx.try_get();
+                val = rx.try_pop();
             }
             assert_eq!(val, Some(i));
         }
@@ -559,21 +559,21 @@ fn cv_wait_tight_interleaving() {
 // -----------------------------------------------------------------------------
 
 /// Test mixing blocking and non-blocking APIs.
-/// Use put() to fill, try_get() to drain.
+/// Use push() to fill, try_pop() to drain.
 #[test]
 fn mixed_blocking_nonblocking_fill_drain() {
     let (mut tx, mut rx) = Spsc::<i32, 8>::new();
 
-    // Fill using blocking put
+    // Fill using blocking push
     for i in 0..8 {
-        tx.put(i);
+        tx.push(i);
     }
 
     assert!(tx.is_full());
 
-    // Drain using non-blocking try_get
+    // Drain using non-blocking try_pop
     for i in 0..8 {
-        let val = rx.try_get();
+        let val = rx.try_pop();
         assert_eq!(val, Some(i));
     }
 
@@ -581,23 +581,23 @@ fn mixed_blocking_nonblocking_fill_drain() {
 }
 
 /// Test mixing blocking and non-blocking APIs.
-/// Use try_put() to fill, get() to drain.
+/// Use try_push() to fill, pop() to drain.
 #[test]
-fn mixed_blocking_nonblocking_try_fill_get() {
+fn mixed_blocking_nonblocking_try_fill_pop() {
     let (mut tx, mut rx) = Spsc::<i32, 8>::new();
 
-    // Fill using non-blocking try_put
+    // Fill using non-blocking try_push
     for i in 0..8 {
-        while tx.try_put(i).is_err() {
+        while tx.try_push(i).is_err() {
             // Wait for space (spin)
         }
     }
 
     assert!(tx.is_full());
 
-    // Drain using blocking get
+    // Drain using blocking pop
     for i in 0..8 {
-        let val = rx.get();
+        let val = rx.pop();
         assert_eq!(val, i);
     }
 
@@ -611,18 +611,18 @@ fn mixed_blocking_nonblocking_multithreaded() {
     let iterations = 1000;
 
     let producer = std::thread::spawn(move || {
-        // Producer uses blocking put
+        // Producer uses blocking push
         for i in 0..iterations {
-            tx.put(i);
+            tx.push(i);
         }
     });
 
     let consumer = std::thread::spawn(move || {
-        // Consumer uses non-blocking try_get with spin
+        // Consumer uses non-blocking try_pop with spin
         for i in 0..iterations {
-            let mut val = rx.try_get();
+            let mut val = rx.try_pop();
             while val.is_none() {
-                val = rx.try_get();
+                val = rx.try_pop();
             }
             assert_eq!(val, Some(i));
         }
@@ -632,25 +632,25 @@ fn mixed_blocking_nonblocking_multithreaded() {
     consumer.join().unwrap();
 }
 
-/// Test mixed blocking/nonblocking: try_put fills, get drains.
+/// Test mixed blocking/nonblocking: try_push fills, pop drains.
 #[test]
-fn mixed_blocking_nonblocking_try_put_get_multithreaded() {
+fn mixed_blocking_nonblocking_try_push_pop_multithreaded() {
     let (mut tx, mut rx) = Spsc::<i32, 4>::new();
     let iterations = 1000;
 
     let producer = std::thread::spawn(move || {
-        // Producer uses non-blocking try_put with spin
+        // Producer uses non-blocking try_push with spin
         for i in 0..iterations {
-            while tx.try_put(i).is_err() {
+            while tx.try_push(i).is_err() {
                 // Spin until success
             }
         }
     });
 
     let consumer = std::thread::spawn(move || {
-        // Consumer uses blocking get
+        // Consumer uses blocking pop
         for i in 0..iterations {
-            assert_eq!(rx.get(), i);
+            assert_eq!(rx.pop(), i);
         }
     });
 
@@ -662,27 +662,27 @@ fn mixed_blocking_nonblocking_try_put_get_multithreaded() {
 // 12. ADAPTIVE READ-CURSOR PUBLISH
 // -----------------------------------------------------------------------------
 
-/// While caught up (queue drained as far as the consumer knows), every get
+/// While caught up (queue drained as far as the consumer knows), every pop
 /// publishes immediately, so producer-side views stay exact — identical to
 /// the per-element publish of the C++ original.
 #[test]
 fn adaptive_publish_exact_when_caught_up() {
     let (mut tx, mut rx) = Spsc::<i32, 1024>::new();
 
-    // Ping-pong: the consumer catches up on every get.
+    // Ping-pong: the consumer catches up on every pop.
     for i in 0..200 {
-        tx.put(i);
-        assert_eq!(rx.get(), i);
-        assert!(tx.is_empty(), "caught-up get must publish immediately");
+        tx.push(i);
+        assert_eq!(rx.pop(), i);
+        assert!(tx.is_empty(), "caught-up pop must publish immediately");
         assert_eq!(tx.len(), 0);
     }
 
-    // Draining a burst: the final (catching-up) get flushes everything.
+    // Draining a burst: the final (catching-up) pop flushes everything.
     for i in 0..100 {
-        tx.put(i);
+        tx.push(i);
     }
     for i in 0..100 {
-        assert_eq!(rx.get(), i);
+        assert_eq!(rx.pop(), i);
     }
     assert!(tx.is_empty());
     assert_eq!(tx.len(), 0);
@@ -697,32 +697,32 @@ fn adaptive_publish_defers_when_backed_up() {
     let (mut tx, mut rx) = Spsc::<i32, 1024>::new(); // batch = 64
 
     for i in 0..1024 {
-        tx.put(i);
+        tx.push(i);
     }
     assert!(tx.is_full());
 
     // Fewer than one batch consumed: producer may still see a full queue,
     // but the consumer's own view is exact.
     for i in 0..10 {
-        assert_eq!(rx.get(), i);
+        assert_eq!(rx.pop(), i);
     }
     assert_eq!(rx.len(), 1014);
     assert!(tx.is_full(), "deferred publish: producer still sees full");
 
     // Crossing the batch boundary publishes.
     for i in 10..64 {
-        assert_eq!(rx.get(), i);
+        assert_eq!(rx.pop(), i);
     }
     assert!(!tx.is_full(), "batch boundary must publish");
 
     // Draining the rest ends caught up, with everything published.
     for i in 64..1024 {
-        assert_eq!(rx.get(), i);
+        assert_eq!(rx.pop(), i);
     }
-    assert!(rx.try_get().is_none());
+    assert!(rx.try_pop().is_none());
     assert!(tx.is_empty());
     for i in 0..1024 {
-        assert!(tx.try_put(i).is_ok(), "all space visible after catch-up");
+        assert!(tx.try_push(i).is_ok(), "all space visible after catch-up");
     }
 }
 
@@ -745,11 +745,11 @@ fn adaptive_publish_no_double_drop_on_consumer_drop() {
     let (mut tx, mut rx) = Spsc::<CountsDrops, 1024>::new(); // batch 64
 
     for _ in 0..100 {
-        tx.put(CountsDrops(drops.clone()));
+        tx.push(CountsDrops(drops.clone()));
     }
     // Consume 10 (< batch 64, still behind): progress is deferred at drop time.
     for _ in 0..10 {
-        drop(rx.get());
+        drop(rx.pop());
     }
     assert_eq!(drops.load(Ordering::Relaxed), 10);
 

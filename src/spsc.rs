@@ -19,8 +19,8 @@
 //!   and each handle's private cursor fields live in the handle (owned by one
 //!   thread) rather than in shared memory.
 //! * **No indirection on the hot path.** Each handle caches the buffer base
-//!   pointer, the mask, and raw pointers to the two shared atomics, so `put` /
-//!   `get` never chase through `Arc<Inner>` to re-read constants — mirroring the
+//!   pointer, the mask, and raw pointers to the two shared atomics, so `push` /
+//!   `pop` never chase through `Arc<Inner>` to re-read constants — mirroring the
 //!   C++ where these are fixed offsets from `this`.
 //! * **Adaptive read-cursor publishes.** A publish only costs something when
 //!   the other side is polling the published line, and the producer only
@@ -41,7 +41,7 @@ use std::sync::Arc;
 use crate::cache_padded::CachePadded;
 use crate::wait::{WaitStrategy, YieldWait};
 
-struct Inner<T, P, G> {
+struct Inner<T, P, C> {
     buffer: Box<[UnsafeCell<MaybeUninit<T>>]>,
     mask: usize,
 
@@ -50,17 +50,17 @@ struct Inner<T, P, G> {
     /// Published by the consumer (Release), read by the producer (Acquire).
     read_cursor: CachePadded<AtomicUsize>,
 
-    put_wait: P,
-    get_wait: G,
+    producer_wait: P,
+    consumer_wait: C,
 }
 
 // SAFETY: The `UnsafeCell` slots are only ever written by the single producer
 // and read by the single consumer, with access ordered by the atomic indices.
 // Sending the shared `Inner` between threads is sound as long as `T` is `Send`.
-unsafe impl<T: Send, P: Send + Sync, G: Send + Sync> Send for Inner<T, P, G> {}
-unsafe impl<T: Send, P: Send + Sync, G: Send + Sync> Sync for Inner<T, P, G> {}
+unsafe impl<T: Send, P: Send + Sync, C: Send + Sync> Send for Inner<T, P, C> {}
+unsafe impl<T: Send, P: Send + Sync, C: Send + Sync> Sync for Inner<T, P, C> {}
 
-impl<T, P, G> Drop for Inner<T, P, G> {
+impl<T, P, C> Drop for Inner<T, P, C> {
     fn drop(&mut self) {
         // No concurrent access at drop time, so relaxed loads suffice. Drop the
         // elements still in the queue: indices [read_cursor, write_cursor).
@@ -104,24 +104,24 @@ impl<const N: usize> AssertCapacity<N> {
 /// Builder/namespace for constructing an SPSC ring buffer.
 ///
 /// `N` is the requested minimum capacity; the real capacity is `N` rounded up
-/// to the next power of two. `P` and `G` are the put-side and get-side
+/// to the next power of two. `P` and `C` are the push-side and pop-side
 /// [`WaitStrategy`]s, defaulting to [`YieldWait`] exactly as the C++ template
 /// defaults do.
-pub struct Spsc<T, const N: usize, P = YieldWait, G = YieldWait>(
-    core::marker::PhantomData<(T, P, G)>,
+pub struct Spsc<T, const N: usize, P = YieldWait, C = YieldWait>(
+    core::marker::PhantomData<(T, P, C)>,
 );
 
-impl<T, const N: usize, P, G> Spsc<T, N, P, G>
+impl<T, const N: usize, P, C> Spsc<T, N, P, C>
 where
     T: Send,
     P: WaitStrategy + Send + Sync,
-    G: WaitStrategy + Send + Sync,
+    C: WaitStrategy + Send + Sync,
 {
     /// Create a ring buffer and return its producer and consumer halves.
     ///
     /// `N == 0` is rejected at compile time.
     #[allow(clippy::new_ret_no_self)] // intentionally returns the producer/consumer pair
-    pub fn new() -> (Producer<T, P, G>, Consumer<T, P, G>) {
+    pub fn new() -> (Producer<T, P, C>, Consumer<T, P, C>) {
         // Evaluated at monomorphization: `Spsc::<T, 0>::new()` fails to compile.
         let () = AssertCapacity::<N>::NON_ZERO;
         let capacity = N.next_power_of_two();
@@ -134,8 +134,8 @@ where
             mask: capacity - 1,
             write_cursor: CachePadded::new(AtomicUsize::new(0)),
             read_cursor: CachePadded::new(AtomicUsize::new(0)),
-            put_wait: P::default(),
-            get_wait: G::default(),
+            producer_wait: P::default(),
+            consumer_wait: C::default(),
         });
 
         // Cache the constants each side needs on its hot path. These `NonNull`s
@@ -174,7 +174,7 @@ where
 }
 
 /// The producing half of an [`Spsc`]. Owns the private write cursor.
-pub struct Producer<T, P, G> {
+pub struct Producer<T, P, C> {
     /// Base of the slot buffer (cached from `inner`; stable for its lifetime).
     buf: NonNull<UnsafeCell<MaybeUninit<T>>>,
     /// `capacity - 1` (cached from `inner`).
@@ -188,28 +188,28 @@ pub struct Producer<T, P, G> {
     /// Cached snapshot of the consumer's `read_cursor` (the C++ `reader_index_cache_`).
     read_cursor_cache: usize,
     /// Keeps the shared allocation alive and carries the wait strategies.
-    inner: Arc<Inner<T, P, G>>,
+    inner: Arc<Inner<T, P, C>>,
 }
 
 // SAFETY: the producer half only touches producer-private state plus atomics.
 // The cached `NonNull`s reference the `Arc<Inner>` it keeps alive.
-unsafe impl<T: Send, P: Send + Sync, G: Send + Sync> Send for Producer<T, P, G> {}
+unsafe impl<T: Send, P: Send + Sync, C: Send + Sync> Send for Producer<T, P, C> {}
 
-impl<T, P, G> Producer<T, P, G>
+impl<T, P, C> Producer<T, P, C>
 where
     P: WaitStrategy,
-    G: WaitStrategy,
+    C: WaitStrategy,
 {
     /// Block until there is room, then enqueue `value`.
     #[inline]
-    pub fn put(&mut self, value: T) {
+    pub fn push(&mut self, value: T) {
         while self.write_cursor > self.read_cursor_cache.wrapping_add(self.mask) {
             // SAFETY: `reader` is a `NonNull` into the live `inner`.
             self.read_cursor_cache = unsafe { (*self.reader.as_ptr()).load(Ordering::Acquire) };
             if self.write_cursor > self.read_cursor_cache.wrapping_add(self.mask) {
                 let next = self.write_cursor;
                 let reader = self.reader.as_ptr();
-                self.inner.put_wait.wait(|| {
+                self.inner.producer_wait.wait(|| {
                     next <= unsafe { (*reader).load(Ordering::Acquire) }.wrapping_add(self.mask)
                 });
             }
@@ -221,7 +221,7 @@ where
     /// Enqueue `value` without blocking. Returns `Err(value)` if the buffer is
     /// full, handing the item back to the caller.
     #[inline]
-    pub fn try_put(&mut self, value: T) -> Result<(), T> {
+    pub fn try_push(&mut self, value: T) -> Result<(), T> {
         if self.write_cursor > self.read_cursor_cache.wrapping_add(self.mask) {
             // SAFETY: `reader` is a `NonNull` into the live `inner`.
             self.read_cursor_cache = unsafe { (*self.reader.as_ptr()).load(Ordering::Acquire) };
@@ -234,7 +234,7 @@ where
         Ok(())
     }
 
-    /// Common tail of `put`/`try_put`: store the value and publish it.
+    /// Common tail of `push`/`try_push`: store the value and publish it.
     #[inline(always)]
     fn write(&mut self, value: T) {
         // SAFETY: `index & mask` is always in `0..capacity`, so the pointer is
@@ -250,9 +250,9 @@ where
         // SAFETY: `next_free` is a `NonNull` into the live `inner`.
         unsafe { (*self.next_free.as_ptr()).store(self.write_cursor, Ordering::Release) };
 
-        // Wake a consumer blocked in `get`. A no-op for the spin strategies,
+        // Wake a consumer blocked in `pop`. A no-op for the spin strategies,
         // which the compiler elides entirely.
-        self.inner.get_wait.notify();
+        self.inner.consumer_wait.notify();
     }
 
     /// Number of elements currently queued.
@@ -273,7 +273,7 @@ where
         is_empty(&self.inner)
     }
 
-    /// Whether the queue is full (no room for another `put`). May transiently
+    /// Whether the queue is full (no room for another `push`). May transiently
     /// report `true` while the consumer defers publishes in the backed-up
     /// regime (see [`len`](Self::len)); never reports `false` for a truly
     /// full queue.
@@ -290,7 +290,7 @@ where
 }
 
 /// The consuming half of an [`Spsc`]. Owns the private read cursor.
-pub struct Consumer<T, P, G> {
+pub struct Consumer<T, P, C> {
     /// Base of the slot buffer (cached from `inner`; stable for its lifetime).
     buf: NonNull<UnsafeCell<MaybeUninit<T>>>,
     /// `capacity - 1` (cached from `inner`).
@@ -307,10 +307,10 @@ pub struct Consumer<T, P, G> {
     /// Cached snapshot of the producer's `write_cursor` (the C++ `next_free_index_cache_`).
     write_cursor_cache: usize,
     /// Keeps the shared allocation alive and carries the wait strategies.
-    inner: Arc<Inner<T, P, G>>,
+    inner: Arc<Inner<T, P, C>>,
 }
 
-impl<T, P, G> Drop for Consumer<T, P, G> {
+impl<T, P, C> Drop for Consumer<T, P, C> {
     fn drop(&mut self) {
         // Publish any deferred progress. Without this, `Inner::drop` would
         // re-drop elements we already moved out, and a surviving producer
@@ -325,16 +325,16 @@ impl<T, P, G> Drop for Consumer<T, P, G> {
 }
 
 // SAFETY: the consumer half only touches consumer-private state plus atomics.
-unsafe impl<T: Send, P: Send + Sync, G: Send + Sync> Send for Consumer<T, P, G> {}
+unsafe impl<T: Send, P: Send + Sync, C: Send + Sync> Send for Consumer<T, P, C> {}
 
-impl<T, P, G> Consumer<T, P, G>
+impl<T, P, C> Consumer<T, P, C>
 where
     P: WaitStrategy,
-    G: WaitStrategy,
+    C: WaitStrategy,
 {
     /// Block until an element is available, then dequeue it.
     #[inline]
-    pub fn get(&mut self) -> T {
+    pub fn pop(&mut self) -> T {
         while self.read_cursor >= self.write_cursor_cache {
             // SAFETY: `next_free` is a `NonNull` into the live `inner`.
             self.write_cursor_cache = unsafe { (*self.next_free.as_ptr()).load(Ordering::Acquire) };
@@ -342,7 +342,7 @@ where
                 let read_cursor = self.read_cursor;
                 let next_free = self.next_free.as_ptr();
                 self.inner
-                    .get_wait
+                    .consumer_wait
                     .wait(|| read_cursor < unsafe { (*next_free).load(Ordering::Acquire) });
             }
         }
@@ -352,7 +352,7 @@ where
 
     /// Dequeue an element without blocking, or return `None` if empty.
     #[inline]
-    pub fn try_get(&mut self) -> Option<T> {
+    pub fn try_pop(&mut self) -> Option<T> {
         if self.read_cursor >= self.write_cursor_cache {
             // SAFETY: `next_free` is a `NonNull` into the live `inner`.
             self.write_cursor_cache = unsafe { (*self.next_free.as_ptr()).load(Ordering::Acquire) };
@@ -364,7 +364,7 @@ where
         Some(self.read())
     }
 
-    /// Common tail of `get`/`try_get`: move the value out and publish progress
+    /// Common tail of `pop`/`try_pop`: move the value out and publish progress
     /// adaptively.
     ///
     /// A publish only costs something when the *other* side is polling the
@@ -408,13 +408,13 @@ where
     }
 
     /// Publish the private read cursor to the shared atomic and wake a
-    /// producer blocked in `put`. The wake-up is a no-op for spin strategies.
+    /// producer blocked in `push`. The wake-up is a no-op for spin strategies.
     #[inline(always)]
     fn flush(&mut self) {
         // SAFETY: `reader` is a `NonNull` into the live `inner`.
         unsafe { (*self.reader.as_ptr()).store(self.read_cursor, Ordering::Release) };
         self.published = self.read_cursor;
-        self.inner.put_wait.notify();
+        self.inner.producer_wait.notify();
     }
 
     /// Number of elements currently queued. Exact on this side: uses the
@@ -448,7 +448,7 @@ where
 }
 
 #[inline]
-fn len<T, P, G>(inner: &Inner<T, P, G>) -> usize {
+fn len<T, P, C>(inner: &Inner<T, P, C>) -> usize {
     inner
         .write_cursor
         .load(Ordering::Acquire)
@@ -456,12 +456,12 @@ fn len<T, P, G>(inner: &Inner<T, P, G>) -> usize {
 }
 
 #[inline]
-fn is_empty<T, P, G>(inner: &Inner<T, P, G>) -> bool {
+fn is_empty<T, P, C>(inner: &Inner<T, P, C>) -> bool {
     inner.read_cursor.load(Ordering::Acquire) >= inner.write_cursor.load(Ordering::Acquire)
 }
 
 #[inline]
-fn is_full<T, P, G>(inner: &Inner<T, P, G>) -> bool {
+fn is_full<T, P, C>(inner: &Inner<T, P, C>) -> bool {
     inner.write_cursor.load(Ordering::Relaxed)
         > inner
             .read_cursor
