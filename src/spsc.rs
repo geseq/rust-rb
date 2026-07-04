@@ -7,20 +7,25 @@
 //!
 //! # Why it is fast
 //!
-//! * **Monotonic masked indices.** `next_free_index` and `reader_index` only
+//! * **Monotonic masked indices.** `write_cursor` and `read_cursor` only
 //!   ever increase; the slot is `index & mask` with `mask = capacity - 1`.
 //!   No modulo, and no wasted "one empty slot" — the whole power-of-two
 //!   capacity is usable.
-//! * **Index caching.** The producer keeps a private `reader_index_cache`; it
+//! * **Index caching.** The producer keeps a private `read_cursor_cache`; it
 //!   only reloads the consumer's atomic when the buffer *looks* full. The
-//!   consumer mirrors this with `next_free_index_cache`. In steady state
+//!   consumer mirrors this with `write_cursor_cache`. In steady state
 //!   neither side touches the other's cache line.
 //! * **No false sharing.** The shared atomics each sit on their own cache line,
 //!   and each handle's private cursor fields live in the handle (owned by one
 //!   thread) rather than in shared memory.
+//! * **No indirection on the hot path.** Each handle caches the buffer base
+//!   pointer, the mask, and raw pointers to the two shared atomics, so `put` /
+//!   `get` never chase through `Arc<Inner>` to re-read constants — mirroring the
+//!   C++ where these are fixed offsets from `this`.
 
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
+use std::ptr::NonNull;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -32,9 +37,9 @@ struct Inner<T, P, G> {
     mask: usize,
 
     /// Published by the producer (Release), read by the consumer (Acquire).
-    next_free_index: CachePadded<AtomicUsize>,
+    write_cursor: CachePadded<AtomicUsize>,
     /// Published by the consumer (Release), read by the producer (Acquire).
-    reader_index: CachePadded<AtomicUsize>,
+    read_cursor: CachePadded<AtomicUsize>,
 
     put_wait: P,
     get_wait: G,
@@ -49,9 +54,9 @@ unsafe impl<T: Send, P: Send + Sync, G: Send + Sync> Sync for Inner<T, P, G> {}
 impl<T, P, G> Drop for Inner<T, P, G> {
     fn drop(&mut self) {
         // No concurrent access at drop time, so relaxed loads suffice. Drop the
-        // elements still in the queue: indices [reader_index, next_free_index).
-        let mut head = self.reader_index.load(Ordering::Relaxed);
-        let tail = self.next_free_index.load(Ordering::Relaxed);
+        // elements still in the queue: indices [read_cursor, write_cursor).
+        let mut head = self.read_cursor.load(Ordering::Relaxed);
+        let tail = self.write_cursor.load(Ordering::Relaxed);
         while head != tail {
             let slot = &self.buffer[head & self.mask];
             // SAFETY: every index in this range was produced and not consumed,
@@ -68,7 +73,9 @@ impl<T, P, G> Drop for Inner<T, P, G> {
 /// to the next power of two. `P` and `G` are the put-side and get-side
 /// [`WaitStrategy`]s, defaulting to [`YieldWait`] exactly as the C++ template
 /// defaults do.
-pub struct Spsc<T, const N: usize, P = YieldWait, G = YieldWait>(core::marker::PhantomData<(T, P, G)>);
+pub struct Spsc<T, const N: usize, P = YieldWait, G = YieldWait>(
+    core::marker::PhantomData<(T, P, G)>,
+);
 
 impl<T, const N: usize, P, G> Spsc<T, N, P, G>
 where
@@ -92,22 +99,39 @@ where
         let inner = Arc::new(Inner {
             buffer: slots.into_boxed_slice(),
             mask: capacity - 1,
-            next_free_index: CachePadded::new(AtomicUsize::new(0)),
-            reader_index: CachePadded::new(AtomicUsize::new(0)),
+            write_cursor: CachePadded::new(AtomicUsize::new(0)),
+            read_cursor: CachePadded::new(AtomicUsize::new(0)),
             put_wait: P::default(),
             get_wait: G::default(),
         });
 
+        // Cache the constants each side needs on its hot path. These `NonNull`s
+        // stay valid for as long as the `Arc<Inner>` the handle holds is alive.
+        let buf = unsafe { NonNull::new_unchecked(inner.buffer.as_ptr().cast_mut()) };
+        let mask = inner.mask;
+        let next_free =
+            unsafe { NonNull::new_unchecked((&*inner.write_cursor as *const AtomicUsize).cast_mut()) };
+        let reader =
+            unsafe { NonNull::new_unchecked((&*inner.read_cursor as *const AtomicUsize).cast_mut()) };
+
         (
             Producer {
+                buf,
+                mask,
+                next_free,
+                reader,
+                write_cursor: 0,
+                read_cursor_cache: 0,
                 inner: inner.clone(),
-                next_free_index: 0,
-                reader_index_cache: 0,
             },
             Consumer {
+                buf,
+                mask,
+                next_free,
+                reader,
+                read_cursor: 0,
+                write_cursor_cache: 0,
                 inner,
-                reader_index: 0,
-                next_free_index_cache: 0,
             },
         )
     }
@@ -115,14 +139,24 @@ where
 
 /// The producing half of an [`Spsc`]. Owns the private write cursor.
 pub struct Producer<T, P, G> {
-    inner: Arc<Inner<T, P, G>>,
+    /// Base of the slot buffer (cached from `inner`; stable for its lifetime).
+    buf: NonNull<UnsafeCell<MaybeUninit<T>>>,
+    /// `capacity - 1` (cached from `inner`).
+    mask: usize,
+    /// Our published cursor (cached `NonNull` into `inner`).
+    next_free: NonNull<AtomicUsize>,
+    /// The consumer's published cursor (cached `NonNull` into `inner`).
+    reader: NonNull<AtomicUsize>,
     /// Next index to write (the C++ `next_free_index_2_`). Private to this thread.
-    next_free_index: usize,
-    /// Cached snapshot of the consumer's `reader_index` (the C++ `reader_index_cache_`).
-    reader_index_cache: usize,
+    write_cursor: usize,
+    /// Cached snapshot of the consumer's `read_cursor` (the C++ `reader_index_cache_`).
+    read_cursor_cache: usize,
+    /// Keeps the shared allocation alive and carries the wait strategies.
+    inner: Arc<Inner<T, P, G>>,
 }
 
 // SAFETY: the producer half only touches producer-private state plus atomics.
+// The cached `NonNull`s reference the `Arc<Inner>` it keeps alive.
 unsafe impl<T: Send, P: Send + Sync, G: Send + Sync> Send for Producer<T, P, G> {}
 
 impl<T, P, G> Producer<T, P, G>
@@ -133,16 +167,15 @@ where
     /// Block until there is room, then enqueue `value`.
     #[inline]
     pub fn put(&mut self, value: T) {
-        let inner = &*self.inner;
-        let mask = inner.mask;
-
-        while self.next_free_index > self.reader_index_cache.wrapping_add(mask) {
-            self.reader_index_cache = inner.reader_index.load(Ordering::Acquire);
-            if self.next_free_index > self.reader_index_cache.wrapping_add(mask) {
-                let next = self.next_free_index;
-                inner
-                    .put_wait
-                    .wait(|| next <= inner.reader_index.load(Ordering::Acquire).wrapping_add(mask));
+        while self.write_cursor > self.read_cursor_cache.wrapping_add(self.mask) {
+            // SAFETY: `reader` is a `NonNull` into the live `inner`.
+            self.read_cursor_cache = unsafe { (*self.reader.as_ptr()).load(Ordering::Acquire) };
+            if self.write_cursor > self.read_cursor_cache.wrapping_add(self.mask) {
+                let next = self.write_cursor;
+                let reader = self.reader.as_ptr();
+                self.inner.put_wait.wait(|| {
+                    next <= unsafe { (*reader).load(Ordering::Acquire) }.wrapping_add(self.mask)
+                });
             }
         }
 
@@ -153,12 +186,10 @@ where
     /// full, handing the item back to the caller.
     #[inline]
     pub fn try_put(&mut self, value: T) -> Result<(), T> {
-        let inner = &*self.inner;
-        let mask = inner.mask;
-
-        if self.next_free_index > self.reader_index_cache.wrapping_add(mask) {
-            self.reader_index_cache = inner.reader_index.load(Ordering::Acquire);
-            if self.next_free_index > self.reader_index_cache.wrapping_add(mask) {
+        if self.write_cursor > self.read_cursor_cache.wrapping_add(self.mask) {
+            // SAFETY: `reader` is a `NonNull` into the live `inner`.
+            self.read_cursor_cache = unsafe { (*self.reader.as_ptr()).load(Ordering::Acquire) };
+            if self.write_cursor > self.read_cursor_cache.wrapping_add(self.mask) {
                 return Err(value);
             }
         }
@@ -170,19 +201,22 @@ where
     /// Common tail of `put`/`try_put`: store the value and publish it.
     #[inline(always)]
     fn write(&mut self, value: T) {
-        let inner = &*self.inner;
-        let slot = &inner.buffer[self.next_free_index & inner.mask];
-        // SAFETY: we are the only producer and have confirmed the slot is free
-        // (the consumer has moved its previous occupant out).
-        unsafe { (*slot.get()).write(value) };
+        // SAFETY: `index & mask` is always in `0..capacity`, so the pointer is
+        // in bounds; skipping the bounds check keeps the hot path branch-free,
+        // as in the C++ `contents_[i & mask]`. We are the only producer and have
+        // confirmed the slot is free (the consumer moved its occupant out).
+        unsafe {
+            let slot = &*self.buf.as_ptr().add(self.write_cursor & self.mask);
+            (*slot.get()).write(value);
+        }
 
-        self.next_free_index = self.next_free_index.wrapping_add(1);
-        inner
-            .next_free_index
-            .store(self.next_free_index, Ordering::Release);
+        self.write_cursor = self.write_cursor.wrapping_add(1);
+        // SAFETY: `next_free` is a `NonNull` into the live `inner`.
+        unsafe { (*self.next_free.as_ptr()).store(self.write_cursor, Ordering::Release) };
 
-        // Wake a consumer blocked in `get`. A no-op for the spin strategies.
-        inner.get_wait.notify();
+        // Wake a consumer blocked in `get`. A no-op for the spin strategies,
+        // which the compiler elides entirely.
+        self.inner.get_wait.notify();
     }
 
     /// Number of elements currently queued.
@@ -206,17 +240,26 @@ where
     /// The buffer's true capacity (`N` rounded up to a power of two).
     #[inline]
     pub fn capacity(&self) -> usize {
-        self.inner.mask + 1
+        self.mask + 1
     }
 }
 
 /// The consuming half of an [`Spsc`]. Owns the private read cursor.
 pub struct Consumer<T, P, G> {
-    inner: Arc<Inner<T, P, G>>,
+    /// Base of the slot buffer (cached from `inner`; stable for its lifetime).
+    buf: NonNull<UnsafeCell<MaybeUninit<T>>>,
+    /// `capacity - 1` (cached from `inner`).
+    mask: usize,
+    /// The producer's published cursor (cached `NonNull` into `inner`).
+    next_free: NonNull<AtomicUsize>,
+    /// Our published cursor (cached `NonNull` into `inner`).
+    reader: NonNull<AtomicUsize>,
     /// Next index to read (the C++ `reader_index_2_`). Private to this thread.
-    reader_index: usize,
-    /// Cached snapshot of the producer's `next_free_index` (the C++ `next_free_index_cache_`).
-    next_free_index_cache: usize,
+    read_cursor: usize,
+    /// Cached snapshot of the producer's `write_cursor` (the C++ `next_free_index_cache_`).
+    write_cursor_cache: usize,
+    /// Keeps the shared allocation alive and carries the wait strategies.
+    inner: Arc<Inner<T, P, G>>,
 }
 
 // SAFETY: the consumer half only touches consumer-private state plus atomics.
@@ -230,15 +273,15 @@ where
     /// Block until an element is available, then dequeue it.
     #[inline]
     pub fn get(&mut self) -> T {
-        let inner = &*self.inner;
-
-        while self.reader_index >= self.next_free_index_cache {
-            self.next_free_index_cache = inner.next_free_index.load(Ordering::Acquire);
-            if self.reader_index >= self.next_free_index_cache {
-                let reader = self.reader_index;
-                inner
+        while self.read_cursor >= self.write_cursor_cache {
+            // SAFETY: `next_free` is a `NonNull` into the live `inner`.
+            self.write_cursor_cache = unsafe { (*self.next_free.as_ptr()).load(Ordering::Acquire) };
+            if self.read_cursor >= self.write_cursor_cache {
+                let read_cursor = self.read_cursor;
+                let next_free = self.next_free.as_ptr();
+                self.inner
                     .get_wait
-                    .wait(|| reader < inner.next_free_index.load(Ordering::Acquire));
+                    .wait(|| read_cursor < unsafe { (*next_free).load(Ordering::Acquire) });
             }
         }
 
@@ -248,11 +291,10 @@ where
     /// Dequeue an element without blocking, or return `None` if empty.
     #[inline]
     pub fn try_get(&mut self) -> Option<T> {
-        let inner = &*self.inner;
-
-        if self.reader_index >= self.next_free_index_cache {
-            self.next_free_index_cache = inner.next_free_index.load(Ordering::Acquire);
-            if self.reader_index >= self.next_free_index_cache {
+        if self.read_cursor >= self.write_cursor_cache {
+            // SAFETY: `next_free` is a `NonNull` into the live `inner`.
+            self.write_cursor_cache = unsafe { (*self.next_free.as_ptr()).load(Ordering::Acquire) };
+            if self.read_cursor >= self.write_cursor_cache {
                 return None;
             }
         }
@@ -263,17 +305,20 @@ where
     /// Common tail of `get`/`try_get`: move the value out and publish progress.
     #[inline(always)]
     fn read(&mut self) -> T {
-        let inner = &*self.inner;
-        let slot = &inner.buffer[self.reader_index & inner.mask];
-        // SAFETY: the index is below the producer's published `next_free_index`,
-        // so the slot holds an initialized `T` that we move out exactly once.
-        let value = unsafe { (*slot.get()).assume_init_read() };
+        // SAFETY: `index & mask` is always in bounds (see `Producer::write`).
+        // The index is below the producer's published `write_cursor`, so the
+        // slot holds an initialized `T` that we move out exactly once.
+        let value = unsafe {
+            let slot = &*self.buf.as_ptr().add(self.read_cursor & self.mask);
+            (*slot.get()).assume_init_read()
+        };
 
-        self.reader_index = self.reader_index.wrapping_add(1);
-        inner.reader_index.store(self.reader_index, Ordering::Release);
+        self.read_cursor = self.read_cursor.wrapping_add(1);
+        // SAFETY: `reader` is a `NonNull` into the live `inner`.
+        unsafe { (*self.reader.as_ptr()).store(self.read_cursor, Ordering::Release) };
 
         // Wake a producer blocked in `put`. A no-op for the spin strategies.
-        inner.put_wait.notify();
+        self.inner.put_wait.notify();
 
         value
     }
@@ -299,25 +344,28 @@ where
     /// The buffer's true capacity (`N` rounded up to a power of two).
     #[inline]
     pub fn capacity(&self) -> usize {
-        self.inner.mask + 1
+        self.mask + 1
     }
 }
 
 #[inline]
 fn len<T, P, G>(inner: &Inner<T, P, G>) -> usize {
     inner
-        .next_free_index
+        .write_cursor
         .load(Ordering::Acquire)
-        .wrapping_sub(inner.reader_index.load(Ordering::Acquire))
+        .wrapping_sub(inner.read_cursor.load(Ordering::Acquire))
 }
 
 #[inline]
 fn is_empty<T, P, G>(inner: &Inner<T, P, G>) -> bool {
-    inner.reader_index.load(Ordering::Acquire) >= inner.next_free_index.load(Ordering::Acquire)
+    inner.read_cursor.load(Ordering::Acquire) >= inner.write_cursor.load(Ordering::Acquire)
 }
 
 #[inline]
 fn is_full<T, P, G>(inner: &Inner<T, P, G>) -> bool {
-    inner.next_free_index.load(Ordering::Relaxed)
-        > inner.reader_index.load(Ordering::Acquire).wrapping_add(inner.mask)
+    inner.write_cursor.load(Ordering::Relaxed)
+        > inner
+            .read_cursor
+            .load(Ordering::Acquire)
+            .wrapping_add(inner.mask)
 }

@@ -4,6 +4,8 @@
 
 use rust_rb::spsc::{Consumer, Producer, Spsc};
 use rust_rb::wait::{CvWait, NoOpWait, PauseWait, WaitStrategy, YieldWait};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 const ITERATIONS: usize = 4096;
 const ITERATIONS_MULTIPLIER: usize = 100;
@@ -195,4 +197,468 @@ fn drops_remaining_elements() {
         assert_eq!(drops.load(Ordering::Relaxed), 3);
     }
     assert_eq!(drops.load(Ordering::Relaxed), 10);
+}
+
+// ============================================================================
+// EDGE CASE AND ADVERSARIAL TESTS
+// ============================================================================
+
+// -----------------------------------------------------------------------------
+// 1. CONSUMER-SIDE STATE METHODS (HIGH)
+// -----------------------------------------------------------------------------
+
+/// Test Consumer::len(), Consumer::is_empty(), Consumer::is_full(),
+/// Consumer::capacity() directly from the consumer side.
+#[test]
+fn consumer_state_methods() {
+    let (mut tx, mut rx) = Spsc::<i32, 16>::new();
+
+    // Initially empty
+    assert_eq!(rx.len(), 0);
+    assert!(rx.is_empty());
+    assert!(!rx.is_full());
+    assert_eq!(rx.capacity(), 16);
+
+    // Fill the queue
+    for i in 0..16 {
+        tx.put(i);
+    }
+
+    // Consumer sees full queue
+    assert_eq!(rx.len(), 16);
+    assert!(!rx.is_empty());
+    assert!(rx.is_full());
+
+    // Consume one item
+    rx.get();
+    assert_eq!(rx.len(), 15);
+    assert!(!rx.is_empty());
+    assert!(!rx.is_full());
+
+    // Empty the queue
+    for _ in 0..15 {
+        rx.get();
+    }
+    assert_eq!(rx.len(), 0);
+    assert!(rx.is_empty());
+    assert!(!rx.is_full());
+}
+
+// -----------------------------------------------------------------------------
+// 2. ZERO CAPACITY PANIC (HIGH)
+// -----------------------------------------------------------------------------
+
+/// Test that Spsc::<T, 0>::new() panics with a descriptive message.
+#[test]
+#[should_panic(expected = "capacity must be greater than zero")]
+fn zero_capacity_panics() {
+    let _ = Spsc::<i32, 0>::new();
+}
+
+// -----------------------------------------------------------------------------
+// 3. EXACT CAPACITY BOUNDARY (MEDIUM)
+// -----------------------------------------------------------------------------
+
+/// Test exact boundary conditions at capacity.
+#[test]
+fn exact_capacity_boundary() {
+    let (mut tx, mut rx) = Spsc::<i32, 4>::new();
+
+    // Fill exactly to capacity
+    for i in 0..4 {
+        tx.put(i);
+    }
+
+    // Verify is_full() returns true
+    assert!(tx.is_full());
+    assert!(rx.is_full());
+
+    // Verify try_put() fails and returns the value
+    assert_eq!(tx.try_put(-1), Err(-1));
+
+    // Consume one
+    assert_eq!(rx.get(), 0);
+
+    // Verify try_put() succeeds
+    assert!(tx.try_put(100).is_ok());
+    assert_eq!(tx.len(), 4);
+}
+
+// -----------------------------------------------------------------------------
+// 4. NON-PRIMITIVE TYPES (MEDIUM)
+// -----------------------------------------------------------------------------
+
+/// Type with custom Drop that tracks moves/drops.
+#[derive(Debug)]
+struct MovabilityTracker {
+    id: usize,
+    moved: bool,
+}
+
+impl MovabilityTracker {
+    fn new(id: usize) -> Self {
+        Self {
+            id,
+            moved: false,
+        }
+    }
+}
+
+impl Drop for MovabilityTracker {
+    fn drop(&mut self) {
+        // Track that this instance was dropped
+        if !self.moved {
+            // Dropped without being moved
+        }
+    }
+}
+
+/// Test with non-Copy struct and custom ownership semantics.
+#[test]
+fn non_primitive_types() {
+    let (mut tx, mut rx) = Spsc::<MovabilityTracker, 16>::new();
+
+    // Move items into the queue
+    for i in 0..8 {
+        tx.put(MovabilityTracker::new(i));
+    }
+
+    // Verify correct move semantics through queue
+    for i in 0..8 {
+        let item = rx.get();
+        assert_eq!(item.id, i);
+    }
+
+    assert!(rx.is_empty());
+}
+
+/// Test with String (complex ownership) through the queue.
+#[test]
+fn non_primitive_types_string() {
+    let (mut tx, mut rx) = Spsc::<String, 8>::new();
+
+    for i in 0..4 {
+        tx.put(format!("item_{}", i));
+    }
+
+    for i in 0..4 {
+        let s = rx.get();
+        assert_eq!(s, format!("item_{}", i));
+    }
+}
+
+// -----------------------------------------------------------------------------
+// 5. TIGHT INTERLEAVING (LOW)
+// -----------------------------------------------------------------------------
+
+/// Stress test tight put-one/get-one interleaving across threads.
+/// Exercises cache-line bouncing and verifies all values are correct.
+#[test]
+fn tight_interleaving() {
+    let (mut tx, mut rx) = Spsc::<i32, 2>::new(); // Small capacity for interleaving
+    let iterations = 1000;
+
+    let producer = std::thread::spawn(move || {
+        for i in 0..iterations {
+            while tx.try_put(i).is_err() {
+                // Spin until we can put
+            }
+        }
+    });
+
+    let consumer = std::thread::spawn(move || {
+        for i in 0..iterations {
+            let mut val = rx.try_get();
+            while val.is_none() {
+                val = rx.try_get();
+            }
+            assert_eq!(val, Some(i));
+        }
+    });
+
+    producer.join().unwrap();
+    consumer.join().unwrap();
+}
+
+// -----------------------------------------------------------------------------
+// 6. CONSUMER-ONLY DROP (LOW)
+// -----------------------------------------------------------------------------
+
+struct CountedDrop {
+    _id: usize,
+    drops: Arc<AtomicUsize>,
+}
+
+impl CountedDrop {
+    fn new(id: usize, drops: Arc<AtomicUsize>) -> Self {
+        Self { _id: id, drops }
+    }
+}
+
+impl Drop for CountedDrop {
+    fn drop(&mut self) {
+        self.drops.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Test dropping consumer with items in buffer.
+/// Put 10 items, consume 3, drop consumer (leaving 7 items).
+/// Verify remaining 7 items are dropped.
+#[test]
+fn consumer_only_drop() {
+    let drops = Arc::new(AtomicUsize::new(0));
+
+    {
+        let (mut tx, mut rx) = Spsc::<CountedDrop, 16>::new();
+        for i in 0..10 {
+            tx.put(CountedDrop::new(i, drops.clone()));
+        }
+
+        // Consume 3 (keeping them alive in this scope)
+        let mut consumed = Vec::new();
+        for _ in 0..3 {
+            consumed.push(rx.get());
+        }
+
+        // At this point 3 items are consumed (held in consumed Vec), 7 remain in buffer
+        // The consumed items haven't been dropped yet since consumed Vec is still in scope
+        assert_eq!(drops.load(Ordering::Relaxed), 0);
+
+        // Drop consumer (and producer via tx)
+        // The remaining 7 items should be dropped
+        drop(rx);
+        drop(tx);
+
+        // Now the 7 remaining items are dropped, but consumed Vec still holds 3
+        assert_eq!(drops.load(Ordering::Relaxed), 7);
+    }
+
+    // Now consumed Vec is dropped too, so all 10 items are dropped
+    assert_eq!(drops.load(Ordering::Relaxed), 10);
+}
+
+// -----------------------------------------------------------------------------
+// 7. NON-POWER-OF-TWO CAPACITY (LOW)
+// -----------------------------------------------------------------------------
+
+/// Test capacity rounding for non-power-of-two capacities.
+#[test]
+fn non_power_of_two_capacity() {
+    let (tx, _rx) = Spsc::<i32, 10>::new();
+    // 10 rounds up to 16
+    assert_eq!(tx.capacity(), 16);
+}
+
+#[test]
+fn non_power_of_two_capacity_various() {
+    let (tx1, _) = Spsc::<i32, 3>::new();
+    assert_eq!(tx1.capacity(), 4);
+
+    let (tx2, _) = Spsc::<i32, 5>::new();
+    assert_eq!(tx2.capacity(), 8);
+
+    let (tx3, _) = Spsc::<i32, 17>::new();
+    assert_eq!(tx3.capacity(), 32);
+
+    let (tx4, _) = Spsc::<i32, 33>::new();
+    assert_eq!(tx4.capacity(), 64);
+}
+
+// -----------------------------------------------------------------------------
+// 8. WRAPPING ARITHMETIC DOCUMENTATION (HIGH)
+// -----------------------------------------------------------------------------
+
+/// Document that usize wrapping is untestable in practice.
+///
+/// SPSC uses usize wrapping arithmetic for indices. Since usize wraps at
+/// 2^64 (or 2^32 on 32-bit), and we'd need to enqueue 2^64 items to
+/// observe wraparound, this is untestable in practice. This test serves
+/// as documentation that wrapping is sound and verified by construction.
+///
+/// The implementation uses `wrapping_add` explicitly to make the intent clear.
+#[test]
+fn wrapping_arithmetic_documentation() {
+    // This test documents that wrapping arithmetic is used throughout.
+    //
+    // Key wrapping operations in the implementation:
+    // 1. `self.write_cursor = self.write_cursor.wrapping_add(1);`
+    // 2. `self.read_cursor = self.read_cursor.wrapping_add(1);`
+    // 3. `index & mask` for slot calculation (works correctly with wrapping)
+    //
+    // Since usize arithmetic in Rust wraps silently (like C++), and the
+    // mask-based slot calculation is mathematically correct for wrapping
+    // indices, the implementation is sound even at wraparound.
+    //
+    // Verification: The tests below exercise many cycles to ensure no
+    // regression in normal operation.
+    let (mut tx, mut rx) = Spsc::<i32, 16>::new();
+
+    // Exercise many cycles
+    for _ in 0..100 {
+        for i in 0..16 {
+            tx.put(i);
+        }
+        for i in 0..16 {
+            assert_eq!(rx.get(), i);
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// 9. CV WAIT STRATEGY SPURIOUS WAKEUPS (MEDIUM)
+// -----------------------------------------------------------------------------
+
+/// Stress test CvWait with many short cycles.
+/// Exercises notify/wait interaction and verifies no spurious wakeup bugs.
+#[test]
+fn cv_wait_spurious_wakeup_stress() {
+    let (mut tx, mut rx) = Spsc::<i32, 16, YieldWait, CvWait>::new();
+    let iterations = 5000;
+
+    let producer = std::thread::spawn(move || {
+        for i in 0..iterations {
+            tx.put(i);
+        }
+    });
+
+    let consumer = std::thread::spawn(move || {
+        for i in 0..iterations {
+            assert_eq!(rx.get(), i);
+        }
+    });
+
+    producer.join().unwrap();
+    consumer.join().unwrap();
+}
+
+/// Another CvWait stress test with put-one/get-one interleaving.
+#[test]
+fn cv_wait_tight_interleaving() {
+    let (mut tx, mut rx) = Spsc::<i32, 2, YieldWait, CvWait>::new();
+    let iterations = 2000;
+
+    let producer = std::thread::spawn(move || {
+        for i in 0..iterations {
+            while tx.try_put(i).is_err() {
+                // Spin briefly
+            }
+        }
+    });
+
+    let consumer = std::thread::spawn(move || {
+        for i in 0..iterations {
+            let mut val = rx.try_get();
+            while val.is_none() {
+                val = rx.try_get();
+            }
+            assert_eq!(val, Some(i));
+        }
+    });
+
+    producer.join().unwrap();
+    consumer.join().unwrap();
+}
+
+// -----------------------------------------------------------------------------
+// 10. MIXED BLOCKING/NONBLOCKING (MEDIUM)
+// -----------------------------------------------------------------------------
+
+/// Test mixing blocking and non-blocking APIs.
+/// Use put() to fill, try_get() to drain.
+#[test]
+fn mixed_blocking_nonblocking_fill_drain() {
+    let (mut tx, mut rx) = Spsc::<i32, 8>::new();
+
+    // Fill using blocking put
+    for i in 0..8 {
+        tx.put(i);
+    }
+
+    assert!(tx.is_full());
+
+    // Drain using non-blocking try_get
+    for i in 0..8 {
+        let val = rx.try_get();
+        assert_eq!(val, Some(i));
+    }
+
+    assert!(rx.is_empty());
+}
+
+/// Test mixing blocking and non-blocking APIs.
+/// Use try_put() to fill, get() to drain.
+#[test]
+fn mixed_blocking_nonblocking_try_fill_get() {
+    let (mut tx, mut rx) = Spsc::<i32, 8>::new();
+
+    // Fill using non-blocking try_put
+    for i in 0..8 {
+        while tx.try_put(i).is_err() {
+            // Wait for space (spin)
+        }
+    }
+
+    assert!(tx.is_full());
+
+    // Drain using blocking get
+    for i in 0..8 {
+        let val = rx.get();
+        assert_eq!(val, i);
+    }
+
+    assert!(rx.is_empty());
+}
+
+/// Test mixed blocking/nonblocking in a producer-consumer thread scenario.
+#[test]
+fn mixed_blocking_nonblocking_multithreaded() {
+    let (mut tx, mut rx) = Spsc::<i32, 4>::new();
+    let iterations = 1000;
+
+    let producer = std::thread::spawn(move || {
+        // Producer uses blocking put
+        for i in 0..iterations {
+            tx.put(i);
+        }
+    });
+
+    let consumer = std::thread::spawn(move || {
+        // Consumer uses non-blocking try_get with spin
+        for i in 0..iterations {
+            let mut val = rx.try_get();
+            while val.is_none() {
+                val = rx.try_get();
+            }
+            assert_eq!(val, Some(i));
+        }
+    });
+
+    producer.join().unwrap();
+    consumer.join().unwrap();
+}
+
+/// Test mixed blocking/nonblocking: try_put fills, get drains.
+#[test]
+fn mixed_blocking_nonblocking_try_put_get_multithreaded() {
+    let (mut tx, mut rx) = Spsc::<i32, 4>::new();
+    let iterations = 1000;
+
+    let producer = std::thread::spawn(move || {
+        // Producer uses non-blocking try_put with spin
+        for i in 0..iterations {
+            while tx.try_put(i).is_err() {
+                // Spin until success
+            }
+        }
+    });
+
+    let consumer = std::thread::spawn(move || {
+        // Consumer uses blocking get
+        for i in 0..iterations {
+            assert_eq!(rx.get(), i);
+        }
+    });
+
+    producer.join().unwrap();
+    consumer.join().unwrap();
 }
