@@ -26,33 +26,32 @@
 //!
 //! # Why it is fast
 //!
-//! The same machinery as [`crate::spsc`], at byte granularity:
-//!
-//! * monotonic byte cursors masked by `capacity - 1` (capacity is a power of
-//!   two), so no modulo and the whole buffer is usable;
-//! * each side caches the other side's cursor and only reloads the shared
-//!   atomic when the buffer looks full/empty;
-//! * the two shared atomics live on their own cache lines; each side's
-//!   private cursors live in its handle;
-//! * one `Release` store publishes a whole record (padding included), one
-//!   `Acquire` load observes it;
-//! * adaptive read-cursor publishes, as in [`crate::spsc`]: per-message while
-//!   the consumer is caught up, deferred/batched while the ring is backed up
-//!   so a full-ring producer's polling cannot force a cache-line ping-pong on
-//!   every message;
-//! * zero-copy on both sides: [`claim`](BytesProducer::claim) hands the
-//!   producer a slice to serialize into directly, [`pop`](BytesConsumer::pop)
-//!   hands the consumer a borrowed view of the payload in place, and
-//!   [`drain`](BytesConsumer::drain) consumes every available message with a
-//!   single cursor publish.
+//! The concurrency machinery is the crate's shared cursor engine (the same
+//! code as [`crate::spsc`], instantiated at byte granularity): monotonic
+//! masked byte cursors compared by wrapped difference, per-side cursor
+//! caching, cache-padded shared atomics, one `Release` store publishing a
+//! whole record (padding included), and adaptive read-cursor publishes.
+//! On top of that, this ring is zero-copy on both sides:
+//! [`claim`](BytesProducer::claim) hands the producer a slice to serialize
+//! into directly, [`pop`](BytesConsumer::pop) hands the consumer a borrowed
+//! view of the payload in place, and [`drain`](BytesConsumer::drain) consumes
+//! every available message with a single cursor publish.
 
 use std::cell::UnsafeCell;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
 
-use crate::cache_padded::CachePadded;
+use crate::cursor::{channel, shared_is_empty, ConsumerCore, ProducerCore};
 use crate::wait::{WaitStrategy, YieldWait};
+
+/// The buffer word type: `u64` so the base is 8-aligned (a `Box<[u8]>`
+/// allocation only guarantees alignment 1). All access goes through raw `u8`
+/// pointers; the words are never read as `u64`s.
+///
+/// Zero-initialized on construction so every byte is always initialized:
+/// `WriteSlot`/`Msg` hand out `&[u8]` views into the ring, which would be
+/// instant UB over uninitialized memory. Zeroing costs one pass at
+/// construction and nothing on the hot path.
+type Word = UnsafeCell<u64>;
 
 /// Size of the length header preceding each payload.
 const HEADER: usize = 4;
@@ -131,35 +130,6 @@ const fn max_message_len(capacity: usize) -> usize {
     }
 }
 
-struct Inner<P, C> {
-    /// The byte buffer, stored as `u64` words so the base is 8-aligned (a
-    /// `Box<[u8]>` allocation only guarantees alignment 1). All access goes
-    /// through raw `u8` pointers; the words are never read as `u64`s.
-    ///
-    /// Zero-initialized on construction so every byte is always initialized:
-    /// `WriteSlot`/`Msg` hand out `&[u8]` views into the ring, which would be
-    /// instant UB over uninitialized memory. Zeroing costs one pass at
-    /// construction and nothing on the hot path.
-    buffer: Box<[UnsafeCell<u64>]>,
-    mask: usize,
-
-    /// Byte cursor published by the producer (Release), read by the consumer
-    /// (Acquire). Always advances by whole records.
-    write_cursor: CachePadded<AtomicUsize>,
-    /// Byte cursor published by the consumer (Release), read by the producer
-    /// (Acquire).
-    read_cursor: CachePadded<AtomicUsize>,
-
-    producer_wait: P,
-    consumer_wait: C,
-}
-
-// SAFETY: the buffer bytes are only ever written by the single producer and
-// read by the single consumer, ordered by the atomic cursors, exactly as in
-// `spsc::Inner`. The payload is plain bytes, so there is no `T: Send` to ask.
-unsafe impl<P: Send + Sync, C: Send + Sync> Send for Inner<P, C> {}
-unsafe impl<P: Send + Sync, C: Send + Sync> Sync for Inner<P, C> {}
-
 /// Builder/namespace for constructing a variable-size-message SPSC ring.
 ///
 /// [`new`](Self::new) takes the minimum capacity in **bytes** at runtime
@@ -200,71 +170,17 @@ where
             .expect("capacity too large to round up to a power of two")
             .max(8);
 
-        let mut words = Vec::with_capacity(capacity / 8);
-        words.resize_with(capacity / 8, || UnsafeCell::new(0u64));
-
-        let inner = Arc::new(Inner {
-            buffer: words.into_boxed_slice(),
-            mask: capacity - 1,
-            write_cursor: CachePadded::new(AtomicUsize::new(0)),
-            read_cursor: CachePadded::new(AtomicUsize::new(0)),
-            producer_wait: P::default(),
-            consumer_wait: C::default(),
-        });
-
-        // Cache the hot-path constants in each handle, as `spsc` does.
-        let buf = unsafe { NonNull::new_unchecked(inner.buffer.as_ptr().cast_mut().cast::<u8>()) };
-        let mask = inner.mask;
-        let next_free = unsafe {
-            NonNull::new_unchecked((&*inner.write_cursor as *const AtomicUsize).cast_mut())
-        };
-        let reader = unsafe {
-            NonNull::new_unchecked((&*inner.read_cursor as *const AtomicUsize).cast_mut())
-        };
-
+        let (producer, consumer) = channel(capacity, capacity / 8, || UnsafeCell::new(0u64));
         (
-            BytesProducer {
-                buf,
-                mask,
-                next_free,
-                reader,
-                write_cursor: 0,
-                read_cursor_cache: 0,
-                inner: inner.clone(),
-            },
-            BytesConsumer {
-                buf,
-                mask,
-                next_free,
-                reader,
-                read_cursor: 0,
-                published: 0,
-                write_cursor_cache: 0,
-                inner,
-            },
+            BytesProducer { core: producer },
+            BytesConsumer { core: consumer },
         )
     }
 }
 
-/// The producing half of an [`BytesRingBuffer`]. Owns the private write cursor.
+/// The producing half of a [`BytesRingBuffer`]. Owns the private write cursor.
 pub struct BytesProducer<P: WaitStrategy = YieldWait, C: WaitStrategy = YieldWait> {
-    buf: NonNull<u8>,
-    mask: usize,
-    /// Our published cursor (cached `NonNull` into `inner`).
-    next_free: NonNull<AtomicUsize>,
-    /// The consumer's published cursor (cached `NonNull` into `inner`).
-    reader: NonNull<AtomicUsize>,
-    /// Next byte to write. Private to this thread.
-    write_cursor: usize,
-    /// Cached snapshot of the consumer's `read_cursor`.
-    read_cursor_cache: usize,
-    inner: Arc<Inner<P, C>>,
-}
-
-// SAFETY: as for `spsc::Producer` — only producer-private state plus atomics.
-unsafe impl<P: WaitStrategy + Send + Sync, C: WaitStrategy + Send + Sync> Send
-    for BytesProducer<P, C>
-{
+    core: ProducerCore<Word, P, C>,
 }
 
 impl<P, C> BytesProducer<P, C>
@@ -281,7 +197,7 @@ where
     #[inline]
     pub fn push(&mut self, msg: &[u8]) {
         let (pad, total) = self.frame(msg.len());
-        self.wait_for_space(total);
+        self.core.wait_for_space(total);
         // SAFETY: `frame` sized the record and `wait_for_space` confirmed
         // `total` free bytes.
         unsafe { self.write_frame(pad, msg.len(), Some(msg.as_ptr())) };
@@ -290,6 +206,11 @@ where
     /// Enqueue a copy of `msg` without blocking. Returns `false` if there is
     /// not enough free space.
     ///
+    /// "Free" is judged against the consumer's *published* progress; while
+    /// the consumer defers publishes in the backed-up regime this can
+    /// spuriously fail with up to `capacity / 8` (max 4096) bytes consumed
+    /// but not yet published.
+    ///
     /// # Panics
     ///
     /// Panics if `msg.len() > self.max_message_len()`.
@@ -297,7 +218,7 @@ where
     #[must_use]
     pub fn try_push(&mut self, msg: &[u8]) -> bool {
         let (pad, total) = self.frame(msg.len());
-        if !self.has_space(total) {
+        if !self.core.has_space(total) {
             return false;
         }
         // SAFETY: as in `push`.
@@ -317,7 +238,7 @@ where
     #[inline]
     pub fn claim(&mut self, len: usize) -> WriteSlot<'_, P, C> {
         let (pad, total) = self.frame(len);
-        self.wait_for_space(total);
+        self.core.wait_for_space(total);
         let payload = self.payload_ptr(pad);
         WriteSlot {
             producer: self,
@@ -336,7 +257,7 @@ where
     #[inline]
     pub fn try_claim(&mut self, len: usize) -> Option<WriteSlot<'_, P, C>> {
         let (pad, total) = self.frame(len);
-        if !self.has_space(total) {
+        if !self.core.has_space(total) {
             return None;
         }
         let payload = self.payload_ptr(pad);
@@ -348,73 +269,38 @@ where
         })
     }
 
+    /// Base of the byte buffer.
+    #[inline(always)]
+    fn base(&self) -> *mut u8 {
+        self.core.buf.as_ptr().cast::<u8>()
+    }
+
     /// Where the payload of a record claimed with `pad` bytes of wrap padding
     /// will start.
     #[inline(always)]
     fn payload_ptr(&self, pad: usize) -> NonNull<u8> {
-        let pos = self.write_cursor.wrapping_add(pad) & self.mask;
+        let pos = self.core.write_cursor.wrapping_add(pad) & self.core.mask;
         // SAFETY: in bounds — `frame` reserved `HEADER + len` contiguous
-        // bytes starting at `pos`, and `buf` is non-null.
-        unsafe { NonNull::new_unchecked(self.buf.as_ptr().add(pos + HEADER)) }
+        // bytes starting at `pos`, and the buffer base is non-null.
+        unsafe { NonNull::new_unchecked(self.base().add(pos + HEADER)) }
     }
 
     /// Compute the record framing for a `len`-byte message at the current
     /// write position: `(padding_bytes, total_bytes_consumed)`.
     #[inline]
     fn frame(&self, len: usize) -> (usize, usize) {
-        let capacity = self.mask + 1;
+        let capacity = self.core.capacity();
         assert!(
             len <= max_message_len(capacity),
             "message length {len} exceeds max_message_len ({})",
             max_message_len(capacity),
         );
-        let record = align_up(HEADER + len);
-        let to_end = capacity - (self.write_cursor & self.mask);
+        let record = record_len(len);
+        let to_end = capacity - (self.core.write_cursor & self.core.mask);
         if record <= to_end {
             (0, record)
         } else {
             (to_end, to_end + record)
-        }
-    }
-
-    /// Check for `total` free bytes, reloading the consumer's cursor at most
-    /// once — the same reload-once shape as `spsc::Producer::try_push`.
-    /// Fullness is judged on the wrapped cursor *difference* (the true byte
-    /// occupancy), never on absolute values — byte cursors wrap `usize` after
-    /// only 4 GiB of traffic on 32-bit targets.
-    #[inline]
-    fn has_space(&mut self, total: usize) -> bool {
-        let capacity = self.mask + 1;
-        if self
-            .write_cursor
-            .wrapping_add(total)
-            .wrapping_sub(self.read_cursor_cache)
-            > capacity
-        {
-            // SAFETY: `reader` is a `NonNull` into the live `inner`.
-            self.read_cursor_cache = unsafe { (*self.reader.as_ptr()).load(Ordering::Acquire) };
-            if self
-                .write_cursor
-                .wrapping_add(total)
-                .wrapping_sub(self.read_cursor_cache)
-                > capacity
-            {
-                return false;
-            }
-        }
-        true
-    }
-
-    /// Spin/park until `total` free bytes are available.
-    #[inline]
-    fn wait_for_space(&mut self, total: usize) {
-        while !self.has_space(total) {
-            let target = self.write_cursor.wrapping_add(total);
-            let capacity = self.mask + 1;
-            let reader = self.reader.as_ptr();
-            self.inner.producer_wait.wait(|| {
-                target.wrapping_sub(unsafe { (*reader).load(Ordering::Acquire) }) <= capacity
-            });
         }
     }
 
@@ -424,14 +310,14 @@ where
     ///
     /// # Safety
     ///
-    /// The caller must have confirmed `pad + align_up(HEADER + len)` free
-    /// bytes, with `(pad, _)` computed by `frame(len)` at the current
-    /// `write_cursor`. `src`, when given, must point to `len` readable bytes.
+    /// The caller must have confirmed `pad + record_len(len)` free bytes,
+    /// with `(pad, _)` computed by `frame(len)` at the current write cursor.
+    /// `src`, when given, must point to `len` readable bytes.
     #[inline(always)]
     unsafe fn write_frame(&mut self, pad: usize, len: usize, src: Option<*const u8>) {
-        let base = self.buf.as_ptr();
-        let mask = self.mask;
-        let mut cur = self.write_cursor;
+        let base = self.base();
+        let mask = self.core.mask;
+        let mut cur = self.core.write_cursor;
 
         // SAFETY (whole block): offsets are `& mask`, so in bounds; every
         // record boundary is 4-aligned (records and padding are multiples of
@@ -450,31 +336,33 @@ where
             if let Some(src) = src {
                 std::ptr::copy_nonoverlapping(src, base.add(pos + HEADER), len);
             }
-            cur = cur.wrapping_add(align_up(HEADER + len));
-            self.write_cursor = cur;
-            (*self.next_free.as_ptr()).store(cur, Ordering::Release);
         }
 
-        // Wake a consumer blocked in `pop`. A no-op for the spin strategies.
-        self.inner.consumer_wait.notify();
+        // One publish covers the padding and the record together.
+        self.core.publish(pad + record_len(len));
     }
 
     /// Whether the ring currently holds no messages.
+    ///
+    /// The consumer publishes its progress adaptively, so this may
+    /// transiently report `false` for a ring the consumer has fully drained;
+    /// it never reports `true` for a non-empty ring.
     #[inline]
     pub fn is_empty(&self) -> bool {
-        is_empty(&self.inner)
+        shared_is_empty(&self.core.inner)
     }
 
-    /// The ring's capacity in bytes (`N` rounded up to a power of two).
+    /// The ring's capacity in bytes (the requested minimum rounded up to a
+    /// power of two).
     #[inline]
     pub fn capacity(&self) -> usize {
-        self.mask + 1
+        self.core.capacity()
     }
 
     /// The largest payload a single message may carry: `capacity / 2 - 4`.
     #[inline]
     pub fn max_message_len(&self) -> usize {
-        max_message_len(self.mask + 1)
+        max_message_len(self.core.capacity())
     }
 }
 
@@ -517,8 +405,9 @@ impl<P: WaitStrategy, C: WaitStrategy> core::ops::Deref for WriteSlot<'_, P, C> 
 
     #[inline]
     fn deref(&self) -> &[u8] {
-        // SAFETY: `payload` points at the `len` reserved bytes; the producer
-        // exclusively owns this unpublished region.
+        // SAFETY: `payload` points at the `len` reserved bytes (always
+        // initialized memory); the producer exclusively owns this
+        // unpublished region.
         unsafe { std::slice::from_raw_parts(self.payload.as_ptr(), self.len) }
     }
 }
@@ -531,42 +420,12 @@ impl<P: WaitStrategy, C: WaitStrategy> core::ops::DerefMut for WriteSlot<'_, P, 
     }
 }
 
-/// The consuming half of an [`BytesRingBuffer`]. Owns the private read cursor.
+/// The consuming half of a [`BytesRingBuffer`]. Owns the private read cursor.
+///
+/// Dropping the consumer publishes any deferred progress and wakes a blocked
+/// producer (handled by the shared cursor engine).
 pub struct BytesConsumer<P: WaitStrategy = YieldWait, C: WaitStrategy = YieldWait> {
-    buf: NonNull<u8>,
-    mask: usize,
-    /// The producer's published cursor (cached `NonNull` into `inner`).
-    next_free: NonNull<AtomicUsize>,
-    /// Our published cursor (cached `NonNull` into `inner`).
-    reader: NonNull<AtomicUsize>,
-    /// Next byte to read. Private to this thread.
-    read_cursor: usize,
-    /// The value of `read_cursor` last published to the shared atomic. As in
-    /// `spsc::Consumer`, publishes are per-message while the consumer is
-    /// caught up and deferred/batched while the ring is backed up, so a
-    /// full-ring producer's polling cannot steal the cursor's cache line
-    /// between every message.
-    published: usize,
-    /// Cached snapshot of the producer's `write_cursor`.
-    write_cursor_cache: usize,
-    inner: Arc<Inner<P, C>>,
-}
-
-impl<P: WaitStrategy, C: WaitStrategy> Drop for BytesConsumer<P, C> {
-    fn drop(&mut self) {
-        // Publish any deferred progress and wake a blocked producer, so a
-        // surviving producer sees the freed bytes even with a genuinely
-        // parking custom `WaitStrategy`.
-        if self.read_cursor != self.published {
-            self.flush();
-        }
-    }
-}
-
-// SAFETY: as for `spsc::Consumer`.
-unsafe impl<P: WaitStrategy + Send + Sync, C: WaitStrategy + Send + Sync> Send
-    for BytesConsumer<P, C>
-{
+    core: ConsumerCore<Word, P, C>,
 }
 
 impl<P, C> BytesConsumer<P, C>
@@ -579,18 +438,7 @@ where
     /// the returned [`Msg`] drops.
     #[inline]
     pub fn pop(&mut self) -> Msg<'_, P, C> {
-        while self.write_cursor_cache.wrapping_sub(self.read_cursor) == 0 {
-            // SAFETY: `next_free` is a `NonNull` into the live `inner`.
-            self.write_cursor_cache = unsafe { (*self.next_free.as_ptr()).load(Ordering::Acquire) };
-            if self.write_cursor_cache.wrapping_sub(self.read_cursor) == 0 {
-                let read_cursor = self.read_cursor;
-                let next_free = self.next_free.as_ptr();
-                self.inner.consumer_wait.wait(|| {
-                    unsafe { (*next_free).load(Ordering::Acquire) }.wrapping_sub(read_cursor) != 0
-                });
-            }
-        }
-
+        self.core.wait_for_item();
         self.next_msg()
     }
 
@@ -598,14 +446,9 @@ where
     /// empty.
     #[inline]
     pub fn try_pop(&mut self) -> Option<Msg<'_, P, C>> {
-        if self.write_cursor_cache.wrapping_sub(self.read_cursor) == 0 {
-            // SAFETY: `next_free` is a `NonNull` into the live `inner`.
-            self.write_cursor_cache = unsafe { (*self.next_free.as_ptr()).load(Ordering::Acquire) };
-            if self.write_cursor_cache.wrapping_sub(self.read_cursor) == 0 {
-                return None;
-            }
+        if !self.core.has_item() {
+            return None;
         }
-
         Some(self.next_msg())
     }
 
@@ -621,32 +464,33 @@ where
     /// `f` sees it, and progress is published even if `f` panics, so an
     /// unwound drain never re-delivers already-processed messages.
     pub fn drain<F: FnMut(&[u8])>(&mut self, mut f: F) -> usize {
-        // SAFETY: `next_free` is a `NonNull` into the live `inner`.
-        self.write_cursor_cache = unsafe { (*self.next_free.as_ptr()).load(Ordering::Acquire) };
-        let end = self.write_cursor_cache;
+        let end = if self.core.has_item() {
+            self.core.write_cursor_cache
+        } else {
+            return 0;
+        };
 
         // Publish on exit — including an unwind out of `f`.
         struct FlushOnDrop<'a, P: WaitStrategy, C: WaitStrategy>(&'a mut BytesConsumer<P, C>);
         impl<P: WaitStrategy, C: WaitStrategy> Drop for FlushOnDrop<'_, P, C> {
             fn drop(&mut self) {
-                if self.0.read_cursor != self.0.published {
-                    self.0.flush();
-                }
+                self.0.core.flush_pending();
             }
         }
 
         let guard = FlushOnDrop(self);
-        let base = guard.0.buf.as_ptr();
-        let mask = guard.0.mask;
+        let base = guard.0.base();
+        let mask = guard.0.core.mask;
         let mut count = 0;
 
-        while end.wrapping_sub(guard.0.read_cursor) != 0 {
+        while end.wrapping_sub(guard.0.core.read_cursor) != 0 {
             // SAFETY: records below `end` are fully published.
-            let (cur, len, payload) = unsafe { decode_record(base, mask, guard.0.read_cursor) };
+            let (cur, len, payload) =
+                unsafe { decode_record(base, mask, guard.0.core.read_cursor) };
             // Advance before the callback: the record counts as consumed even
             // if `f` unwinds. The payload slice stays valid — the producer
             // cannot reuse it until the guard publishes, strictly after `f`.
-            guard.0.read_cursor = cur.wrapping_add(record_len(len));
+            guard.0.core.read_cursor = cur.wrapping_add(record_len(len));
             // SAFETY: payload is contiguous, in bounds, and fully published.
             f(unsafe { std::slice::from_raw_parts(payload, len) });
             count += 1;
@@ -654,14 +498,10 @@ where
         count
     }
 
-    /// Publish the private read cursor to the shared atomic and wake a
-    /// producer blocked in `push`. The wake-up is a no-op for spin strategies.
+    /// Base of the byte buffer.
     #[inline(always)]
-    fn flush(&mut self) {
-        // SAFETY: `reader` is a `NonNull` into the live `inner`.
-        unsafe { (*self.reader.as_ptr()).store(self.read_cursor, Ordering::Release) };
-        self.published = self.read_cursor;
-        self.inner.producer_wait.notify();
+    fn base(&self) -> *mut u8 {
+        self.core.buf.as_ptr().cast::<u8>()
     }
 
     /// Common tail of `pop`/`try_pop`: availability is already confirmed;
@@ -670,9 +510,9 @@ where
     fn next_msg(&mut self) -> Msg<'_, P, C> {
         // SAFETY: availability was confirmed by the caller.
         let (cur, len, payload) =
-            unsafe { decode_record(self.buf.as_ptr(), self.mask, self.read_cursor) };
-        self.read_cursor = cur;
-        // SAFETY: `payload` is derived from the non-null `buf`.
+            unsafe { decode_record(self.base(), self.core.mask, self.core.read_cursor) };
+        self.core.read_cursor = cur;
+        // SAFETY: `payload` is derived from the non-null buffer base.
         let payload = unsafe { NonNull::new_unchecked(payload.cast_mut()) };
         Msg {
             payload,
@@ -685,21 +525,20 @@ where
     /// the consumer's private cursor, which is always current.
     #[inline]
     pub fn is_empty(&self) -> bool {
-        // SAFETY: `next_free` is a `NonNull` into the live `inner`.
-        unsafe { (*self.next_free.as_ptr()).load(Ordering::Acquire) }.wrapping_sub(self.read_cursor)
-            == 0
+        self.core.available() == 0
     }
 
-    /// The ring's capacity in bytes (`N` rounded up to a power of two).
+    /// The ring's capacity in bytes (the requested minimum rounded up to a
+    /// power of two).
     #[inline]
     pub fn capacity(&self) -> usize {
-        self.mask + 1
+        self.core.capacity()
     }
 
     /// The largest payload a single message may carry: `capacity / 2 - 4`.
     #[inline]
     pub fn max_message_len(&self) -> usize {
-        max_message_len(self.mask + 1)
+        max_message_len(self.core.capacity())
     }
 }
 
@@ -736,29 +575,14 @@ impl<P: WaitStrategy, C: WaitStrategy> core::ops::Deref for Msg<'_, P, C> {
 impl<P: WaitStrategy, C: WaitStrategy> Drop for Msg<'_, P, C> {
     #[inline]
     fn drop(&mut self) {
-        let c = &mut *self.consumer;
-        c.read_cursor = c.read_cursor.wrapping_add(record_len(self.len));
-        // Adaptive publish, as in `spsc::Consumer::advance`: publish
-        // immediately when caught up (uncontended, latency-critical, and it
-        // guarantees the consumer never waits or reports empty with progress
-        // deferred); defer to one publish per `publish_batch_bytes` while the
-        // ring is backed up, where a full-ring producer polls this line and
-        // per-message publishes would degrade both threads into a lockstep
-        // cache-line ping-pong. The clamp bounds how much freed space a
-        // blocked producer can transiently not see.
-        if c.read_cursor == c.write_cursor_cache
-            || c.read_cursor.wrapping_sub(c.published) >= publish_batch_bytes(c.mask + 1)
-        {
-            c.flush();
-        }
+        // Release the record with an adaptive publish (see the cursor
+        // engine): immediate when caught up or the ring was observed full,
+        // one publish per `publish_batch_bytes` while backed up — a full-ring
+        // producer's polling cannot force a per-message cache-line ping-pong,
+        // and the clamp bounds how much freed space a blocked producer can
+        // transiently not see.
+        let c = &mut self.consumer.core;
+        let batch = publish_batch_bytes(c.capacity());
+        c.advance(record_len(self.len), batch);
     }
-}
-
-#[inline]
-fn is_empty<P, C>(inner: &Inner<P, C>) -> bool {
-    inner
-        .write_cursor
-        .load(Ordering::Acquire)
-        .wrapping_sub(inner.read_cursor.load(Ordering::Acquire))
-        == 0
 }
