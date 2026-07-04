@@ -227,3 +227,46 @@ fn force_attach_replaces_dead_producer_single_side() {
     assert_eq!(&*rx.pop(), b"from-old-producer");
     assert_eq!(&*rx.pop(), b"from-new-producer");
 }
+
+/// The lease/force/recovery protocol on the ELEMENT ring (the byte ring has
+/// its own coverage above): polite-attach conflict, single-side force
+/// takeover, and full recovery with data intact.
+#[test]
+fn element_ring_lease_force_and_recovery() {
+    let fd = memfd("rb-elem-lease").unwrap();
+    // SAFETY: fresh private memfd; u64 is ShmItem.
+    let (mut tx, mut rx) = unsafe { RingBuffer::<u64>::create_shm(fd.as_fd(), 256) }.unwrap();
+    tx.push(1);
+    tx.push(2);
+
+    // Roles held: polite attach conflicts.
+    // SAFETY: cooperating handles only.
+    assert!(
+        unsafe { RingBuffer::<u64, PauseWait, PauseWait>::attach_shm_producer(fd.as_fd()) }
+            .is_err()
+    );
+
+    // Producer "crashes" (leaked handle, lease left set); force takeover.
+    std::mem::forget(tx);
+    // SAFETY: the old producer is gone (leaked, never used again).
+    let mut tx2 =
+        unsafe { RingBuffer::<u64, YieldWait, YieldWait>::force_attach_shm_producer(fd.as_fd()) }
+            .unwrap();
+    tx2.push(3);
+    assert_eq!(rx.pop(), 1);
+    assert_eq!(rx.pop(), 2);
+    assert_eq!(rx.pop(), 3);
+
+    // Full recovery: everything published (but unconsumed) survives.
+    tx2.push(40);
+    tx2.push(41);
+    std::mem::forget(tx2);
+    std::mem::forget(rx);
+    // SAFETY: both previous holders are gone (leaked, never used again).
+    let (mut tx3, mut rx3) = unsafe { RingBuffer::<u64>::recover_shm(fd.as_fd()) }.unwrap();
+    assert_eq!(rx3.pop(), 40);
+    assert_eq!(rx3.pop(), 41);
+    tx3.push(5);
+    assert_eq!(rx3.pop(), 5);
+    assert!(rx3.try_pop().is_none());
+}

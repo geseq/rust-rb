@@ -40,7 +40,7 @@
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
 
-use crate::cursor::{channel, publish_batch, ConsumerCore, ProducerCore};
+use crate::cursor::{channel, publish_batch, round_capacity, ConsumerCore, ProducerCore};
 use crate::wait::{WaitStrategy, YieldWait};
 
 /// The slot type: a cell the producer writes and the consumer moves out of,
@@ -89,10 +89,7 @@ where
     ///
     /// Panics if `min_capacity == 0`.
     pub fn with_wait_strategies(min_capacity: usize) -> (Producer<T, P, C>, Consumer<T, P, C>) {
-        assert!(min_capacity > 0, "capacity must be greater than zero");
-        let capacity = min_capacity
-            .checked_next_power_of_two()
-            .expect("capacity too large to round up to a power of two");
+        let capacity = round_capacity(min_capacity, 1);
 
         let (producer, consumer) =
             channel(

@@ -40,7 +40,9 @@
 use std::cell::UnsafeCell;
 use std::ptr::NonNull;
 
-use crate::cursor::{channel, publish_batch, ConsumerCore, ProducerCore, SlotCleanup};
+use crate::cursor::{
+    channel, publish_batch, round_capacity, ConsumerCore, ProducerCore, SlotCleanup,
+};
 use crate::wait::{WaitStrategy, YieldWait};
 
 /// The buffer word type: `u64` so the base is 8-aligned (a `Box<[u8]>`
@@ -50,7 +52,9 @@ use crate::wait::{WaitStrategy, YieldWait};
 /// Zero-initialized on construction so every byte is always initialized:
 /// `WriteSlot`/`Msg` hand out `&[u8]` views into the ring, which would be
 /// instant UB over uninitialized memory. Zeroing costs one pass at
-/// construction and nothing on the hot path.
+/// construction and nothing on the hot path. (Shm rings inherit the same
+/// guarantee differently: mapped file bytes are always initialized memory,
+/// and `create_shm` zeroes the buffer area explicitly.)
 type Word = UnsafeCell<u64>;
 
 // The byte ring's slots are plain words with nothing to drop, and its cursors
@@ -64,8 +68,13 @@ impl SlotCleanup for Word {
 
 /// Size of the length header preceding each payload.
 const HEADER: usize = 4;
-/// Record alignment. Keeps every header read/write naturally aligned.
-const ALIGN: usize = 4;
+/// Record alignment. Keeps every header read/write naturally aligned. Also
+/// the alignment shm attach validation enforces on stored cursors.
+pub(crate) const ALIGN: usize = 4;
+
+/// Smallest legal byte-ring capacity: below 8 the `max_message_len`
+/// arithmetic underflows (shared with shm attach validation).
+pub(crate) const MIN_CAPACITY: usize = 8;
 /// Header value marking a padding record that runs to the end of the buffer.
 const PADDING: u32 = u32::MAX;
 
@@ -163,11 +172,7 @@ where
     ///
     /// Panics if `min_capacity == 0`.
     pub fn with_wait_strategies(min_capacity: usize) -> (BytesProducer<P, C>, BytesConsumer<P, C>) {
-        assert!(min_capacity > 0, "capacity must be greater than zero");
-        let capacity = min_capacity
-            .checked_next_power_of_two()
-            .expect("capacity too large to round up to a power of two")
-            .max(8);
+        let capacity = round_capacity(min_capacity, MIN_CAPACITY);
 
         let (producer, consumer) = channel(capacity, capacity / 8, || UnsafeCell::new(0u64));
         (
@@ -469,9 +474,12 @@ where
     /// keep `f` short or prefer [`pop`](Self::pop) when the producer is
     /// starved for space.
     ///
-    /// Delivery is at-most-once: the cursor advances over each record before
-    /// `f` sees it, and progress is published even if `f` panics, so an
-    /// unwound drain never re-delivers already-processed messages.
+    /// Delivery is at-most-once **within a process**: the cursor advances
+    /// over each record before `f` sees it, and progress is published even if
+    /// `f` panics, so an unwound drain never re-delivers already-processed
+    /// messages. (Across a *process crash* mid-drain, none of the in-progress
+    /// batch was published, so shm crash recovery re-delivers the whole
+    /// interrupted drain — see the shm module's at-least-once notes.)
     pub fn drain<F: FnMut(&[u8])>(&mut self, mut f: F) -> usize {
         // Unconditionally refresh the view of the producer's cursor: the
         // contract is "everything currently in the ring", which a stale
@@ -594,17 +602,23 @@ impl<P: WaitStrategy, C: WaitStrategy> Drop for Msg<'_, P, C> {
         // transiently not see.
         let c = &mut self.consumer.core;
         let capacity = c.capacity();
-        // Watermark = capacity / 2: a byte producer blocks whenever
-        // contiguous space runs short (free < pad + record), which can happen
-        // well below exactly full — and the frame decoder consumes wrap
-        // padding into the cursor before this advance, further skewing plain
-        // occupancy. Records are capped at capacity / 2, so any blocked
-        // producer implies occupancy above this watermark, guaranteeing the
-        // immediate release the engine's liveness rule promises.
+        // Padding-aware watermark. A byte producer blocks whenever
+        // `free < pad + record`; from this side we know the producer's next
+        // write position (our cached view of its cursor), so we can bound the
+        // worst case it might need: a max-size record (capacity/2) plus, if
+        // that record cannot fit before the buffer end, the wrap padding to
+        // get past it. Any occupancy above `capacity - max_needed` could
+        // therefore be blocking a legal producer, and the release publishes
+        // immediately. (With a stale cursor cache the bound lags like every
+        // other cached-view decision: the batch clamp and catch-up flush
+        // still bound the wait.)
+        let half = capacity / 2;
+        let to_end = capacity - (c.write_cursor_cache & (capacity - 1));
+        let max_needed = half + if to_end < half { to_end } else { 0 };
         c.advance(
             record_len(self.len),
             publish_batch(capacity, MAX_PUBLISH_BATCH_BYTES),
-            capacity / 2,
+            capacity - max_needed,
         );
     }
 }

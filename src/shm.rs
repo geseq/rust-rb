@@ -19,8 +19,8 @@
 //! 16   capacity  u64      cursor units (power of two)
 //! 24   unit_size u64      bytes per cursor unit (1, or size_of::<T>())
 //! 32   arch_bits u32      usize width; cross-arch attach is rejected
-//! 40   producer_lease u64 (atomic) pid holding the producer role, 0 = free
-//! 48   consumer_lease u64 (atomic) pid holding the consumer role, 0 = free
+//! 40   producer_lease u64 (atomic) opaque token of the producer holder, 0 = free
+//! 48   consumer_lease u64 (atomic) opaque token of the consumer holder, 0 = free
 //! 128  write_cursor  usize (atomic, own 128-byte slot)
 //! 256  read_cursor   usize (atomic, own 128-byte slot)
 //! 384  buffer        capacity * unit_size bytes
@@ -36,16 +36,26 @@
 //!
 //! # Roles, leases, and crash recovery
 //!
-//! Each side holds a *lease* (its pid) in the header; dropping a handle
-//! releases its lease. [`create_shm`](BytesRingBuffer::create_shm) takes
-//! both roles; `attach_*` claims one free role; `recover_shm` reclaims roles
-//! whose holder is dead (best-effort `kill(pid, 0)` liveness probe — pid
-//! reuse can defeat it, which is part of the `unsafe` contract). Because a
-//! record becomes visible only through the producer's single `Release`
-//! cursor store, a producer that dies mid-write leaves the region fully
-//! consistent: everything published is drainable, the unpublished partial
-//! record is simply invisible and its space is reused once the producer role
-//! is re-attached.
+//! Each side holds a *lease* — an opaque random token — in the header;
+//! dropping a handle releases its lease with a guarded CAS (a stale handle
+//! whose role was taken over cannot revoke the successor, and its teardown
+//! skips the shared-cursor flush too). Tokens deliberately carry **no
+//! liveness meaning**: pids are namespace-relative, zombies look alive, and
+//! pids get reused, so whether a holder is really gone is knowledge only the
+//! application has. [`create_shm`](BytesRingBuffer::create_shm) takes both
+//! roles; `attach_*` claims a free role (`AddrInUse` if held);
+//! `force_attach_shm_producer`/`_consumer` unconditionally replace one role
+//! and `recover_shm` replaces both — the caller asserts, via the `unsafe`
+//! contract, that the previous holder(s) are gone.
+//!
+//! Because a record becomes visible only through the producer's single
+//! `Release` cursor store, a producer that dies mid-write leaves the region
+//! fully consistent: everything published is drainable, the unpublished
+//! partial record is simply invisible and its space is reused once the
+//! producer role is re-taken. Consumer-side recovery is **at-least-once**:
+//! the dead consumer's deferred publishes — up to `capacity / 8` (max
+//! 4096 bytes / 64 elements) in pop mode, or the whole in-progress batch if
+//! it died mid-`drain` — are delivered again.
 //!
 //! Only [`CrossProcess`] wait strategies are accepted: the spin strategies
 //! work across processes as-is, while `CvWait`'s mutex/condvar are
@@ -56,7 +66,7 @@ use std::io;
 use std::mem::MaybeUninit;
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use crate::cursor::{consumer_core_from_raw, producer_core_from_raw, AnchorKind, SlotCleanup};
@@ -181,14 +191,22 @@ impl ShmRegion {
         unsafe { &*self.at(offset).cast::<A>() }
     }
 
+    /// Atomic header reads: another cooperating process may be initializing
+    /// the region concurrently; `read_magic` is the Acquire that orders the
+    /// remaining (Relaxed) field reads.
+    fn read_magic(&self) -> u64 {
+        // SAFETY: OFF_MAGIC is 8-aligned and inside the mapping.
+        unsafe { self.atomic::<AtomicU64>(OFF_MAGIC) }.load(Ordering::Acquire)
+    }
+
     fn read_u64(&self, offset: usize) -> u64 {
         // SAFETY: header offsets are 8-aligned and inside the mapping.
-        unsafe { self.at(offset).cast::<u64>().read() }
+        unsafe { self.atomic::<AtomicU64>(offset) }.load(Ordering::Relaxed)
     }
 
     fn read_u32(&self, offset: usize) -> u32 {
         // SAFETY: header offsets are 4-aligned and inside the mapping.
-        unsafe { self.at(offset).cast::<u32>().read() }
+        unsafe { self.atomic::<AtomicU32>(offset) }.load(Ordering::Relaxed)
     }
 }
 
@@ -218,6 +236,18 @@ pub(crate) struct ShmAnchor<P, C> {
     token: u64,
     pub(crate) producer_wait: P,
     pub(crate) consumer_wait: C,
+}
+
+impl<P, C> ShmAnchor<P, C> {
+    /// Whether the role lease still holds this handle's token (i.e. no one
+    /// has force-taken the role). Consulted before teardown touches shared
+    /// state; a takeover racing this check is the force caller's asserted
+    /// responsibility ("the previous holder is gone").
+    pub(crate) fn owns_lease(&self) -> bool {
+        // SAFETY: lease offsets are 8-aligned and inside the mapping.
+        let lease: &AtomicU64 = unsafe { self.region.atomic(self.role.lease_offset()) };
+        lease.load(Ordering::Acquire) == self.token
+    }
 }
 
 impl<P, C> Drop for ShmAnchor<P, C> {
@@ -306,34 +336,61 @@ fn create_region(
     }
     let region = ShmRegion::map(fd, len)?;
 
-    // Header writes happen before any handle exists, so plain stores are
-    // fine; the leases and cursors are atomics from first use.
-    // SAFETY: all header offsets are aligned and inside the mapping.
+    // All header accesses go through atomics: plain stores would let the
+    // compiler elide the magic clear (a "dead" store) and give a concurrent
+    // attacher in another process no ordering at all.
+    // SAFETY: all header offsets are naturally aligned and inside the mapping.
     let (producer_token, consumer_token) = unsafe {
-        // Invalidate any previous ring in this fd FIRST, so the
-        // publish-magic-last torn-header guard below is meaningful even when
-        // the fd is being reused.
-        region.at(OFF_MAGIC).cast::<u64>().write(0);
-        region.at(OFF_VERSION).cast::<u32>().write(VERSION);
-        region.at(OFF_KIND).cast::<u32>().write(kind);
-        region.at(OFF_CAPACITY).cast::<u64>().write(capacity as u64);
+        // Invalidate any previous ring in this fd FIRST (SeqCst store: must
+        // neither be elided nor sink past the field stores), so a concurrent
+        // validator can only ever observe "no ring" or a complete header —
+        // never the old magic over half-new fields.
         region
-            .at(OFF_UNIT_SIZE)
-            .cast::<u64>()
-            .write(unit_size as u64);
-        region.at(OFF_ARCH_BITS).cast::<u32>().write(usize::BITS);
+            .atomic::<AtomicU64>(OFF_MAGIC)
+            .store(0, Ordering::SeqCst);
+        region
+            .atomic::<AtomicU32>(OFF_VERSION)
+            .store(VERSION, Ordering::Relaxed);
+        region
+            .atomic::<AtomicU32>(OFF_KIND)
+            .store(kind, Ordering::Relaxed);
+        region
+            .atomic::<AtomicU64>(OFF_CAPACITY)
+            .store(capacity as u64, Ordering::Relaxed);
+        region
+            .atomic::<AtomicU64>(OFF_UNIT_SIZE)
+            .store(unit_size as u64, Ordering::Relaxed);
+        region
+            .atomic::<AtomicU32>(OFF_ARCH_BITS)
+            .store(usize::BITS, Ordering::Relaxed);
         let pt = lease_token();
         let ct = lease_token();
-        region.at(OFF_PRODUCER_LEASE).cast::<u64>().write(pt);
-        region.at(OFF_CONSUMER_LEASE).cast::<u64>().write(ct);
-        region.at(OFF_WRITE_CURSOR).cast::<usize>().write(0);
-        region.at(OFF_READ_CURSOR).cast::<usize>().write(0);
-        // Publish the magic last: an attacher that sees it sees a complete
-        // header (same-process ordering suffices for cooperating processes
-        // that coordinate fd hand-off, which happens-after this call).
-        region.at(OFF_MAGIC).cast::<u64>().write(MAGIC);
+        region
+            .atomic::<AtomicU64>(OFF_PRODUCER_LEASE)
+            .store(pt, Ordering::Relaxed);
+        region
+            .atomic::<AtomicU64>(OFF_CONSUMER_LEASE)
+            .store(ct, Ordering::Relaxed);
+        region
+            .atomic::<AtomicUsize>(OFF_WRITE_CURSOR)
+            .store(0, Ordering::Relaxed);
+        region
+            .atomic::<AtomicUsize>(OFF_READ_CURSOR)
+            .store(0, Ordering::Relaxed);
+        // Publish the magic last with Release: an attacher that Acquire-loads
+        // it sees every header field above.
+        region
+            .atomic::<AtomicU64>(OFF_MAGIC)
+            .store(MAGIC, Ordering::Release);
         (pt, ct)
     };
+
+    // Match the heap ring's zeroed-buffer guarantee even when the fd is
+    // reused and carries old contents (one pass at create time).
+    // SAFETY: the buffer span is inside the mapping.
+    unsafe {
+        std::ptr::write_bytes(region.at(BUFFER_OFFSET), 0, len - BUFFER_OFFSET);
+    }
     Ok((Arc::new(region), producer_token, consumer_token))
 }
 
@@ -357,7 +414,7 @@ fn open_region(
     unit_size: usize,
     min_capacity: usize,
     cursor_align: usize,
-) -> io::Result<Arc<ShmRegion>> {
+) -> io::Result<(Arc<ShmRegion>, usize)> {
     // Touching mapped pages past the file's end is SIGBUS, not an error
     // return — validate the size before every mapping.
     let err = |m: &str| io::Error::new(io::ErrorKind::InvalidData, m.to_string());
@@ -366,7 +423,7 @@ fn open_region(
     }
     // Map just the header first to learn the capacity.
     let header = ShmRegion::map(fd, BUFFER_OFFSET)?;
-    if header.read_u64(OFF_MAGIC) != MAGIC {
+    if header.read_magic() != MAGIC {
         return Err(err("bad magic: not a rust-rb shm ring"));
     }
     if header.read_u32(OFF_VERSION) != VERSION {
@@ -374,6 +431,9 @@ fn open_region(
     }
     if header.read_u32(OFF_KIND) != kind {
         return Err(err("ring kind mismatch (bytes vs element ring)"));
+    }
+    if unit_size == 0 {
+        return Err(err("zero-sized elements are not supported in shm rings"));
     }
     if header.read_u64(OFF_UNIT_SIZE) != unit_size as u64 {
         return Err(err("element size mismatch"));
@@ -403,14 +463,10 @@ fn open_region(
     if write % cursor_align != 0 || read % cursor_align != 0 {
         return Err(err("corrupt cursors: not record-aligned"));
     }
-    Ok(Arc::new(region))
+    Ok((Arc::new(region), capacity))
 }
 
 impl ShmRegion {
-    fn capacity(&self) -> usize {
-        self.read_u64(OFF_CAPACITY) as usize
-    }
-
     fn cursors(&self) -> (NonNull<AtomicUsize>, NonNull<AtomicUsize>) {
         (
             NonNull::new(self.at(OFF_WRITE_CURSOR).cast()).expect("mapping is non-null"),
@@ -431,6 +487,7 @@ impl ShmRegion {
 /// Region layout must match `B` (validated by `open_region`/`create_region`).
 unsafe fn shm_producer_core<B, P, C>(
     region: Arc<ShmRegion>,
+    capacity: usize,
     token: u64,
 ) -> crate::cursor::ProducerCore<B, P, C>
 where
@@ -439,7 +496,6 @@ where
     C: CrossProcess + Default,
 {
     let (write, read) = region.cursors();
-    let capacity = region.capacity();
     let buf = region.buffer::<B>();
     let anchor = AnchorKind::Shm(ShmAnchor {
         region,
@@ -461,6 +517,7 @@ where
 /// As for `shm_producer_core`.
 unsafe fn shm_consumer_core<B, P, C>(
     region: Arc<ShmRegion>,
+    capacity: usize,
     token: u64,
 ) -> crate::cursor::ConsumerCore<B, P, C>
 where
@@ -469,7 +526,6 @@ where
     C: CrossProcess + Default,
 {
     let (write, read) = region.cursors();
-    let capacity = region.capacity();
     let buf = region.buffer::<B>();
     let anchor = AnchorKind::Shm(ShmAnchor {
         region,
@@ -488,12 +544,10 @@ pub type BytesPair<P, C> = (BytesProducer<P, C>, BytesConsumer<P, C>);
 /// Both halves of a shm-backed element ring.
 pub type ElemPair<T, P, C> = (Producer<T, P, C>, Consumer<T, P, C>);
 
-/// Byte-ring capacity floor (see `spsc_bytes`): below 8 the max-message
-/// arithmetic underflows.
-const BYTES_MIN_CAPACITY: usize = 8;
-/// Byte-ring cursors advance in ALIGN(4)-byte records; the frame decoder's
-/// aligned u32 header reads rely on it.
-const BYTES_CURSOR_ALIGN: usize = 4;
+/// Byte-ring capacity floor and record alignment, shared with the ring's own
+/// constructor and frame decoder so they cannot drift.
+const BYTES_MIN_CAPACITY: usize = crate::spsc_bytes::MIN_CAPACITY;
+const BYTES_CURSOR_ALIGN: usize = crate::spsc_bytes::ALIGN;
 
 impl BytesRingBuffer {
     /// Initialize `fd` as a fresh shm-backed byte ring and return both
@@ -540,7 +594,7 @@ where
     P: CrossProcess + Send + Sync,
     C: CrossProcess + Send + Sync,
 {
-    fn open(fd: BorrowedFd<'_>) -> io::Result<Arc<ShmRegion>> {
+    fn open(fd: BorrowedFd<'_>) -> io::Result<(Arc<ShmRegion>, usize)> {
         open_region(fd, KIND_BYTES, 1, BYTES_MIN_CAPACITY, BYTES_CURSOR_ALIGN)
     }
 
@@ -554,17 +608,17 @@ where
         fd: BorrowedFd<'_>,
         min_capacity: usize,
     ) -> io::Result<BytesPair<P, C>> {
-        assert!(min_capacity > 0, "capacity must be greater than zero");
-        let capacity = min_capacity
-            .checked_next_power_of_two()
-            .expect("capacity too large to round up to a power of two")
-            .max(BYTES_MIN_CAPACITY);
+        let capacity = crate::cursor::round_capacity(min_capacity, BYTES_MIN_CAPACITY);
         let (region, pt, ct) = create_region(fd, KIND_BYTES, capacity, 1)?;
         // SAFETY: freshly initialized region matches the byte-ring layout.
         Ok(unsafe {
             (
-                BytesProducer::from_core(shm_producer_core::<Word, P, C>(region.clone(), pt)),
-                BytesConsumer::from_core(shm_consumer_core::<Word, P, C>(region, ct)),
+                BytesProducer::from_core(shm_producer_core::<Word, P, C>(
+                    region.clone(),
+                    capacity,
+                    pt,
+                )),
+                BytesConsumer::from_core(shm_consumer_core::<Word, P, C>(region, capacity, ct)),
             )
         })
     }
@@ -580,10 +634,12 @@ where
     /// producer handle exists (the lease enforces this against cooperating
     /// processes only).
     pub unsafe fn attach_shm_producer(fd: BorrowedFd<'_>) -> io::Result<BytesProducer<P, C>> {
-        let region = Self::open(fd)?;
+        let (region, capacity) = Self::open(fd)?;
         let token = claim_lease(&region, Role::Producer)?;
         // SAFETY: validated byte-ring region.
-        Ok(unsafe { BytesProducer::from_core(shm_producer_core::<Word, P, C>(region, token)) })
+        Ok(unsafe {
+            BytesProducer::from_core(shm_producer_core::<Word, P, C>(region, capacity, token))
+        })
     }
 
     /// Attach to an existing ring as the consumer (see
@@ -593,10 +649,12 @@ where
     ///
     /// Trust model, plus single-consumer.
     pub unsafe fn attach_shm_consumer(fd: BorrowedFd<'_>) -> io::Result<BytesConsumer<P, C>> {
-        let region = Self::open(fd)?;
+        let (region, capacity) = Self::open(fd)?;
         let token = claim_lease(&region, Role::Consumer)?;
         // SAFETY: validated byte-ring region.
-        Ok(unsafe { BytesConsumer::from_core(shm_consumer_core::<Word, P, C>(region, token)) })
+        Ok(unsafe {
+            BytesConsumer::from_core(shm_consumer_core::<Word, P, C>(region, capacity, token))
+        })
     }
 
     /// Unconditionally take over the **producer** role — single-side crash
@@ -609,27 +667,32 @@ where
     /// Trust model, plus: unconditional takeover — the caller asserts the
     /// previous producer is gone (a live one would corrupt the ring).
     pub unsafe fn force_attach_shm_producer(fd: BorrowedFd<'_>) -> io::Result<BytesProducer<P, C>> {
-        let region = Self::open(fd)?;
+        let (region, capacity) = Self::open(fd)?;
         let token = force_claim_lease(&region, Role::Producer);
         // SAFETY: validated byte-ring region.
-        Ok(unsafe { BytesProducer::from_core(shm_producer_core::<Word, P, C>(region, token)) })
+        Ok(unsafe {
+            BytesProducer::from_core(shm_producer_core::<Word, P, C>(region, capacity, token))
+        })
     }
 
     /// Unconditionally take over the **consumer** role — single-side crash
     /// recovery while the producer keeps running. Consumption resumes at the
     /// dead consumer's last *published* cursor: messages it consumed but had
-    /// not yet published — up to the deferred-publish window (`capacity / 8`,
-    /// max 4096 bytes) — are delivered again (at-least-once).
+    /// not yet published are delivered again (at-least-once) — up to the
+    /// deferred-publish window (`capacity / 8`, max 4096 bytes) in pop mode,
+    /// or the entire in-progress batch if it died mid-`drain`.
     ///
     /// # Safety
     ///
     /// As for [`force_attach_shm_producer`](Self::force_attach_shm_producer),
     /// for the consumer role.
     pub unsafe fn force_attach_shm_consumer(fd: BorrowedFd<'_>) -> io::Result<BytesConsumer<P, C>> {
-        let region = Self::open(fd)?;
+        let (region, capacity) = Self::open(fd)?;
         let token = force_claim_lease(&region, Role::Consumer);
         // SAFETY: validated byte-ring region.
-        Ok(unsafe { BytesConsumer::from_core(shm_consumer_core::<Word, P, C>(region, token)) })
+        Ok(unsafe {
+            BytesConsumer::from_core(shm_consumer_core::<Word, P, C>(region, capacity, token))
+        })
     }
 
     /// [`recover_shm`](BytesRingBuffer::recover_shm) with explicit wait
@@ -639,7 +702,7 @@ where
     ///
     /// See [`recover_shm`](BytesRingBuffer::recover_shm).
     pub unsafe fn recover_shm_with(fd: BorrowedFd<'_>) -> io::Result<BytesPair<P, C>> {
-        let region = Self::open(fd)?;
+        let (region, capacity) = Self::open(fd)?;
         // Unconditional: force both roles. No partial-failure path exists
         // (force cannot fail), so no lease can leak.
         let pt = force_claim_lease(&region, Role::Producer);
@@ -648,8 +711,12 @@ where
         // live cursors by the core constructors.
         Ok(unsafe {
             (
-                BytesProducer::from_core(shm_producer_core::<Word, P, C>(region.clone(), pt)),
-                BytesConsumer::from_core(shm_consumer_core::<Word, P, C>(region, ct)),
+                BytesProducer::from_core(shm_producer_core::<Word, P, C>(
+                    region.clone(),
+                    capacity,
+                    pt,
+                )),
+                BytesConsumer::from_core(shm_consumer_core::<Word, P, C>(region, capacity, ct)),
             )
         })
     }
@@ -695,7 +762,14 @@ where
     P: CrossProcess + Send + Sync,
     C: CrossProcess + Send + Sync,
 {
-    fn open(fd: BorrowedFd<'_>) -> io::Result<Arc<ShmRegion>> {
+    fn open(fd: BorrowedFd<'_>) -> io::Result<(Arc<ShmRegion>, usize)> {
+        // The invariants create_shm_with asserts must hold on ATTACH too —
+        // an attacher instantiated with a different `T` of the same size but
+        // higher alignment would otherwise get misaligned slots (UB).
+        assert!(
+            std::mem::align_of::<T>() <= 128,
+            "element alignment exceeds the buffer offset alignment"
+        );
         // Element cursors count whole elements; any value is decodable.
         open_region(fd, KIND_ELEMS, std::mem::size_of::<T>(), 1, 1)
     }
@@ -710,20 +784,25 @@ where
         fd: BorrowedFd<'_>,
         min_capacity: usize,
     ) -> io::Result<ElemPair<T, P, C>> {
-        assert!(min_capacity > 0, "capacity must be greater than zero");
         assert!(
             std::mem::align_of::<T>() <= 128,
             "element alignment exceeds the buffer offset alignment"
         );
-        let capacity = min_capacity
-            .checked_next_power_of_two()
-            .expect("capacity too large to round up to a power of two");
+        assert!(
+            std::mem::size_of::<T>() > 0,
+            "zero-sized elements are not supported in shm rings"
+        );
+        let capacity = crate::cursor::round_capacity(min_capacity, 1);
         let (region, pt, ct) = create_region(fd, KIND_ELEMS, capacity, std::mem::size_of::<T>())?;
         // SAFETY: freshly initialized region matches the element-ring layout.
         Ok(unsafe {
             (
-                Producer::from_core(shm_producer_core::<Slot<T>, P, C>(region.clone(), pt)),
-                Consumer::from_core(shm_consumer_core::<Slot<T>, P, C>(region, ct)),
+                Producer::from_core(shm_producer_core::<Slot<T>, P, C>(
+                    region.clone(),
+                    capacity,
+                    pt,
+                )),
+                Consumer::from_core(shm_consumer_core::<Slot<T>, P, C>(region, capacity, ct)),
             )
         })
     }
@@ -735,10 +814,12 @@ where
     /// Trust model, plus single-producer, plus `T` must be the exact type
     /// the ring was created with (only its size is validated).
     pub unsafe fn attach_shm_producer(fd: BorrowedFd<'_>) -> io::Result<Producer<T, P, C>> {
-        let region = Self::open(fd)?;
+        let (region, capacity) = Self::open(fd)?;
         let token = claim_lease(&region, Role::Producer)?;
         // SAFETY: validated element-ring region.
-        Ok(unsafe { Producer::from_core(shm_producer_core::<Slot<T>, P, C>(region, token)) })
+        Ok(unsafe {
+            Producer::from_core(shm_producer_core::<Slot<T>, P, C>(region, capacity, token))
+        })
     }
 
     /// Attach to an existing element ring as the consumer.
@@ -747,10 +828,12 @@ where
     ///
     /// As for [`attach_shm_producer`](Self::attach_shm_producer).
     pub unsafe fn attach_shm_consumer(fd: BorrowedFd<'_>) -> io::Result<Consumer<T, P, C>> {
-        let region = Self::open(fd)?;
+        let (region, capacity) = Self::open(fd)?;
         let token = claim_lease(&region, Role::Consumer)?;
         // SAFETY: validated element-ring region.
-        Ok(unsafe { Consumer::from_core(shm_consumer_core::<Slot<T>, P, C>(region, token)) })
+        Ok(unsafe {
+            Consumer::from_core(shm_consumer_core::<Slot<T>, P, C>(region, capacity, token))
+        })
     }
 
     /// Unconditionally take over the producer role (see
@@ -761,10 +844,12 @@ where
     /// See [`BytesRingBuffer::force_attach_shm_producer`], plus the `T`
     /// caveat of [`attach_shm_producer`](Self::attach_shm_producer).
     pub unsafe fn force_attach_shm_producer(fd: BorrowedFd<'_>) -> io::Result<Producer<T, P, C>> {
-        let region = Self::open(fd)?;
+        let (region, capacity) = Self::open(fd)?;
         let token = force_claim_lease(&region, Role::Producer);
         // SAFETY: validated element-ring region.
-        Ok(unsafe { Producer::from_core(shm_producer_core::<Slot<T>, P, C>(region, token)) })
+        Ok(unsafe {
+            Producer::from_core(shm_producer_core::<Slot<T>, P, C>(region, capacity, token))
+        })
     }
 
     /// Unconditionally take over the consumer role (see
@@ -776,10 +861,12 @@ where
     /// See [`BytesRingBuffer::force_attach_shm_consumer`], plus the `T`
     /// caveat of [`attach_shm_producer`](Self::attach_shm_producer).
     pub unsafe fn force_attach_shm_consumer(fd: BorrowedFd<'_>) -> io::Result<Consumer<T, P, C>> {
-        let region = Self::open(fd)?;
+        let (region, capacity) = Self::open(fd)?;
         let token = force_claim_lease(&region, Role::Consumer);
         // SAFETY: validated element-ring region.
-        Ok(unsafe { Consumer::from_core(shm_consumer_core::<Slot<T>, P, C>(region, token)) })
+        Ok(unsafe {
+            Consumer::from_core(shm_consumer_core::<Slot<T>, P, C>(region, capacity, token))
+        })
     }
 
     /// [`recover_shm`](RingBuffer::recover_shm) with explicit wait
@@ -790,14 +877,18 @@ where
     /// See [`BytesRingBuffer::recover_shm`], plus the `T` caveat of
     /// [`attach_shm_producer`](Self::attach_shm_producer).
     pub unsafe fn recover_shm_with(fd: BorrowedFd<'_>) -> io::Result<ElemPair<T, P, C>> {
-        let region = Self::open(fd)?;
+        let (region, capacity) = Self::open(fd)?;
         let pt = force_claim_lease(&region, Role::Producer);
         let ct = force_claim_lease(&region, Role::Consumer);
         // SAFETY: validated element-ring region.
         Ok(unsafe {
             (
-                Producer::from_core(shm_producer_core::<Slot<T>, P, C>(region.clone(), pt)),
-                Consumer::from_core(shm_consumer_core::<Slot<T>, P, C>(region, ct)),
+                Producer::from_core(shm_producer_core::<Slot<T>, P, C>(
+                    region.clone(),
+                    capacity,
+                    pt,
+                )),
+                Consumer::from_core(shm_consumer_core::<Slot<T>, P, C>(region, capacity, ct)),
             )
         })
     }

@@ -330,3 +330,37 @@ fn minimum_capacity_ring_boundaries() {
     }
     assert!(rx.try_pop().is_none());
 }
+
+/// Regression (review round 2): a producer blocked on wrap padding BELOW
+/// half capacity must still be released by a single pop — the watermark
+/// accounts for the padding the producer's next record may need.
+///
+/// Exact construction (capacity 1024): records span bytes 500..1004
+/// (occupancy 504, write position 1004, so to_end = 20). A 500-byte payload
+/// makes a 504-byte record needing pad(20) + 504 = 524 > 520 free: blocked
+/// with occupancy under the naive half-capacity (512) watermark. One pop
+/// frees 24 bytes (544 >= 524) and must publish immediately.
+#[test]
+fn pop_releases_padding_blocked_producer_below_half() {
+    let (mut tx, mut rx) = BytesRingBuffer::new(1024);
+
+    tx.push(&[7u8; 16]); // 20-byte record, write = 20
+    for _ in 0..20 {
+        tx.push(&[7u8; 20]); // 24-byte records, write = 500
+    }
+    for _ in 0..21 {
+        tx.push(&[8u8; 20]); // write = 1004
+    }
+    for _ in 0..21 {
+        drop(rx.pop()); // read = 500; occupancy 504; producer to_end = 20
+    }
+
+    let big = [1u8; 500]; // 504-byte record
+    assert!(!tx.try_push(&big), "setup: pad(20)+504 exceeds 520 free");
+
+    drop(rx.pop()); // frees 24 bytes; 544 >= 524 now free
+    assert!(
+        tx.try_push(&big),
+        "a single pop must publish for a padding-blocked producer below half capacity"
+    );
+}

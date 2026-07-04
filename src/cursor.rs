@@ -71,6 +71,20 @@ pub(crate) const fn publish_batch(capacity: usize, max_batch: usize) -> usize {
     }
 }
 
+/// Round a requested minimum capacity to the ring's real capacity: the next
+/// power of two, at least `floor`.
+///
+/// # Panics
+///
+/// Panics if `min_capacity == 0` or the rounding overflows `usize`.
+pub(crate) fn round_capacity(min_capacity: usize, floor: usize) -> usize {
+    assert!(min_capacity > 0, "capacity must be greater than zero");
+    min_capacity
+        .checked_next_power_of_two()
+        .expect("capacity too large to round up to a power of two")
+        .max(floor)
+}
+
 /// The wrap-safe fullness predicate: would writing `needed` more units past
 /// `write` overrun a `capacity`-unit ring whose consumer has read up to
 /// `read`? The single source of truth for "full" (used by the space check
@@ -161,6 +175,20 @@ impl<B: SlotCleanup, P: WaitStrategy, C: WaitStrategy> AnchorKind<B, P, C> {
             AnchorKind::Heap(shared) => &shared.consumer_wait,
             #[cfg(all(feature = "shm", target_os = "linux"))]
             AnchorKind::Shm(anchor) => &anchor.consumer_wait,
+        }
+    }
+
+    /// Whether this handle still owns its exclusivity claim on the ring.
+    ///
+    /// Heap rings always do (an `Arc` clone cannot be revoked). Shm handles
+    /// check their lease token: after a force takeover, a zombie handle's
+    /// teardown must not touch the shared state a successor now owns.
+    #[inline]
+    fn owns_ring(&self) -> bool {
+        match self {
+            AnchorKind::Heap(_) => true,
+            #[cfg(all(feature = "shm", target_os = "linux"))]
+            AnchorKind::Shm(anchor) => anchor.owns_lease(),
         }
     }
 }
@@ -442,7 +470,13 @@ impl<B: SlotCleanup, P: WaitStrategy, C: WaitStrategy> Drop for ConsumerCore<B, 
         // out, and a surviving producer would never see the space we freed;
         // without the notify, a producer parked in a genuinely blocking
         // custom `WaitStrategy` would never wake.
-        self.flush_pending();
+        //
+        // Guarded like the lease release: a zombie shm handle whose role was
+        // force-taken must not store its stale cursor over the successor's —
+        // a stale-ahead value would let the producer overwrite unread data.
+        if self.anchor.owns_ring() {
+            self.flush_pending();
+        }
     }
 }
 

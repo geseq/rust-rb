@@ -7,7 +7,7 @@ description = "High-performance SPSC ring buffers — fixed-size items and varia
 license = "MIT"
 repository = "https://github.com/geseq/rust-rb"
 readme = "README.md"
-keywords = ["spsc", "mpsc", "ringbuffer", "queue", "lockfree"]
+keywords = ["spsc", "ipc", "ringbuffer", "queue", "lockfree"]
 categories = ["concurrency", "data-structures"]
 
 [lib]
@@ -16,6 +16,7 @@ path = "src/lib.rs"
 
 [package.metadata.docs.rs]
 all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
 # Shared-memory-backed rings (Linux): memfd/mmap constructors, leases,
