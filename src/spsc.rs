@@ -106,7 +106,7 @@ where
 
         // Cache the constants each side needs on its hot path. These pointers
         // stay valid for as long as the `Arc<Inner>` the handle holds is alive.
-        let buf = inner.buffer.as_ptr() as *const UnsafeCell<MaybeUninit<T>>;
+        let buf = inner.buffer.as_ptr();
         let mask = inner.mask;
         let next_free = &*inner.write_cursor as *const AtomicUsize;
         let reader = &*inner.read_cursor as *const AtomicUsize;
