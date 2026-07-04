@@ -127,6 +127,34 @@ impl<B: SlotCleanup, P, C> Drop for Shared<B, P, C> {
     }
 }
 
+/// What keeps the ring's memory alive and where the wait strategies live.
+///
+/// The hot paths never touch this: the cores cache raw pointers to the
+/// cursor atomics and the buffer up front. It is consulted only on the cold
+/// paths (blocking waits, notifies for non-spin strategies, teardown). For
+/// the built-in spin strategies the accessors return ZST references, so the
+/// match compiles away entirely.
+pub(crate) enum AnchorKind<B: SlotCleanup, P: WaitStrategy, C: WaitStrategy> {
+    /// In-process ring: the shared state lives on the heap in an `Arc`.
+    Heap(Arc<Shared<B, P, C>>),
+}
+
+impl<B: SlotCleanup, P: WaitStrategy, C: WaitStrategy> AnchorKind<B, P, C> {
+    #[inline(always)]
+    fn producer_wait(&self) -> &P {
+        match self {
+            AnchorKind::Heap(shared) => &shared.producer_wait,
+        }
+    }
+
+    #[inline(always)]
+    fn consumer_wait(&self) -> &C {
+        match self {
+            AnchorKind::Heap(shared) => &shared.consumer_wait,
+        }
+    }
+}
+
 /// Create the shared state and the two handle cores.
 ///
 /// `capacity` is the ring capacity in cursor units (a power of two;
@@ -174,7 +202,7 @@ where
             reader,
             write_cursor: 0,
             read_cursor_cache: 0,
-            inner: inner.clone(),
+            anchor: AnchorKind::Heap(inner.clone()),
         },
         ConsumerCore {
             buf,
@@ -184,7 +212,53 @@ where
             read_cursor: 0,
             published: 0,
             write_cursor_cache: 0,
-            inner,
+            anchor: AnchorKind::Heap(inner),
+        },
+    )
+}
+
+/// Build the handle-cached pointer set and the two cores over shared state
+/// that already lives somewhere (heap or a mapped region). `write_cursor` /
+/// `read_cursor` point at the live cursor atomics; the private caches are
+/// seeded from the current cursor values so recovered/attached handles start
+/// consistent.
+///
+/// # Safety
+///
+/// The pointers must reference live atomics and an in-bounds buffer of
+/// `capacity` cursor units that outlive the returned cores (guaranteed by
+/// the anchors), and the cursor values must satisfy the ring invariant
+/// (`write - read <= capacity`, wrapped).
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn cores_from_raw<B: SlotCleanup, P: WaitStrategy, C: WaitStrategy>(
+    buf: NonNull<B>,
+    capacity: usize,
+    write_cursor: NonNull<AtomicUsize>,
+    read_cursor: NonNull<AtomicUsize>,
+    producer_anchor: AnchorKind<B, P, C>,
+    consumer_anchor: AnchorKind<B, P, C>,
+) -> (ProducerCore<B, P, C>, ConsumerCore<B, P, C>) {
+    let write = unsafe { write_cursor.as_ref() }.load(Ordering::Acquire);
+    let read = unsafe { read_cursor.as_ref() }.load(Ordering::Acquire);
+    (
+        ProducerCore {
+            buf,
+            mask: capacity - 1,
+            next_free: write_cursor,
+            reader: read_cursor,
+            write_cursor: write,
+            read_cursor_cache: read,
+            anchor: producer_anchor,
+        },
+        ConsumerCore {
+            buf,
+            mask: capacity - 1,
+            next_free: write_cursor,
+            reader: read_cursor,
+            read_cursor: read,
+            published: read,
+            write_cursor_cache: write,
+            anchor: consumer_anchor,
         },
     )
 }
@@ -205,8 +279,8 @@ pub(crate) struct ProducerCore<B: SlotCleanup, P: WaitStrategy, C: WaitStrategy>
     pub(crate) write_cursor: usize,
     /// Cached snapshot of the consumer's cursor (the C++ `reader_index_cache_`).
     read_cursor_cache: usize,
-    /// Keeps the shared allocation alive and carries the wait strategies.
-    pub(crate) inner: Arc<Shared<B, P, C>>,
+    /// Keeps the ring's memory alive and carries the wait strategies.
+    anchor: AnchorKind<B, P, C>,
 }
 
 // SAFETY: the producer core only touches producer-private state plus atomics.
@@ -245,7 +319,7 @@ where
             let write = self.write_cursor;
             let capacity = self.mask + 1;
             let reader = self.reader.as_ptr();
-            self.inner.producer_wait.wait(|| {
+            self.anchor.producer_wait().wait(|| {
                 !lacks_space(
                     write,
                     needed,
@@ -264,7 +338,7 @@ where
         self.write_cursor = self.write_cursor.wrapping_add(amount);
         // SAFETY: `next_free` is a `NonNull` into the live `inner`.
         unsafe { (*self.next_free.as_ptr()).store(self.write_cursor, Ordering::Release) };
-        self.inner.consumer_wait.notify();
+        self.anchor.consumer_wait().notify();
     }
 
     /// The ring's capacity in cursor units.
@@ -280,6 +354,31 @@ where
     pub(crate) fn slot_ptr(&self) -> *mut B {
         // SAFETY: in bounds by masking; `buf` is a live allocation.
         unsafe { self.buf.as_ptr().add(self.write_cursor & self.mask) }
+    }
+
+    /// Occupancy per the two shared atomics (the producer-side view; may
+    /// transiently over-count while the consumer defers publishes).
+    #[inline]
+    pub(crate) fn occupancy(&self) -> usize {
+        // SAFETY: the cached pointers reference the live cursor atomics.
+        unsafe {
+            (*self.next_free.as_ptr())
+                .load(Ordering::Acquire)
+                .wrapping_sub((*self.reader.as_ptr()).load(Ordering::Acquire))
+        }
+    }
+
+    /// The producer-side fullness view (write `Relaxed` — it is our own
+    /// cursor — against the consumer's published cursor `Acquire`).
+    #[inline]
+    pub(crate) fn is_full_view(&self) -> bool {
+        // SAFETY: as for `occupancy`.
+        unsafe {
+            (*self.next_free.as_ptr())
+                .load(Ordering::Relaxed)
+                .wrapping_sub((*self.reader.as_ptr()).load(Ordering::Acquire))
+                > self.mask
+        }
     }
 }
 
@@ -303,8 +402,8 @@ pub(crate) struct ConsumerCore<B: SlotCleanup, P: WaitStrategy, C: WaitStrategy>
     /// Cached snapshot of the producer's cursor (the C++
     /// `next_free_index_cache_`).
     pub(crate) write_cursor_cache: usize,
-    /// Keeps the shared allocation alive and carries the wait strategies.
-    pub(crate) inner: Arc<Shared<B, P, C>>,
+    /// Keeps the ring's memory alive and carries the wait strategies.
+    anchor: AnchorKind<B, P, C>,
 }
 
 // SAFETY: the consumer core only touches consumer-private state plus atomics.
@@ -360,8 +459,8 @@ where
         while !self.has_item() {
             let read_cursor = self.read_cursor;
             let next_free = self.next_free.as_ptr();
-            self.inner
-                .consumer_wait
+            self.anchor
+                .consumer_wait()
                 .wait(|| !no_item(unsafe { (*next_free).load(Ordering::Acquire) }, read_cursor));
         }
     }
@@ -423,7 +522,7 @@ where
         // SAFETY: `reader` is a `NonNull` into the live `inner`.
         unsafe { (*self.reader.as_ptr()).store(self.read_cursor, Ordering::Release) };
         self.published = self.read_cursor;
-        self.inner.producer_wait.notify();
+        self.anchor.producer_wait().notify();
     }
 
     /// [`flush`](Self::flush) only if there is unpublished progress.
@@ -463,28 +562,4 @@ where
         // SAFETY: in bounds by masking; `buf` is a live allocation.
         unsafe { self.buf.as_ptr().add(self.read_cursor & self.mask) }
     }
-}
-
-/// Occupancy in cursor units per the two shared atomics (the producer-side
-/// view; may transiently over-count while the consumer defers publishes).
-#[inline]
-pub(crate) fn shared_len<B: SlotCleanup, P, C>(inner: &Shared<B, P, C>) -> usize {
-    inner
-        .write_cursor
-        .load(Ordering::Acquire)
-        .wrapping_sub(inner.read_cursor.load(Ordering::Acquire))
-}
-
-#[inline]
-pub(crate) fn shared_is_empty<B: SlotCleanup, P, C>(inner: &Shared<B, P, C>) -> bool {
-    shared_len(inner) == 0
-}
-
-#[inline]
-pub(crate) fn shared_is_full<B: SlotCleanup, P, C>(inner: &Shared<B, P, C>) -> bool {
-    inner
-        .write_cursor
-        .load(Ordering::Relaxed)
-        .wrapping_sub(inner.read_cursor.load(Ordering::Acquire))
-        > inner.mask
 }

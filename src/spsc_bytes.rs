@@ -40,9 +40,7 @@
 use std::cell::UnsafeCell;
 use std::ptr::NonNull;
 
-use crate::cursor::{
-    channel, publish_batch, shared_is_empty, ConsumerCore, ProducerCore, SlotCleanup,
-};
+use crate::cursor::{channel, publish_batch, ConsumerCore, ProducerCore, SlotCleanup};
 use crate::wait::{WaitStrategy, YieldWait};
 
 /// The buffer word type: `u64` so the base is 8-aligned (a `Box<[u8]>`
@@ -350,7 +348,7 @@ where
     /// it never reports `true` for a non-empty ring.
     #[inline]
     pub fn is_empty(&self) -> bool {
-        shared_is_empty(&self.core.inner)
+        self.core.occupancy() == 0
     }
 
     /// The ring's capacity in bytes (the requested minimum rounded up to a

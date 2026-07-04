@@ -39,12 +39,8 @@
 
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
-use std::sync::Arc;
 
-use crate::cursor::{
-    channel, publish_batch, shared_is_empty, shared_is_full, shared_len, ConsumerCore,
-    ProducerCore, Shared,
-};
+use crate::cursor::{channel, publish_batch, ConsumerCore, ProducerCore};
 use crate::wait::{WaitStrategy, YieldWait};
 
 /// The slot type: a cell the producer writes and the consumer moves out of,
@@ -192,14 +188,14 @@ where
     /// under-counts.
     #[inline]
     pub fn len(&self) -> usize {
-        shared_len(self.shared())
+        self.core.occupancy()
     }
 
     /// Whether the queue is empty. Exact whenever the consumer has caught up
     /// (see [`len`](Self::len)); never reports `true` for a non-empty queue.
     #[inline]
     pub fn is_empty(&self) -> bool {
-        shared_is_empty(self.shared())
+        self.core.occupancy() == 0
     }
 
     /// Whether the queue is full (no room for another `push`). May transiently
@@ -208,7 +204,7 @@ where
     /// full queue.
     #[inline]
     pub fn is_full(&self) -> bool {
-        shared_is_full(self.shared())
+        self.core.is_full_view()
     }
 
     /// The buffer's true capacity (the requested minimum rounded up to a
@@ -216,11 +212,6 @@ where
     #[inline]
     pub fn capacity(&self) -> usize {
         self.core.capacity()
-    }
-
-    #[inline(always)]
-    fn shared(&self) -> &Arc<Shared<Slot<T>, P, C>> {
-        &self.core.inner
     }
 }
 
