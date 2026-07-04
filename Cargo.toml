@@ -14,7 +14,7 @@ categories = ["concurrency", "data-structures"]
 name = "rust_rb"
 path = "src/lib.rs"
 
-[target.'cfg(unix)'.dev-dependencies]
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dev-dependencies]
 libc = "0.2"
 
 [profile.release]
@@ -33,6 +33,3 @@ path = "examples/bench.rs"
 [[example]]
 name = "bench_bytes"
 path = "examples/bench_bytes.rs"
-
-[dev-dependencies]
-disruptor-rs = "0.1.1"

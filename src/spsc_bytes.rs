@@ -47,7 +47,6 @@
 //!   single cursor publish.
 
 use std::cell::UnsafeCell;
-use std::mem::MaybeUninit;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -65,6 +64,57 @@ const PADDING: u32 = u32::MAX;
 #[inline(always)]
 const fn align_up(n: usize) -> usize {
     (n + (ALIGN - 1)) & !(ALIGN - 1)
+}
+
+/// Bytes a record with a `len`-byte payload occupies in the ring.
+#[inline(always)]
+const fn record_len(len: usize) -> usize {
+    align_up(HEADER + len)
+}
+
+/// Decode the record at byte cursor `cur`: skip a padding record if present
+/// and return `(cursor at the record header, payload length, payload ptr)`.
+/// The single source of truth for the frame format — used by `pop`, `drain`,
+/// and (via [`record_len`]) `Msg::drop`.
+///
+/// # Safety
+///
+/// A fully published record must exist at `cur` (availability confirmed via
+/// an `Acquire` load of the producer's cursor). The producer publishes
+/// padding together with the record that follows it (one cursor store covers
+/// both), so after a padding skip a record is guaranteed at offset zero.
+#[inline(always)]
+unsafe fn decode_record(base: *const u8, mask: usize, mut cur: usize) -> (usize, usize, *const u8) {
+    let mut pos = cur & mask;
+    // SAFETY: header reads are 4-aligned (records and padding are ALIGN
+    // multiples, base is 8-aligned) and in bounds via the mask.
+    let mut header = unsafe { base.add(pos).cast::<u32>().read() };
+    if header == PADDING {
+        cur = cur.wrapping_add((mask + 1) - pos);
+        pos = 0;
+        // SAFETY: as above, at offset zero.
+        header = unsafe { base.cast::<u32>().read() };
+        debug_assert!(header != PADDING, "padding is never followed by padding");
+    }
+    let len = header as usize;
+    // SAFETY: the record is contiguous: `pos + HEADER + len <= capacity`.
+    (cur, len, unsafe { base.add(pos + HEADER) })
+}
+
+/// The deferred-publish bound for the consumer's adaptive publish (see
+/// `Msg::drop`): `capacity / 8` bytes, clamped to 4096 — the byte-ring analog
+/// of `spsc::publish_batch`'s 64-element cap, bounding the absolute amount of
+/// freed-but-unpublished space a blocked producer can be waiting behind.
+#[inline(always)]
+const fn publish_batch_bytes(capacity: usize) -> usize {
+    let batch = capacity / 8;
+    if batch == 0 {
+        1
+    } else if batch > 4096 {
+        4096
+    } else {
+        batch
+    }
 }
 
 #[inline(always)]
@@ -85,7 +135,12 @@ struct Inner<P, C> {
     /// The byte buffer, stored as `u64` words so the base is 8-aligned (a
     /// `Box<[u8]>` allocation only guarantees alignment 1). All access goes
     /// through raw `u8` pointers; the words are never read as `u64`s.
-    buffer: Box<[UnsafeCell<MaybeUninit<u64>>]>,
+    ///
+    /// Zero-initialized on construction so every byte is always initialized:
+    /// `WriteSlot`/`Msg` hand out `&[u8]` views into the ring, which would be
+    /// instant UB over uninitialized memory. Zeroing costs one pass at
+    /// construction and nothing on the hot path.
+    buffer: Box<[UnsafeCell<u64>]>,
     mask: usize,
 
     /// Byte cursor published by the producer (Release), read by the consumer
@@ -140,10 +195,13 @@ where
     /// Panics if `min_capacity == 0`.
     pub fn with_wait_strategies(min_capacity: usize) -> (BytesProducer<P, C>, BytesConsumer<P, C>) {
         assert!(min_capacity > 0, "capacity must be greater than zero");
-        let capacity = min_capacity.next_power_of_two().max(8);
+        let capacity = min_capacity
+            .checked_next_power_of_two()
+            .expect("capacity too large to round up to a power of two")
+            .max(8);
 
         let mut words = Vec::with_capacity(capacity / 8);
-        words.resize_with(capacity / 8, || UnsafeCell::new(MaybeUninit::uninit()));
+        words.resize_with(capacity / 8, || UnsafeCell::new(0u64));
 
         let inner = Arc::new(Inner {
             buffer: words.into_boxed_slice(),
@@ -189,7 +247,7 @@ where
 }
 
 /// The producing half of an [`BytesRingBuffer`]. Owns the private write cursor.
-pub struct BytesProducer<P = YieldWait, C = YieldWait> {
+pub struct BytesProducer<P: WaitStrategy = YieldWait, C: WaitStrategy = YieldWait> {
     buf: NonNull<u8>,
     mask: usize,
     /// Our published cursor (cached `NonNull` into `inner`).
@@ -204,7 +262,10 @@ pub struct BytesProducer<P = YieldWait, C = YieldWait> {
 }
 
 // SAFETY: as for `spsc::Producer` — only producer-private state plus atomics.
-unsafe impl<P: Send + Sync, C: Send + Sync> Send for BytesProducer<P, C> {}
+unsafe impl<P: WaitStrategy + Send + Sync, C: WaitStrategy + Send + Sync> Send
+    for BytesProducer<P, C>
+{
+}
 
 impl<P, C> BytesProducer<P, C>
 where
@@ -318,13 +379,25 @@ where
 
     /// Check for `total` free bytes, reloading the consumer's cursor at most
     /// once — the same reload-once shape as `spsc::Producer::try_push`.
+    /// Fullness is judged on the wrapped cursor *difference* (the true byte
+    /// occupancy), never on absolute values — byte cursors wrap `usize` after
+    /// only 4 GiB of traffic on 32-bit targets.
     #[inline]
     fn has_space(&mut self, total: usize) -> bool {
         let capacity = self.mask + 1;
-        if self.write_cursor.wrapping_add(total) > self.read_cursor_cache.wrapping_add(capacity) {
+        if self
+            .write_cursor
+            .wrapping_add(total)
+            .wrapping_sub(self.read_cursor_cache)
+            > capacity
+        {
             // SAFETY: `reader` is a `NonNull` into the live `inner`.
             self.read_cursor_cache = unsafe { (*self.reader.as_ptr()).load(Ordering::Acquire) };
-            if self.write_cursor.wrapping_add(total) > self.read_cursor_cache.wrapping_add(capacity)
+            if self
+                .write_cursor
+                .wrapping_add(total)
+                .wrapping_sub(self.read_cursor_cache)
+                > capacity
             {
                 return false;
             }
@@ -340,7 +413,7 @@ where
             let capacity = self.mask + 1;
             let reader = self.reader.as_ptr();
             self.inner.producer_wait.wait(|| {
-                target <= unsafe { (*reader).load(Ordering::Acquire) }.wrapping_add(capacity)
+                target.wrapping_sub(unsafe { (*reader).load(Ordering::Acquire) }) <= capacity
             });
         }
     }
@@ -411,8 +484,10 @@ where
 /// directly. Call [`commit`](Self::commit) to publish; dropping the slot
 /// without committing publishes nothing.
 ///
-/// The slice's initial contents are unspecified (whatever the ring last held
-/// there) — write your message before reading anything back.
+/// The slice's initial contents are unspecified but always initialized
+/// memory (zeroed at construction, previous records afterwards) — reading
+/// before writing is safe but yields garbage, and committing without fully
+/// writing publishes that garbage to the consumer.
 pub struct WriteSlot<'a, P: WaitStrategy, C: WaitStrategy> {
     producer: &'a mut BytesProducer<P, C>,
     /// Payload start, cached at claim time (the same handle-caching idea as
@@ -457,7 +532,7 @@ impl<P: WaitStrategy, C: WaitStrategy> core::ops::DerefMut for WriteSlot<'_, P, 
 }
 
 /// The consuming half of an [`BytesRingBuffer`]. Owns the private read cursor.
-pub struct BytesConsumer<P = YieldWait, C = YieldWait> {
+pub struct BytesConsumer<P: WaitStrategy = YieldWait, C: WaitStrategy = YieldWait> {
     buf: NonNull<u8>,
     mask: usize,
     /// The producer's published cursor (cached `NonNull` into `inner`).
@@ -477,20 +552,22 @@ pub struct BytesConsumer<P = YieldWait, C = YieldWait> {
     inner: Arc<Inner<P, C>>,
 }
 
-impl<P, C> Drop for BytesConsumer<P, C> {
+impl<P: WaitStrategy, C: WaitStrategy> Drop for BytesConsumer<P, C> {
     fn drop(&mut self) {
-        // Publish any deferred progress so a surviving producer sees the
-        // freed bytes. (No `notify`: it would need a `WaitStrategy` bound,
-        // and a `CvWait` producer re-checks every 100 ns regardless.)
+        // Publish any deferred progress and wake a blocked producer, so a
+        // surviving producer sees the freed bytes even with a genuinely
+        // parking custom `WaitStrategy`.
         if self.read_cursor != self.published {
-            // SAFETY: `reader` is a `NonNull` into the live `inner`.
-            unsafe { (*self.reader.as_ptr()).store(self.read_cursor, Ordering::Release) };
+            self.flush();
         }
     }
 }
 
 // SAFETY: as for `spsc::Consumer`.
-unsafe impl<P: Send + Sync, C: Send + Sync> Send for BytesConsumer<P, C> {}
+unsafe impl<P: WaitStrategy + Send + Sync, C: WaitStrategy + Send + Sync> Send
+    for BytesConsumer<P, C>
+{
+}
 
 impl<P, C> BytesConsumer<P, C>
 where
@@ -502,15 +579,15 @@ where
     /// the returned [`Msg`] drops.
     #[inline]
     pub fn pop(&mut self) -> Msg<'_, P, C> {
-        while self.read_cursor >= self.write_cursor_cache {
+        while self.write_cursor_cache.wrapping_sub(self.read_cursor) == 0 {
             // SAFETY: `next_free` is a `NonNull` into the live `inner`.
             self.write_cursor_cache = unsafe { (*self.next_free.as_ptr()).load(Ordering::Acquire) };
-            if self.read_cursor >= self.write_cursor_cache {
+            if self.write_cursor_cache.wrapping_sub(self.read_cursor) == 0 {
                 let read_cursor = self.read_cursor;
                 let next_free = self.next_free.as_ptr();
-                self.inner
-                    .consumer_wait
-                    .wait(|| read_cursor < unsafe { (*next_free).load(Ordering::Acquire) });
+                self.inner.consumer_wait.wait(|| {
+                    unsafe { (*next_free).load(Ordering::Acquire) }.wrapping_sub(read_cursor) != 0
+                });
             }
         }
 
@@ -521,10 +598,10 @@ where
     /// empty.
     #[inline]
     pub fn try_pop(&mut self) -> Option<Msg<'_, P, C>> {
-        if self.read_cursor >= self.write_cursor_cache {
+        if self.write_cursor_cache.wrapping_sub(self.read_cursor) == 0 {
             // SAFETY: `next_free` is a `NonNull` into the live `inner`.
             self.write_cursor_cache = unsafe { (*self.next_free.as_ptr()).load(Ordering::Acquire) };
-            if self.read_cursor >= self.write_cursor_cache {
+            if self.write_cursor_cache.wrapping_sub(self.read_cursor) == 0 {
                 return None;
             }
         }
@@ -539,38 +616,40 @@ where
     /// that the producer sees no space freed until the batch completes, so
     /// keep `f` short or prefer [`pop`](Self::pop) when the producer is
     /// starved for space.
+    ///
+    /// Delivery is at-most-once: the cursor advances over each record before
+    /// `f` sees it, and progress is published even if `f` panics, so an
+    /// unwound drain never re-delivers already-processed messages.
     pub fn drain<F: FnMut(&[u8])>(&mut self, mut f: F) -> usize {
         // SAFETY: `next_free` is a `NonNull` into the live `inner`.
         self.write_cursor_cache = unsafe { (*self.next_free.as_ptr()).load(Ordering::Acquire) };
         let end = self.write_cursor_cache;
-        let start = self.read_cursor;
 
-        let base = self.buf.as_ptr();
-        let mask = self.mask;
-        let mut cur = start;
-        let mut count = 0;
-
-        while cur != end {
-            let pos = cur & mask;
-            // SAFETY: `cur < end` means the producer published a whole record
-            // here; header reads are 4-aligned and in bounds (see
-            // `write_frame`).
-            let header = unsafe { base.add(pos).cast::<u32>().read() };
-            if header == PADDING {
-                cur = cur.wrapping_add((mask + 1) - pos);
-                continue;
+        // Publish on exit — including an unwind out of `f`.
+        struct FlushOnDrop<'a, P: WaitStrategy, C: WaitStrategy>(&'a mut BytesConsumer<P, C>);
+        impl<P: WaitStrategy, C: WaitStrategy> Drop for FlushOnDrop<'_, P, C> {
+            fn drop(&mut self) {
+                if self.0.read_cursor != self.0.published {
+                    self.0.flush();
+                }
             }
-            let len = header as usize;
-            // SAFETY: the record is contiguous: `pos + HEADER + len` is in
-            // bounds and the payload was fully written before the publish.
-            f(unsafe { std::slice::from_raw_parts(base.add(pos + HEADER), len) });
-            cur = cur.wrapping_add(align_up(HEADER + len));
-            count += 1;
         }
 
-        if cur != start {
-            self.read_cursor = cur;
-            self.flush();
+        let guard = FlushOnDrop(self);
+        let base = guard.0.buf.as_ptr();
+        let mask = guard.0.mask;
+        let mut count = 0;
+
+        while end.wrapping_sub(guard.0.read_cursor) != 0 {
+            // SAFETY: records below `end` are fully published.
+            let (cur, len, payload) = unsafe { decode_record(base, mask, guard.0.read_cursor) };
+            // Advance before the callback: the record counts as consumed even
+            // if `f` unwinds. The payload slice stays valid — the producer
+            // cannot reuse it until the guard publishes, strictly after `f`.
+            guard.0.read_cursor = cur.wrapping_add(record_len(len));
+            // SAFETY: payload is contiguous, in bounds, and fully published.
+            f(unsafe { std::slice::from_raw_parts(payload, len) });
+            count += 1;
         }
         count
     }
@@ -586,32 +665,15 @@ where
     }
 
     /// Common tail of `pop`/`try_pop`: availability is already confirmed;
-    /// skip padding and wrap the record at the read cursor.
+    /// decode the record at the read cursor.
     #[inline(always)]
     fn next_msg(&mut self) -> Msg<'_, P, C> {
-        let base = self.buf.as_ptr();
-        let mask = self.mask;
-
-        let pos = self.read_cursor & mask;
-        // SAFETY: a record is published at the read cursor (availability was
-        // checked); header reads are 4-aligned and in bounds.
-        let mut header = unsafe { base.add(pos).cast::<u32>().read() };
-        if header == PADDING {
-            // The producer publishes padding together with the record that
-            // follows it (one cursor store covers both), so a record is
-            // guaranteed to sit at offset zero — no need to re-check
-            // availability.
-            self.read_cursor = self.read_cursor.wrapping_add((mask + 1) - pos);
-            // SAFETY: as above, at offset zero.
-            header = unsafe { base.cast::<u32>().read() };
-            debug_assert!(header != PADDING, "padding is never followed by padding");
-        }
-
-        let len = header as usize;
-        let pos = self.read_cursor & mask;
-        // SAFETY: the record is contiguous and in bounds (`pos + HEADER + len
-        // <= capacity`), and `base` is non-null.
-        let payload = unsafe { NonNull::new_unchecked(base.add(pos + HEADER)) };
+        // SAFETY: availability was confirmed by the caller.
+        let (cur, len, payload) =
+            unsafe { decode_record(self.buf.as_ptr(), self.mask, self.read_cursor) };
+        self.read_cursor = cur;
+        // SAFETY: `payload` is derived from the non-null `buf`.
+        let payload = unsafe { NonNull::new_unchecked(payload.cast_mut()) };
         Msg {
             payload,
             len,
@@ -624,7 +686,8 @@ where
     #[inline]
     pub fn is_empty(&self) -> bool {
         // SAFETY: `next_free` is a `NonNull` into the live `inner`.
-        self.read_cursor >= unsafe { (*self.next_free.as_ptr()).load(Ordering::Acquire) }
+        unsafe { (*self.next_free.as_ptr()).load(Ordering::Acquire) }.wrapping_sub(self.read_cursor)
+            == 0
     }
 
     /// The ring's capacity in bytes (`N` rounded up to a power of two).
@@ -645,6 +708,11 @@ where
 /// Dereferences to the payload bytes, which live in the ring itself. The
 /// message is released — its bytes handed back to the producer and the read
 /// cursor published — when this drops. Copy out anything you need to keep.
+///
+/// Forgetting the guard (`mem::forget`) does **not** consume the message:
+/// the cursor never advances, so the *same message is delivered again* by
+/// the next pop or drain. Safe, but re-processing side effects is on the
+/// caller.
 pub struct Msg<'a, P: WaitStrategy, C: WaitStrategy> {
     consumer: &'a mut BytesConsumer<P, C>,
     /// Payload start, cached when the record was framed (the same
@@ -669,16 +737,17 @@ impl<P: WaitStrategy, C: WaitStrategy> Drop for Msg<'_, P, C> {
     #[inline]
     fn drop(&mut self) {
         let c = &mut *self.consumer;
-        c.read_cursor = c.read_cursor.wrapping_add(align_up(HEADER + self.len));
-        // Adaptive publish, as in `spsc::Consumer::read`: publish immediately
-        // when caught up (uncontended, latency-critical, and it guarantees
-        // the consumer never waits or reports empty with progress deferred);
-        // defer to one publish per `capacity / 8` bytes while the ring is
-        // backed up, where a full-ring producer polls this line and
+        c.read_cursor = c.read_cursor.wrapping_add(record_len(self.len));
+        // Adaptive publish, as in `spsc::Consumer::advance`: publish
+        // immediately when caught up (uncontended, latency-critical, and it
+        // guarantees the consumer never waits or reports empty with progress
+        // deferred); defer to one publish per `publish_batch_bytes` while the
+        // ring is backed up, where a full-ring producer polls this line and
         // per-message publishes would degrade both threads into a lockstep
-        // cache-line ping-pong.
+        // cache-line ping-pong. The clamp bounds how much freed space a
+        // blocked producer can transiently not see.
         if c.read_cursor == c.write_cursor_cache
-            || c.read_cursor.wrapping_sub(c.published) >= (c.mask + 1) / 8
+            || c.read_cursor.wrapping_sub(c.published) >= publish_batch_bytes(c.mask + 1)
         {
             c.flush();
         }
@@ -687,5 +756,9 @@ impl<P: WaitStrategy, C: WaitStrategy> Drop for Msg<'_, P, C> {
 
 #[inline]
 fn is_empty<P, C>(inner: &Inner<P, C>) -> bool {
-    inner.read_cursor.load(Ordering::Acquire) >= inner.write_cursor.load(Ordering::Acquire)
+    inner
+        .write_cursor
+        .load(Ordering::Acquire)
+        .wrapping_sub(inner.read_cursor.load(Ordering::Acquire))
+        == 0
 }

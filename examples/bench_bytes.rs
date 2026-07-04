@@ -17,7 +17,7 @@ use rust_rb::wait::{NoOpWait, PauseWait, WaitStrategy};
 const NUM_MESSAGES: usize = 20_000_000;
 const CAPACITY: usize = 64 * 1024;
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn pin(core: usize) {
     // SAFETY: zero-initialising a cpu_set_t and calling the libc affinity
     // helpers with valid arguments is sound.
@@ -29,7 +29,7 @@ fn pin(core: usize) {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
 fn pin(_core: usize) {}
 
 fn run<P, C>(name: &str, msg_len: usize, drain: bool, cores: Option<(usize, usize)>)

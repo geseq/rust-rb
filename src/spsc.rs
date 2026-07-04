@@ -142,7 +142,9 @@ where
     /// Panics if `min_capacity == 0`.
     pub fn with_wait_strategies(min_capacity: usize) -> (Producer<T, P, C>, Consumer<T, P, C>) {
         assert!(min_capacity > 0, "capacity must be greater than zero");
-        let capacity = min_capacity.next_power_of_two();
+        let capacity = min_capacity
+            .checked_next_power_of_two()
+            .expect("capacity too large to round up to a power of two");
 
         let mut slots = Vec::with_capacity(capacity);
         slots.resize_with(capacity, || UnsafeCell::new(MaybeUninit::uninit()));
@@ -192,7 +194,7 @@ where
 }
 
 /// The producing half of a [`RingBuffer`]. Owns the private write cursor.
-pub struct Producer<T, P = YieldWait, C = YieldWait> {
+pub struct Producer<T, P: WaitStrategy = YieldWait, C: WaitStrategy = YieldWait> {
     /// Base of the slot buffer (cached from `inner`; stable for its lifetime).
     buf: NonNull<UnsafeCell<MaybeUninit<T>>>,
     /// `capacity - 1` (cached from `inner`).
@@ -211,7 +213,10 @@ pub struct Producer<T, P = YieldWait, C = YieldWait> {
 
 // SAFETY: the producer half only touches producer-private state plus atomics.
 // The cached `NonNull`s reference the `Arc<Inner>` it keeps alive.
-unsafe impl<T: Send, P: Send + Sync, C: Send + Sync> Send for Producer<T, P, C> {}
+unsafe impl<T: Send, P: WaitStrategy + Send + Sync, C: WaitStrategy + Send + Sync> Send
+    for Producer<T, P, C>
+{
+}
 
 impl<T, P, C> Producer<T, P, C>
 where
@@ -227,6 +232,12 @@ where
 
     /// Enqueue `value` without blocking. Returns `Err(value)` if the buffer is
     /// full, handing the item back to the caller.
+    ///
+    /// "Full" is judged against the consumer's *published* progress; while
+    /// the consumer defers publishes in the backed-up regime this can
+    /// spuriously fail with up to `capacity / 8` (max 64) slots consumed but
+    /// not yet published. A blocking [`push`](Self::push) is woken as soon
+    /// as the consumer flushes.
     #[inline]
     pub fn try_push(&mut self, value: T) -> Result<(), T> {
         if !self.has_space() {
@@ -260,12 +271,17 @@ where
     }
 
     /// Check for a free slot, reloading the consumer's cursor at most once.
+    ///
+    /// Fullness is judged on the wrapped *difference* of the monotonic
+    /// cursors (`write - read`, which is always the true occupancy), never on
+    /// the absolute values — the cursors wrap `usize`, which on 32-bit
+    /// targets happens after mere 2^32 elements.
     #[inline(always)]
     fn has_space(&mut self) -> bool {
-        if self.write_cursor > self.read_cursor_cache.wrapping_add(self.mask) {
+        if self.write_cursor.wrapping_sub(self.read_cursor_cache) > self.mask {
             // SAFETY: `reader` is a `NonNull` into the live `inner`.
             self.read_cursor_cache = unsafe { (*self.reader.as_ptr()).load(Ordering::Acquire) };
-            if self.write_cursor > self.read_cursor_cache.wrapping_add(self.mask) {
+            if self.write_cursor.wrapping_sub(self.read_cursor_cache) > self.mask {
                 return false;
             }
         }
@@ -278,9 +294,10 @@ where
         while !self.has_space() {
             let next = self.write_cursor;
             let reader = self.reader.as_ptr();
-            self.inner.producer_wait.wait(|| {
-                next <= unsafe { (*reader).load(Ordering::Acquire) }.wrapping_add(self.mask)
-            });
+            let mask = self.mask;
+            self.inner
+                .producer_wait
+                .wait(|| next.wrapping_sub(unsafe { (*reader).load(Ordering::Acquire) }) <= mask);
         }
     }
 
@@ -398,7 +415,7 @@ impl<T, P: WaitStrategy, C: WaitStrategy> WriteSlot<'_, T, P, C> {
 }
 
 /// The consuming half of a [`RingBuffer`]. Owns the private read cursor.
-pub struct Consumer<T, P = YieldWait, C = YieldWait> {
+pub struct Consumer<T, P: WaitStrategy = YieldWait, C: WaitStrategy = YieldWait> {
     /// Base of the slot buffer (cached from `inner`; stable for its lifetime).
     buf: NonNull<UnsafeCell<MaybeUninit<T>>>,
     /// `capacity - 1` (cached from `inner`).
@@ -418,22 +435,24 @@ pub struct Consumer<T, P = YieldWait, C = YieldWait> {
     inner: Arc<Inner<T, P, C>>,
 }
 
-impl<T, P, C> Drop for Consumer<T, P, C> {
+impl<T, P: WaitStrategy, C: WaitStrategy> Drop for Consumer<T, P, C> {
     fn drop(&mut self) {
-        // Publish any deferred progress. Without this, `Inner::drop` would
-        // re-drop elements we already moved out, and a surviving producer
-        // would never see the space we freed. (No `notify`: it would need a
-        // `WaitStrategy` bound, and a `CvWait` producer re-checks every
-        // 100 ns regardless.)
+        // Publish any deferred progress and wake a blocked producer. Without
+        // the publish, `Inner::drop` would re-drop elements we already moved
+        // out, and a surviving producer would never see the space we freed;
+        // without the notify, a producer parked in a genuinely blocking
+        // custom `WaitStrategy` would never wake.
         if self.read_cursor != self.published {
-            // SAFETY: `reader` is a `NonNull` into the live `inner`.
-            unsafe { (*self.reader.as_ptr()).store(self.read_cursor, Ordering::Release) };
+            self.flush();
         }
     }
 }
 
 // SAFETY: the consumer half only touches consumer-private state plus atomics.
-unsafe impl<T: Send, P: Send + Sync, C: Send + Sync> Send for Consumer<T, P, C> {}
+unsafe impl<T: Send, P: WaitStrategy + Send + Sync, C: WaitStrategy + Send + Sync> Send
+    for Consumer<T, P, C>
+{
+}
 
 impl<T, P, C> Consumer<T, P, C>
 where
@@ -481,13 +500,14 @@ where
     }
 
     /// Check for an available element, reloading the producer's cursor at
-    /// most once.
+    /// most once. Emptiness is judged on the wrapped cursor difference (see
+    /// `Producer::has_space`).
     #[inline(always)]
     fn has_item(&mut self) -> bool {
-        if self.read_cursor >= self.write_cursor_cache {
+        if self.write_cursor_cache.wrapping_sub(self.read_cursor) == 0 {
             // SAFETY: `next_free` is a `NonNull` into the live `inner`.
             self.write_cursor_cache = unsafe { (*self.next_free.as_ptr()).load(Ordering::Acquire) };
-            if self.read_cursor >= self.write_cursor_cache {
+            if self.write_cursor_cache.wrapping_sub(self.read_cursor) == 0 {
                 return false;
             }
         }
@@ -500,9 +520,9 @@ where
         while !self.has_item() {
             let read_cursor = self.read_cursor;
             let next_free = self.next_free.as_ptr();
-            self.inner
-                .consumer_wait
-                .wait(|| read_cursor < unsafe { (*next_free).load(Ordering::Acquire) });
+            self.inner.consumer_wait.wait(|| {
+                unsafe { (*next_free).load(Ordering::Acquire) }.wrapping_sub(read_cursor) != 0
+            });
         }
     }
 
@@ -545,13 +565,23 @@ where
     ///   line ping-pong (~3.5x lower throughput end to end).
     ///
     /// Because catching up always flushes, the consumer can never wait (or
-    /// report empty) with progress unpublished, so a blocked producer is
-    /// stalled by at most the batch slack while the consumer is actively
-    /// consuming.
+    /// report empty) with progress unpublished. A pop that *observes a full
+    /// queue* (per its latest view of the producer cursor) also flushes
+    /// immediately, so a producer blocked on a full queue is released by the
+    /// first pop that sees it — this fires once per cursor-reload cycle, not
+    /// per element, so it does not reintroduce the ping-pong. The residual
+    /// window: if the consumer's cached view predates the queue becoming
+    /// full and the consumer then stops popping mid-batch, a blocked
+    /// producer waits until the consumer's next flush (at most the batch
+    /// slack of pops away, or the consumer catching up or dropping).
     #[inline(always)]
     fn advance(&mut self) {
+        // Observed occupancy before this element is released; == capacity
+        // means the producer is (or was about to be) blocked on full.
+        let was_full = self.write_cursor_cache.wrapping_sub(self.read_cursor) > self.mask;
         self.read_cursor = self.read_cursor.wrapping_add(1);
-        if self.read_cursor == self.write_cursor_cache
+        if was_full
+            || self.read_cursor == self.write_cursor_cache
             || self.read_cursor.wrapping_sub(self.published) >= publish_batch(self.mask + 1)
         {
             self.flush();
@@ -579,8 +609,7 @@ where
     /// Whether the queue is empty. Exact on this side (see [`len`](Self::len)).
     #[inline]
     pub fn is_empty(&self) -> bool {
-        // SAFETY: `next_free` is a `NonNull` into the live `inner`.
-        self.read_cursor >= unsafe { (*self.next_free.as_ptr()).load(Ordering::Acquire) }
+        self.len() == 0
     }
 
     /// Whether the queue is full. Exact on this side (see [`len`](Self::len)).
@@ -588,7 +617,7 @@ where
     pub fn is_full(&self) -> bool {
         // SAFETY: `next_free` is a `NonNull` into the live `inner`.
         let write = unsafe { (*self.next_free.as_ptr()).load(Ordering::Relaxed) };
-        write > self.read_cursor.wrapping_add(self.mask)
+        write.wrapping_sub(self.read_cursor) > self.mask
     }
 
     /// The buffer's true capacity (the requested minimum rounded up to a
@@ -603,8 +632,12 @@ where
 ///
 /// Dereferences to the element (mutably too, e.g. to take parts out of it).
 /// When this drops, the element is dropped in place and its slot released to
-/// the producer. Leaking the guard (`mem::forget`) leaks the element and
-/// never releases the slot — safe, but the queue stalls.
+/// the producer.
+///
+/// Forgetting the guard (`mem::forget`) does **not** consume the element:
+/// the cursor never advances, so the *same element is delivered again* by
+/// the next pop. This is safe, but if the element carries side-effectful
+/// semantics (a command, an order), re-processing it is on the caller.
 pub struct PopRef<'a, T, P: WaitStrategy, C: WaitStrategy> {
     consumer: &'a mut Consumer<T, P, C>,
 }
@@ -632,10 +665,24 @@ impl<T, P: WaitStrategy, C: WaitStrategy> core::ops::DerefMut for PopRef<'_, T, 
 impl<T, P: WaitStrategy, C: WaitStrategy> Drop for PopRef<'_, T, P, C> {
     #[inline]
     fn drop(&mut self) {
+        // Advance via a guard so the cursor moves even if `T::drop` unwinds:
+        // once `drop_in_place` begins, the element counts as dropped, and
+        // leaving the cursor on it would let the unwind path (or the next
+        // pop) drop it a second time. The publish still happens strictly
+        // after `drop_in_place` returns or unwinds, so the producer cannot
+        // overwrite the slot while the destructor is running.
+        struct AdvanceOnDrop<'a, T, P: WaitStrategy, C: WaitStrategy>(&'a mut Consumer<T, P, C>);
+        impl<T, P: WaitStrategy, C: WaitStrategy> Drop for AdvanceOnDrop<'_, T, P, C> {
+            fn drop(&mut self) {
+                self.0.advance();
+            }
+        }
+
+        let guard = AdvanceOnDrop(&mut *self.consumer);
+        let slot = guard.0.slot();
         // SAFETY: the slot holds an initialized `T` that no one else can
-        // observe; drop it exactly once, then release the slot.
-        unsafe { std::ptr::drop_in_place((*self.consumer.slot()).as_mut_ptr()) };
-        self.consumer.advance();
+        // observe; drop it exactly once. The guard releases the slot after.
+        unsafe { std::ptr::drop_in_place((*slot).as_mut_ptr()) };
     }
 }
 
@@ -649,14 +696,14 @@ fn len<T, P, C>(inner: &Inner<T, P, C>) -> usize {
 
 #[inline]
 fn is_empty<T, P, C>(inner: &Inner<T, P, C>) -> bool {
-    inner.read_cursor.load(Ordering::Acquire) >= inner.write_cursor.load(Ordering::Acquire)
+    len(inner) == 0
 }
 
 #[inline]
 fn is_full<T, P, C>(inner: &Inner<T, P, C>) -> bool {
-    inner.write_cursor.load(Ordering::Relaxed)
-        > inner
-            .read_cursor
-            .load(Ordering::Acquire)
-            .wrapping_add(inner.mask)
+    inner
+        .write_cursor
+        .load(Ordering::Relaxed)
+        .wrapping_sub(inner.read_cursor.load(Ordering::Acquire))
+        > inner.mask
 }

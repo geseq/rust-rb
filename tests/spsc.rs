@@ -465,14 +465,13 @@ fn non_power_of_two_capacity_various() {
 // 8. WRAPPING ARITHMETIC DOCUMENTATION (HIGH)
 // -----------------------------------------------------------------------------
 
-/// Document that usize wrapping is untestable in practice.
+/// Cursor wraparound is handled by comparing wrapped *differences*.
 ///
-/// SPSC uses usize wrapping arithmetic for indices. Since usize wraps at
-/// 2^64 (or 2^32 on 32-bit), and we'd need to enqueue 2^64 items to
-/// observe wraparound, this is untestable in practice. This test serves
-/// as documentation that wrapping is sound and verified by construction.
-///
-/// The implementation uses `wrapping_add` explicitly to make the intent clear.
+/// The monotonic cursors wrap `usize` — after 2^64 elements on 64-bit but
+/// after only 2^32 on 32-bit targets, which is reachable in practice. All
+/// fullness/emptiness checks therefore compare `write.wrapping_sub(read)`
+/// (the true occupancy, correct across wraparound) rather than the absolute
+/// cursor values.
 #[test]
 fn wrapping_arithmetic_documentation() {
     // This test documents that wrapping arithmetic is used throughout.
@@ -691,9 +690,9 @@ fn adaptive_publish_exact_when_caught_up() {
 }
 
 /// While the queue is backed up, publishes are deferred (up to capacity/8,
-/// max 64), so the producer transiently sees a fuller queue; the deferred
-/// progress becomes visible at the batch boundary and when the consumer
-/// catches up.
+/// max 64) — except that a pop observing a *full* queue publishes at once
+/// (producer-liveness). Deferred progress becomes visible at the batch
+/// boundary and when the consumer catches up.
 #[test]
 fn adaptive_publish_defers_when_backed_up() {
     let (mut tx, mut rx) = RingBuffer::<i32>::new(1024); // batch = 64
@@ -703,22 +702,26 @@ fn adaptive_publish_defers_when_backed_up() {
     }
     assert!(tx.is_full());
 
-    // Fewer than one batch consumed: producer may still see a full queue,
-    // but the consumer's own view is exact.
-    for i in 0..10 {
-        assert_eq!(rx.pop(), i);
-    }
-    assert_eq!(rx.len(), 1014);
-    assert!(tx.is_full(), "deferred publish: producer still sees full");
+    // The first pop observes a full queue and publishes immediately.
+    assert_eq!(rx.pop(), 0);
+    assert!(!tx.is_full(), "pop from full must publish immediately");
 
-    // Crossing the batch boundary publishes.
-    for i in 10..64 {
+    // Subsequent pops (queue no longer full per the consumer's view) defer:
+    // the producer's view over-counts until the batch boundary.
+    for i in 1..10 {
         assert_eq!(rx.pop(), i);
     }
-    assert!(!tx.is_full(), "batch boundary must publish");
+    assert_eq!(rx.len(), 1014, "consumer view is exact");
+    assert_eq!(tx.len(), 1023, "producer view lags by the deferred pops");
+
+    // Crossing the batch boundary (batch pops past the last publish) flushes.
+    for i in 10..65 {
+        assert_eq!(rx.pop(), i);
+    }
+    assert!(tx.len() <= 1024 - 65, "batch boundary must publish");
 
     // Draining the rest ends caught up, with everything published.
-    for i in 64..1024 {
+    for i in 65..1024 {
         assert_eq!(rx.pop(), i);
     }
     assert!(rx.try_pop().is_none());
@@ -857,4 +860,96 @@ fn claim_pop_ref_threaded() {
     }
     assert!(rx.try_pop().is_none());
     producer.join().unwrap();
+}
+
+// -----------------------------------------------------------------------------
+// 14. REVIEW REGRESSIONS (adaptive publish liveness, PopRef panic safety)
+// -----------------------------------------------------------------------------
+
+/// A pop that observes a full queue publishes immediately, so a producer
+/// blocked on full is released by the first pop even when the consumer then
+/// stops (review finding: mid-batch pops previously freed nothing).
+#[test]
+fn pop_on_full_queue_publishes_immediately() {
+    let (mut tx, mut rx) = RingBuffer::<i32>::new(512); // batch = 64
+
+    for i in 0..512 {
+        tx.push(i);
+    }
+    assert!(tx.is_full());
+
+    // One pop from a full queue must be visible to the producer at once.
+    assert_eq!(rx.pop(), 0);
+    assert!(!tx.is_full(), "first pop from full must publish");
+    assert!(tx.try_push(512).is_ok());
+
+    // Threaded version: blocked push is released by a single pop.
+    let (mut tx, mut rx) = RingBuffer::<i32, PauseWait, PauseWait>::with_wait_strategies(512);
+    for i in 0..512 {
+        tx.push(i);
+    }
+    let producer = std::thread::spawn(move || {
+        tx.push(512); // blocks until the consumer frees a slot
+        tx
+    });
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    assert_eq!(rx.pop(), 0); // must unblock the producer
+    let _tx = producer.join().unwrap();
+    for i in 1..513 {
+        assert_eq!(rx.pop(), i);
+    }
+}
+
+/// A panicking `T::drop` inside `PopRef` must not double-drop: the cursor
+/// advances even on unwind (review finding: verified double-free before).
+#[test]
+fn pop_ref_panicking_drop_is_not_double_dropped() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    struct PanicsOnDrop {
+        drops: Arc<AtomicUsize>,
+        panic_on_drop: bool,
+    }
+    impl Drop for PanicsOnDrop {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::Relaxed);
+            if self.panic_on_drop {
+                panic!("boom");
+            }
+        }
+    }
+
+    let drops = Arc::new(AtomicUsize::new(0));
+    let (mut tx, mut rx) = RingBuffer::<PanicsOnDrop>::new(8);
+    tx.push(PanicsOnDrop {
+        drops: drops.clone(),
+        panic_on_drop: true,
+    });
+    tx.push(PanicsOnDrop {
+        drops: drops.clone(),
+        panic_on_drop: false,
+    });
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        drop(rx.pop_ref());
+    }));
+    assert!(result.is_err(), "first drop panics");
+    assert_eq!(drops.load(Ordering::Relaxed), 1);
+
+    // The cursor advanced past the panicked element: the next pop yields the
+    // SECOND element, and nothing is dropped twice.
+    {
+        let second = rx.pop_ref();
+        assert!(!second.panic_on_drop);
+    }
+    assert_eq!(drops.load(Ordering::Relaxed), 2);
+    assert!(rx.try_pop_ref().is_none());
+    drop(rx);
+    drop(tx);
+    assert_eq!(
+        drops.load(Ordering::Relaxed),
+        2,
+        "no double drop at teardown"
+    );
 }

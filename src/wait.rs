@@ -9,7 +9,7 @@
 //! CPU and let the caller re-check the loop condition), matching the C++ where
 //! only [`CvWait`] consults the predicate.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{fence, AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
@@ -27,6 +27,12 @@ pub trait WaitStrategy: Default {
 
     /// Wake any thread parked in [`wait`](WaitStrategy::wait). A no-op for the
     /// spin strategies.
+    ///
+    /// Contract for implementors: if `wait` can park indefinitely (an
+    /// untimed futex/park), a `notify` issued after the waited-for condition
+    /// became true must wake it. The queue calls `notify` after every
+    /// progress publish; strategies whose `wait` re-checks on a timeout (as
+    /// all built-in ones do) may treat `notify` as advisory.
     #[inline(always)]
     fn notify(&self) {}
 }
@@ -71,7 +77,9 @@ impl WaitStrategy for NoOpWait {
     fn wait<P: FnMut() -> bool>(&self, _pred: P) {}
 }
 
-/// Park on a condition variable, re-checking at most every 100 ns.
+/// Park on a condition variable with a timed re-check (nominally 100 ns;
+/// effectively the OS timer granularity, tens of microseconds on Linux with
+/// default timerslack).
 ///
 /// Port of `CVWaitStrategy`. Lowest CPU usage; highest wake-up latency. Unlike
 /// the spin strategies this consults `pred` so a notification that arrives
@@ -100,24 +108,32 @@ impl WaitStrategy for CvWait {
     #[inline]
     fn wait<P: FnMut() -> bool>(&self, mut pred: P) {
         let guard = self.mutex.lock().unwrap();
-        self.waiting.store(true, Ordering::Release);
-        // wait_timeout_while returns immediately if `pred` is already satisfied,
-        // mirroring `cv_.wait_for(lock, 100ns, p)`.
+        self.waiting.store(true, Ordering::Relaxed);
+        // Order the `waiting` store before the predicate's load. Paired with
+        // the notifier's fence, this is the classic store-buffering pattern:
+        // either the notifier sees `waiting == true` and takes the slow path,
+        // or this predicate check sees the notifier's published progress and
+        // never parks — a stale read on both sides at once is impossible.
+        fence(Ordering::SeqCst);
+        // wait_timeout_while returns immediately if `pred` is already
+        // satisfied. The timed re-check bounds any residual staleness; note
+        // the effective granularity is the OS timer (tens of microseconds
+        // with default Linux timerslack), not literally 100 ns.
         let _ = self
             .cv
             .wait_timeout_while(guard, Duration::from_nanos(100), |_| !pred())
             .unwrap();
-        self.waiting.store(false, Ordering::Release);
+        self.waiting.store(false, Ordering::Relaxed);
     }
 
     #[inline]
     fn notify(&self) {
+        // Order the caller's progress publish (a `Release` store) before the
+        // `waiting` load — see the matching fence in `wait`.
+        fence(Ordering::SeqCst);
         // Fast path: nobody is parked (or about to park), so there is nothing
-        // to wake and we avoid the mutex altogether. If the waiter is racing
-        // us into `wait` and we read a stale `false`, its predicate re-check
-        // under the lock — or, at worst, the 100 ns timeout — recovers, which
-        // is the same guarantee the C++ original's lock-free notify provides.
-        if self.waiting.load(Ordering::Acquire) {
+        // to wake and we avoid the mutex altogether.
+        if self.waiting.load(Ordering::Relaxed) {
             // Take the lock so we never signal between the waiter's predicate
             // check and its park, which would otherwise be a lost wake-up.
             let _guard = self.mutex.lock().unwrap();
