@@ -953,3 +953,18 @@ fn pop_ref_panicking_drop_is_not_double_dropped() {
         "no double drop at teardown"
     );
 }
+
+/// Capacity-1 ring: the smallest queue, where every push observes full-ish
+/// boundaries and the publish batch clamps to 1 (exact per-element publish).
+#[test]
+fn capacity_one_ring() {
+    let (mut tx, mut rx) = RingBuffer::<u64>::new(1);
+    assert_eq!(tx.capacity(), 1);
+    for i in 0..1000u64 {
+        tx.push(i);
+        assert!(tx.is_full());
+        assert!(tx.try_push(i).is_err());
+        assert_eq!(rx.pop(), i);
+        assert!(tx.is_empty(), "capacity-1 publishes exactly per element");
+    }
+}
