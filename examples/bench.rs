@@ -65,8 +65,9 @@ where
     let elapsed = start.elapsed();
 
     let ns_per_op = elapsed.as_nanos() as f64 / NUM_ITERATIONS as f64;
+    let mops = NUM_ITERATIONS as f64 / elapsed.as_secs_f64() / 1e6;
     println!(
-        "{name:<14} {ns_per_op:>5.2} ns/op   {:>5} ms",
+        "{name:<14} {ns_per_op:>5.2} ns/op   {mops:>6.1} M msgs/s   {:>5} ms",
         elapsed.as_millis()
     );
 }

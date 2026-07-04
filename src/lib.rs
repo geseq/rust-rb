@@ -34,6 +34,24 @@
 //! The producer and consumer move to their respective threads; the buffer lives
 //! in a shared [`std::sync::Arc`] and is freed when both halves drop.
 //!
+//! # Variable-size messages
+//!
+//! When the payload is not one fixed type — serialized structs, wire frames,
+//! log records of differing lengths — use [`spsc_bytes::SpscBytes`], a framed
+//! byte ring with the same design and zero-copy reads and writes:
+//!
+//! ```
+//! use rust_rb::spsc_bytes::SpscBytes;
+//!
+//! // Capacity is in bytes, rounded up to the next power of two.
+//! let (mut tx, mut rx) = SpscBytes::<4096>::new();
+//!
+//! tx.put(b"tick");
+//! tx.put(b"a longer message");
+//! assert_eq!(&*rx.get(), b"tick");
+//! assert_eq!(&*rx.get(), b"a longer message");
+//! ```
+//!
 //! [`YieldWait`]: wait::YieldWait
 
 #![deny(unsafe_op_in_unsafe_fn)]
@@ -41,9 +59,12 @@
 mod cache_padded;
 
 pub mod spsc;
+pub mod spsc_bytes;
 pub mod wait;
 
 #[doc(inline)]
 pub use spsc::{Consumer, Producer, Spsc};
+#[doc(inline)]
+pub use spsc_bytes::{BytesConsumer, BytesProducer, SpscBytes};
 #[doc(inline)]
 pub use wait::{CvWait, NoOpWait, PauseWait, WaitStrategy, YieldWait};

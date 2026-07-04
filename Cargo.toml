@@ -3,7 +3,7 @@ name = "rust-rb"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.70"
-description = "High-performance SPSC and MPSC ring buffers with selectable wait strategies. A faithful Rust port of cpp-fastchan."
+description = "High-performance SPSC ring buffers — fixed-size items and variable-size byte messages — with selectable wait strategies. A faithful Rust port of cpp-fastchan."
 license = "MIT"
 repository = "https://github.com/geseq/rust-rb"
 readme = "README.md"
@@ -29,6 +29,10 @@ codegen-units = 1
 [[example]]
 name = "bench"
 path = "examples/bench.rs"
+
+[[example]]
+name = "bench_bytes"
+path = "examples/bench_bytes.rs"
 
 [dev-dependencies]
 disruptor-rs = "0.1.1"

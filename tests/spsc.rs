@@ -245,15 +245,13 @@ fn consumer_state_methods() {
 }
 
 // -----------------------------------------------------------------------------
-// 2. ZERO CAPACITY PANIC (HIGH)
+// 2. ZERO CAPACITY (HIGH)
 // -----------------------------------------------------------------------------
 
-/// Test that Spsc::<T, 0>::new() panics with a descriptive message.
-#[test]
-#[should_panic(expected = "capacity must be greater than zero")]
-fn zero_capacity_panics() {
-    let _ = Spsc::<i32, 0>::new();
-}
+// `Spsc::<i32, 0>::new()` is rejected at compile time (monomorphization-time
+// const assert in `Spsc::new`), so there is no runtime panic left to test.
+// Uncommenting the following line must fail to compile:
+// const _: fn() = || { let _ = Spsc::<i32, 0>::new(); };
 
 // -----------------------------------------------------------------------------
 // 3. EXACT CAPACITY BOUNDARY (MEDIUM)
@@ -297,10 +295,7 @@ struct MovabilityTracker {
 
 impl MovabilityTracker {
     fn new(id: usize) -> Self {
-        Self {
-            id,
-            moved: false,
-        }
+        Self { id, moved: false }
     }
 }
 
@@ -661,4 +656,104 @@ fn mixed_blocking_nonblocking_try_put_get_multithreaded() {
 
     producer.join().unwrap();
     consumer.join().unwrap();
+}
+
+// -----------------------------------------------------------------------------
+// 12. ADAPTIVE READ-CURSOR PUBLISH
+// -----------------------------------------------------------------------------
+
+/// While caught up (queue drained as far as the consumer knows), every get
+/// publishes immediately, so producer-side views stay exact — identical to
+/// the per-element publish of the C++ original.
+#[test]
+fn adaptive_publish_exact_when_caught_up() {
+    let (mut tx, mut rx) = Spsc::<i32, 1024>::new();
+
+    // Ping-pong: the consumer catches up on every get.
+    for i in 0..200 {
+        tx.put(i);
+        assert_eq!(rx.get(), i);
+        assert!(tx.is_empty(), "caught-up get must publish immediately");
+        assert_eq!(tx.len(), 0);
+    }
+
+    // Draining a burst: the final (catching-up) get flushes everything.
+    for i in 0..100 {
+        tx.put(i);
+    }
+    for i in 0..100 {
+        assert_eq!(rx.get(), i);
+    }
+    assert!(tx.is_empty());
+    assert_eq!(tx.len(), 0);
+}
+
+/// While the queue is backed up, publishes are deferred (up to capacity/8,
+/// max 64), so the producer transiently sees a fuller queue; the deferred
+/// progress becomes visible at the batch boundary and when the consumer
+/// catches up.
+#[test]
+fn adaptive_publish_defers_when_backed_up() {
+    let (mut tx, mut rx) = Spsc::<i32, 1024>::new(); // batch = 64
+
+    for i in 0..1024 {
+        tx.put(i);
+    }
+    assert!(tx.is_full());
+
+    // Fewer than one batch consumed: producer may still see a full queue,
+    // but the consumer's own view is exact.
+    for i in 0..10 {
+        assert_eq!(rx.get(), i);
+    }
+    assert_eq!(rx.len(), 1014);
+    assert!(tx.is_full(), "deferred publish: producer still sees full");
+
+    // Crossing the batch boundary publishes.
+    for i in 10..64 {
+        assert_eq!(rx.get(), i);
+    }
+    assert!(!tx.is_full(), "batch boundary must publish");
+
+    // Draining the rest ends caught up, with everything published.
+    for i in 64..1024 {
+        assert_eq!(rx.get(), i);
+    }
+    assert!(rx.try_get().is_none());
+    assert!(tx.is_empty());
+    for i in 0..1024 {
+        assert!(tx.try_put(i).is_ok(), "all space visible after catch-up");
+    }
+}
+
+/// Consuming fewer elements than the publish batch and then dropping both
+/// halves must not double-drop the consumed elements: `Consumer::drop`
+/// publishes its private cursor before `Inner::drop` walks the leftovers.
+#[test]
+fn adaptive_publish_no_double_drop_on_consumer_drop() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    struct CountsDrops(Arc<AtomicUsize>);
+    impl Drop for CountsDrops {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    let drops = Arc::new(AtomicUsize::new(0));
+    let (mut tx, mut rx) = Spsc::<CountsDrops, 1024>::new(); // batch 64
+
+    for _ in 0..100 {
+        tx.put(CountsDrops(drops.clone()));
+    }
+    // Consume 10 (< batch 64, still behind): progress is deferred at drop time.
+    for _ in 0..10 {
+        drop(rx.get());
+    }
+    assert_eq!(drops.load(Ordering::Relaxed), 10);
+
+    drop(rx);
+    drop(tx); // Inner::drop releases the remaining 90 — exactly once each
+    assert_eq!(drops.load(Ordering::Relaxed), 100);
 }

@@ -61,7 +61,8 @@ Both halves also expose `len()`, `is_empty()`, `is_full()`, and `capacity()`.
 
 ## What makes it fast
 
-The same four ideas as the C++ original:
+The same four ideas as the C++ original, plus an adaptive refinement of the
+publish side:
 
 - **Monotonic masked indices.** The write and read cursors only ever increase;
   the slot is `index & (capacity - 1)`. No modulo, and the *entire*
@@ -70,18 +71,76 @@ The same four ideas as the C++ original:
   cursor and only reloads the shared atomic when the buffer *looks* full; the
   consumer does the mirror image. In steady state neither side reads the other's
   cache line.
-- **No false sharing.** The two shared atomics each sit on their own 64-byte
-  cache line, and each side's private cursors live in its handle (owned by one
-  thread) rather than in shared memory.
+- **No false sharing.** The two shared atomics are padded a full destructive
+  interference distance apart — 128 bytes on x86-64 and AArch64, where
+  adjacent-line prefetchers make 64-byte spacing insufficient — and each side's
+  private cursors live in its handle (owned by one thread) rather than in
+  shared memory.
 - **Single-writer publish.** One `Release` store publishes each side's progress;
   the other side observes it with an `Acquire` load. On x86-64 these compile to
   plain `MOV`s, so the orderings are free while remaining correct on weakly
   ordered targets such as AArch64.
+- **Adaptive read-cursor publishes.** A publish only costs something when the
+  other side is polling the published line, and the producer only polls the
+  read cursor when the queue is full. So the consumer publishes after every
+  element while it is *caught up* — uncontended, latency-critical, and
+  identical to the C++ behavior — but defers to one publish per `capacity / 8`
+  (max 64) elements while the queue is *backed up*. In the backed-up regime a
+  per-element publish lets the polling producer steal the cursor's cache line
+  between every store, collapsing both threads into a lockstep line ping-pong;
+  deferring amortizes the transfer and lets the producer put in bursts. On a
+  Grace (Neoverse V2) core pair this takes the saturated spin-strategy
+  benchmark from ~135 M to ~860 M msgs/s, roughly twice the C++ original's
+  best on the same cores. The trade-off: while (and only while) the queue is
+  backed up, producer-side `len()`/`is_full()` may transiently over-count by
+  up to the deferral bound; consumer-side views are exact, and the consumer
+  never waits, reports empty, or drops with progress unpublished.
+
+## Variable-size messages: `SpscBytes`
+
+When the payload is not one fixed type — serialized structs, wire frames, log
+records of differing lengths — `SpscBytes` transports discrete byte messages
+through one shared ring:
+
+```rust
+use rust_rb::spsc_bytes::SpscBytes;
+
+// Capacity is in *bytes*, rounded up to the next power of two.
+let (mut tx, mut rx) = SpscBytes::<4096>::new();
+
+tx.put(b"tick");                 // copy in
+assert_eq!(&*rx.get(), b"tick"); // zero-copy view, released on drop
+```
+
+Each message is framed as a 4-byte length header plus the payload, rounded up
+to a 4-byte boundary. Records never wrap: a record that would straddle the end
+of the buffer is preceded by a padding marker and starts again at offset zero,
+so every payload is contiguous and reads are zero-copy. Because a message may
+need that padding *in addition to* its own record, a single message is capped
+at `capacity / 2 - 4` bytes (`max_message_len()`) — this guarantees any legal
+message can always be written eventually, whatever the cursor positions.
+
+| Producer | Consumer | Behaviour |
+| -------- | -------- | --------- |
+| `put(&[u8])` | `get() -> Msg` | block (using the wait strategy) |
+| `try_put(&[u8]) -> bool` | `try_get() -> Option<Msg>` | return immediately when full / empty |
+| `claim(len)` / `try_claim(len)` | `drain(f) -> usize` | zero-copy write slot / batched consume |
+
+`claim` returns a `WriteSlot` that dereferences to the payload slice, so you
+serialize directly into the ring and `commit()`; dropping it uncommitted
+abandons the space. `drain` consumes every available message with a **single**
+cursor publish, amortizing the release store and wake-up across the batch.
+`Msg` dereferences to the payload bytes in place; the bytes are handed back to
+the producer when it drops.
+
+The framing, cursor caching, padding, and memory-ordering design is identical
+to the fixed-size ring; the wait strategies are shared between both.
 
 ## Benchmark
 
 ```
-cargo run --release --example bench
+cargo run --release --example bench          # fixed-size ring
+cargo run --release --example bench_bytes    # variable-size ring
 ```
 
 For meaningful numbers, pin the producer and consumer to dedicated cores, e.g.

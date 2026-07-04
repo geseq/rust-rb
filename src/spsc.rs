@@ -22,6 +22,15 @@
 //!   pointer, the mask, and raw pointers to the two shared atomics, so `put` /
 //!   `get` never chase through `Arc<Inner>` to re-read constants — mirroring the
 //!   C++ where these are fixed offsets from `this`.
+//! * **Adaptive read-cursor publishes.** A publish only costs something when
+//!   the other side is polling the published line, and the producer only
+//!   polls the read cursor when the queue is full. The consumer therefore
+//!   publishes per element while it is caught up (uncontended and
+//!   latency-critical — identical to the C++ behavior) but defers to batched
+//!   publishes while the queue is backed up, where per-element publishes
+//!   would let the polling producer steal the cursor's cache line between
+//!   every store and collapse both threads into a lockstep line ping-pong.
+//!   See [`Consumer`] internals for the full analysis.
 
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
@@ -67,6 +76,31 @@ impl<T, P, G> Drop for Inner<T, P, G> {
     }
 }
 
+/// The deferred-publish bound for the consumer's adaptive publish (see
+/// `Consumer::read`): `capacity / 8`, clamped to `[1, 64]`. Large enough to
+/// amortize the release store and keep a full-queue producer off the
+/// consumer's cache line, small enough that the producer never sees more than
+/// 12.5% of the buffer as phantom occupancy.
+#[inline(always)]
+const fn publish_batch(capacity: usize) -> usize {
+    let batch = capacity / 8;
+    if batch == 0 {
+        1
+    } else if batch > 64 {
+        64
+    } else {
+        batch
+    }
+}
+
+/// Rejects zero capacities when `new` is monomorphized, turning what would be
+/// a runtime panic into a compile error.
+struct AssertCapacity<const N: usize>;
+
+impl<const N: usize> AssertCapacity<N> {
+    const NON_ZERO: () = assert!(N > 0, "capacity must be greater than zero");
+}
+
 /// Builder/namespace for constructing an SPSC ring buffer.
 ///
 /// `N` is the requested minimum capacity; the real capacity is `N` rounded up
@@ -85,12 +119,11 @@ where
 {
     /// Create a ring buffer and return its producer and consumer halves.
     ///
-    /// # Panics
-    ///
-    /// Panics if `N == 0`.
+    /// `N == 0` is rejected at compile time.
     #[allow(clippy::new_ret_no_self)] // intentionally returns the producer/consumer pair
     pub fn new() -> (Producer<T, P, G>, Consumer<T, P, G>) {
-        assert!(N > 0, "capacity must be greater than zero");
+        // Evaluated at monomorphization: `Spsc::<T, 0>::new()` fails to compile.
+        let () = AssertCapacity::<N>::NON_ZERO;
         let capacity = N.next_power_of_two();
 
         let mut slots = Vec::with_capacity(capacity);
@@ -109,10 +142,12 @@ where
         // stay valid for as long as the `Arc<Inner>` the handle holds is alive.
         let buf = unsafe { NonNull::new_unchecked(inner.buffer.as_ptr().cast_mut()) };
         let mask = inner.mask;
-        let next_free =
-            unsafe { NonNull::new_unchecked((&*inner.write_cursor as *const AtomicUsize).cast_mut()) };
-        let reader =
-            unsafe { NonNull::new_unchecked((&*inner.read_cursor as *const AtomicUsize).cast_mut()) };
+        let next_free = unsafe {
+            NonNull::new_unchecked((&*inner.write_cursor as *const AtomicUsize).cast_mut())
+        };
+        let reader = unsafe {
+            NonNull::new_unchecked((&*inner.read_cursor as *const AtomicUsize).cast_mut())
+        };
 
         (
             Producer {
@@ -130,6 +165,7 @@ where
                 next_free,
                 reader,
                 read_cursor: 0,
+                published: 0,
                 write_cursor_cache: 0,
                 inner,
             },
@@ -220,18 +256,27 @@ where
     }
 
     /// Number of elements currently queued.
+    ///
+    /// While the queue is backed up, the consumer defers its cursor publishes
+    /// (see `Consumer::read`), so this may transiently over-count by up to
+    /// `capacity / 8` (max 64) already-consumed elements. It is exact
+    /// whenever the consumer has caught up, and never under-counts.
     #[inline]
     pub fn len(&self) -> usize {
         len(&self.inner)
     }
 
-    /// Whether the queue is empty.
+    /// Whether the queue is empty. Exact whenever the consumer has caught up
+    /// (see [`len`](Self::len)); never reports `true` for a non-empty queue.
     #[inline]
     pub fn is_empty(&self) -> bool {
         is_empty(&self.inner)
     }
 
-    /// Whether the queue is full (no room for another `put`).
+    /// Whether the queue is full (no room for another `put`). May transiently
+    /// report `true` while the consumer defers publishes in the backed-up
+    /// regime (see [`len`](Self::len)); never reports `false` for a truly
+    /// full queue.
     #[inline]
     pub fn is_full(&self) -> bool {
         is_full(&self.inner)
@@ -256,10 +301,27 @@ pub struct Consumer<T, P, G> {
     reader: NonNull<AtomicUsize>,
     /// Next index to read (the C++ `reader_index_2_`). Private to this thread.
     read_cursor: usize,
+    /// The value of `read_cursor` last published to the shared atomic (see
+    /// [`read`](Self::read) for the adaptive publish rule).
+    published: usize,
     /// Cached snapshot of the producer's `write_cursor` (the C++ `next_free_index_cache_`).
     write_cursor_cache: usize,
     /// Keeps the shared allocation alive and carries the wait strategies.
     inner: Arc<Inner<T, P, G>>,
+}
+
+impl<T, P, G> Drop for Consumer<T, P, G> {
+    fn drop(&mut self) {
+        // Publish any deferred progress. Without this, `Inner::drop` would
+        // re-drop elements we already moved out, and a surviving producer
+        // would never see the space we freed. (No `notify`: it would need a
+        // `WaitStrategy` bound, and a `CvWait` producer re-checks every
+        // 100 ns regardless.)
+        if self.read_cursor != self.published {
+            // SAFETY: `reader` is a `NonNull` into the live `inner`.
+            unsafe { (*self.reader.as_ptr()).store(self.read_cursor, Ordering::Release) };
+        }
+    }
 }
 
 // SAFETY: the consumer half only touches consumer-private state plus atomics.
@@ -302,7 +364,29 @@ where
         Some(self.read())
     }
 
-    /// Common tail of `get`/`try_get`: move the value out and publish progress.
+    /// Common tail of `get`/`try_get`: move the value out and publish progress
+    /// adaptively.
+    ///
+    /// A publish only costs something when the *other* side is polling the
+    /// published line, and the producer only polls `read_cursor` when the
+    /// queue is full. So the publish rule adapts to the regime the consumer
+    /// can already see for free:
+    ///
+    /// * **Caught up** (`read_cursor == write_cursor_cache`, the queue looks
+    ///   empty): publish immediately — the line is uncontended, and this is
+    ///   the latency-sensitive regime. Behaves exactly like the per-element
+    ///   publish of the C++ original.
+    /// * **Behind** (more items already known available — the backpressure
+    ///   regime, where a full-queue producer polls this line): defer, and
+    ///   publish once per `publish_batch(capacity)` elements. Per-element
+    ///   publishes here let the producer's polling steal the cache line
+    ///   between every store, collapsing both threads into a lockstep
+    ///   line ping-pong (~3.5x lower throughput end to end).
+    ///
+    /// Because catching up always flushes, the consumer can never wait (or
+    /// report empty) with progress unpublished, so a blocked producer is
+    /// stalled by at most the batch slack while the consumer is actively
+    /// consuming.
     #[inline(always)]
     fn read(&mut self) -> T {
         // SAFETY: `index & mask` is always in bounds (see `Producer::write`).
@@ -314,31 +398,46 @@ where
         };
 
         self.read_cursor = self.read_cursor.wrapping_add(1);
-        // SAFETY: `reader` is a `NonNull` into the live `inner`.
-        unsafe { (*self.reader.as_ptr()).store(self.read_cursor, Ordering::Release) };
-
-        // Wake a producer blocked in `put`. A no-op for the spin strategies.
-        self.inner.put_wait.notify();
+        if self.read_cursor == self.write_cursor_cache
+            || self.read_cursor.wrapping_sub(self.published) >= publish_batch(self.mask + 1)
+        {
+            self.flush();
+        }
 
         value
     }
 
-    /// Number of elements currently queued.
+    /// Publish the private read cursor to the shared atomic and wake a
+    /// producer blocked in `put`. The wake-up is a no-op for spin strategies.
+    #[inline(always)]
+    fn flush(&mut self) {
+        // SAFETY: `reader` is a `NonNull` into the live `inner`.
+        unsafe { (*self.reader.as_ptr()).store(self.read_cursor, Ordering::Release) };
+        self.published = self.read_cursor;
+        self.inner.put_wait.notify();
+    }
+
+    /// Number of elements currently queued. Exact on this side: uses the
+    /// consumer's private cursor, which is always current.
     #[inline]
     pub fn len(&self) -> usize {
-        len(&self.inner)
+        // SAFETY: `next_free` is a `NonNull` into the live `inner`.
+        unsafe { (*self.next_free.as_ptr()).load(Ordering::Acquire) }.wrapping_sub(self.read_cursor)
     }
 
-    /// Whether the queue is empty.
+    /// Whether the queue is empty. Exact on this side (see [`len`](Self::len)).
     #[inline]
     pub fn is_empty(&self) -> bool {
-        is_empty(&self.inner)
+        // SAFETY: `next_free` is a `NonNull` into the live `inner`.
+        self.read_cursor >= unsafe { (*self.next_free.as_ptr()).load(Ordering::Acquire) }
     }
 
-    /// Whether the queue is full.
+    /// Whether the queue is full. Exact on this side (see [`len`](Self::len)).
     #[inline]
     pub fn is_full(&self) -> bool {
-        is_full(&self.inner)
+        // SAFETY: `next_free` is a `NonNull` into the live `inner`.
+        let write = unsafe { (*self.next_free.as_ptr()).load(Ordering::Relaxed) };
+        write > self.read_cursor.wrapping_add(self.mask)
     }
 
     /// The buffer's true capacity (`N` rounded up to a power of two).
