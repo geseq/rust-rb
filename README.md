@@ -162,6 +162,24 @@ For meaningful numbers, pin the producer and consumer to dedicated cores, e.g.
 `taskset -c 2,3 cargo run --release --example bench`. As in the original,
 latency is dominated by the core-to-core topology of the producer/consumer pair.
 
+### Results
+
+Measured on an NVIDIA Grace (Neoverse V2) core pair, pinned, spin wait
+strategies, saturating producer:
+
+| Ring | Payload | Rate | Payload bandwidth |
+| ---- | ------- | ---- | ----------------- |
+| `RingBuffer<i64>` (cap 32 Ki) | 8 B/element | **~1.15 ns/op, ~860–900 M msgs/s** | — |
+| `BytesRingBuffer` (cap 64 KiB) | 8 B/msg | ~4.9 ns/msg, ~205 M msgs/s | ~1.6 GB/s |
+| `BytesRingBuffer` (cap 64 KiB) | 64 B/msg | ~13 ns/msg, ~77 M msgs/s | ~5 GB/s |
+| `BytesRingBuffer` (cap 64 KiB) | 256 B/msg | ~27–46 ns/msg, ~25–37 M msgs/s | ~6–9 GB/s |
+
+The two benchmarks measure different work: the fixed-size ring hands off
+8-byte values (pure queue overhead — the C++ original measures ~2.4 ns/op on
+the same cores), while the bytes ring copies every payload into the ring and
+transfers those cache lines between the cores, so it becomes bandwidth-bound
+as messages grow — per-message overhead amortizes and GB/s rises with size.
+
 ## Testing
 
 ```
