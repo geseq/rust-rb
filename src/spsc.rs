@@ -25,6 +25,7 @@
 
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
+use std::ptr::NonNull;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -104,12 +105,14 @@ where
             get_wait: G::default(),
         });
 
-        // Cache the constants each side needs on its hot path. These pointers
+        // Cache the constants each side needs on its hot path. These `NonNull`s
         // stay valid for as long as the `Arc<Inner>` the handle holds is alive.
-        let buf = inner.buffer.as_ptr();
+        let buf = unsafe { NonNull::new_unchecked(inner.buffer.as_ptr().cast_mut()) };
         let mask = inner.mask;
-        let next_free = &*inner.write_cursor as *const AtomicUsize;
-        let reader = &*inner.read_cursor as *const AtomicUsize;
+        let next_free =
+            unsafe { NonNull::new_unchecked((&*inner.write_cursor as *const AtomicUsize).cast_mut()) };
+        let reader =
+            unsafe { NonNull::new_unchecked((&*inner.read_cursor as *const AtomicUsize).cast_mut()) };
 
         (
             Producer {
@@ -137,13 +140,13 @@ where
 /// The producing half of an [`Spsc`]. Owns the private write cursor.
 pub struct Producer<T, P, G> {
     /// Base of the slot buffer (cached from `inner`; stable for its lifetime).
-    buf: *const UnsafeCell<MaybeUninit<T>>,
+    buf: NonNull<UnsafeCell<MaybeUninit<T>>>,
     /// `capacity - 1` (cached from `inner`).
     mask: usize,
-    /// Our published cursor (cached pointer into `inner`).
-    next_free: *const AtomicUsize,
-    /// The consumer's published cursor (cached pointer into `inner`).
-    reader: *const AtomicUsize,
+    /// Our published cursor (cached `NonNull` into `inner`).
+    next_free: NonNull<AtomicUsize>,
+    /// The consumer's published cursor (cached `NonNull` into `inner`).
+    reader: NonNull<AtomicUsize>,
     /// Next index to write (the C++ `next_free_index_2_`). Private to this thread.
     write_cursor: usize,
     /// Cached snapshot of the consumer's `read_cursor` (the C++ `reader_index_cache_`).
@@ -153,7 +156,7 @@ pub struct Producer<T, P, G> {
 }
 
 // SAFETY: the producer half only touches producer-private state plus atomics.
-// The cached raw pointers reference the `Arc<Inner>` it keeps alive.
+// The cached `NonNull`s reference the `Arc<Inner>` it keeps alive.
 unsafe impl<T: Send, P: Send + Sync, G: Send + Sync> Send for Producer<T, P, G> {}
 
 impl<T, P, G> Producer<T, P, G>
@@ -165,11 +168,11 @@ where
     #[inline]
     pub fn put(&mut self, value: T) {
         while self.write_cursor > self.read_cursor_cache.wrapping_add(self.mask) {
-            // SAFETY: `reader` points into the live `inner`.
-            self.read_cursor_cache = unsafe { (*self.reader).load(Ordering::Acquire) };
+            // SAFETY: `reader` is a `NonNull` into the live `inner`.
+            self.read_cursor_cache = unsafe { (*self.reader.as_ptr()).load(Ordering::Acquire) };
             if self.write_cursor > self.read_cursor_cache.wrapping_add(self.mask) {
                 let next = self.write_cursor;
-                let reader = self.reader;
+                let reader = self.reader.as_ptr();
                 self.inner.put_wait.wait(|| {
                     next <= unsafe { (*reader).load(Ordering::Acquire) }.wrapping_add(self.mask)
                 });
@@ -184,8 +187,8 @@ where
     #[inline]
     pub fn try_put(&mut self, value: T) -> Result<(), T> {
         if self.write_cursor > self.read_cursor_cache.wrapping_add(self.mask) {
-            // SAFETY: `reader` points into the live `inner`.
-            self.read_cursor_cache = unsafe { (*self.reader).load(Ordering::Acquire) };
+            // SAFETY: `reader` is a `NonNull` into the live `inner`.
+            self.read_cursor_cache = unsafe { (*self.reader.as_ptr()).load(Ordering::Acquire) };
             if self.write_cursor > self.read_cursor_cache.wrapping_add(self.mask) {
                 return Err(value);
             }
@@ -203,13 +206,13 @@ where
         // as in the C++ `contents_[i & mask]`. We are the only producer and have
         // confirmed the slot is free (the consumer moved its occupant out).
         unsafe {
-            let slot = &*self.buf.add(self.write_cursor & self.mask);
+            let slot = &*self.buf.as_ptr().add(self.write_cursor & self.mask);
             (*slot.get()).write(value);
         }
 
         self.write_cursor = self.write_cursor.wrapping_add(1);
-        // SAFETY: `next_free` points into the live `inner`.
-        unsafe { (*self.next_free).store(self.write_cursor, Ordering::Release) };
+        // SAFETY: `next_free` is a `NonNull` into the live `inner`.
+        unsafe { (*self.next_free.as_ptr()).store(self.write_cursor, Ordering::Release) };
 
         // Wake a consumer blocked in `get`. A no-op for the spin strategies,
         // which the compiler elides entirely.
@@ -244,13 +247,13 @@ where
 /// The consuming half of an [`Spsc`]. Owns the private read cursor.
 pub struct Consumer<T, P, G> {
     /// Base of the slot buffer (cached from `inner`; stable for its lifetime).
-    buf: *const UnsafeCell<MaybeUninit<T>>,
+    buf: NonNull<UnsafeCell<MaybeUninit<T>>>,
     /// `capacity - 1` (cached from `inner`).
     mask: usize,
-    /// The producer's published cursor (cached pointer into `inner`).
-    next_free: *const AtomicUsize,
-    /// Our published cursor (cached pointer into `inner`).
-    reader: *const AtomicUsize,
+    /// The producer's published cursor (cached `NonNull` into `inner`).
+    next_free: NonNull<AtomicUsize>,
+    /// Our published cursor (cached `NonNull` into `inner`).
+    reader: NonNull<AtomicUsize>,
     /// Next index to read (the C++ `reader_index_2_`). Private to this thread.
     read_cursor: usize,
     /// Cached snapshot of the producer's `write_cursor` (the C++ `next_free_index_cache_`).
@@ -271,11 +274,11 @@ where
     #[inline]
     pub fn get(&mut self) -> T {
         while self.read_cursor >= self.write_cursor_cache {
-            // SAFETY: `next_free` points into the live `inner`.
-            self.write_cursor_cache = unsafe { (*self.next_free).load(Ordering::Acquire) };
+            // SAFETY: `next_free` is a `NonNull` into the live `inner`.
+            self.write_cursor_cache = unsafe { (*self.next_free.as_ptr()).load(Ordering::Acquire) };
             if self.read_cursor >= self.write_cursor_cache {
                 let read_cursor = self.read_cursor;
-                let next_free = self.next_free;
+                let next_free = self.next_free.as_ptr();
                 self.inner
                     .get_wait
                     .wait(|| read_cursor < unsafe { (*next_free).load(Ordering::Acquire) });
@@ -289,8 +292,8 @@ where
     #[inline]
     pub fn try_get(&mut self) -> Option<T> {
         if self.read_cursor >= self.write_cursor_cache {
-            // SAFETY: `next_free` points into the live `inner`.
-            self.write_cursor_cache = unsafe { (*self.next_free).load(Ordering::Acquire) };
+            // SAFETY: `next_free` is a `NonNull` into the live `inner`.
+            self.write_cursor_cache = unsafe { (*self.next_free.as_ptr()).load(Ordering::Acquire) };
             if self.read_cursor >= self.write_cursor_cache {
                 return None;
             }
@@ -306,13 +309,13 @@ where
         // The index is below the producer's published `write_cursor`, so the
         // slot holds an initialized `T` that we move out exactly once.
         let value = unsafe {
-            let slot = &*self.buf.add(self.read_cursor & self.mask);
+            let slot = &*self.buf.as_ptr().add(self.read_cursor & self.mask);
             (*slot.get()).assume_init_read()
         };
 
         self.read_cursor = self.read_cursor.wrapping_add(1);
-        // SAFETY: `reader` points into the live `inner`.
-        unsafe { (*self.reader).store(self.read_cursor, Ordering::Release) };
+        // SAFETY: `reader` is a `NonNull` into the live `inner`.
+        unsafe { (*self.reader.as_ptr()).store(self.read_cursor, Ordering::Release) };
 
         // Wake a producer blocked in `put`. A no-op for the spin strategies.
         self.inner.put_wait.notify();
