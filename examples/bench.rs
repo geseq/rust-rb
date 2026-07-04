@@ -13,7 +13,7 @@
 
 use std::time::Instant;
 
-use rust_rb::spsc::Spsc;
+use rust_rb::spsc::RingBuffer;
 use rust_rb::wait::{NoOpWait, PauseWait, WaitStrategy, YieldWait};
 
 const NUM_ITERATIONS: i64 = 100_000_000;
@@ -39,7 +39,7 @@ where
     P: WaitStrategy + Send + Sync + 'static,
     C: WaitStrategy + Send + Sync + 'static,
 {
-    let (mut tx, mut rx) = Spsc::<i64, CAPACITY, P, C>::new();
+    let (mut tx, mut rx) = RingBuffer::<i64, P, C>::with_wait_strategies(CAPACITY);
     let consumer_core = cores.map(|(_, c)| c);
 
     let consumer = std::thread::spawn(move || {

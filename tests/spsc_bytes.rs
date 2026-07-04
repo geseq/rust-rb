@@ -2,7 +2,7 @@
 //! zero-copy claim/commit and drain paths, capacity edge cases, and
 //! multi-threaded stress with heavily mixed message sizes.
 
-use rust_rb::spsc_bytes::SpscBytes;
+use rust_rb::spsc_bytes::BytesRingBuffer;
 use rust_rb::wait::{NoOpWait, PauseWait, YieldWait};
 
 /// Deterministic payload for message `seq`: `len` bytes of `(seq + i) as u8`.
@@ -12,7 +12,7 @@ fn payload(seq: usize, len: usize) -> Vec<u8> {
 
 #[test]
 fn round_trip_mixed_sizes() {
-    let (mut tx, mut rx) = SpscBytes::<256>::new();
+    let (mut tx, mut rx) = BytesRingBuffer::new(256);
     assert!(tx.is_empty());
     assert_eq!(tx.capacity(), 256);
     assert_eq!(tx.max_message_len(), 124);
@@ -28,16 +28,16 @@ fn round_trip_mixed_sizes() {
 
 #[test]
 fn capacity_rounds_up_and_has_floor() {
-    let (tx, _rx) = SpscBytes::<100>::new();
+    let (tx, _rx) = BytesRingBuffer::new(100);
     assert_eq!(tx.capacity(), 128);
-    let (tx, _rx) = SpscBytes::<1>::new();
+    let (tx, _rx) = BytesRingBuffer::new(1);
     assert_eq!(tx.capacity(), 8);
     assert_eq!(tx.max_message_len(), 0);
 }
 
 #[test]
 fn zero_length_messages() {
-    let (mut tx, mut rx) = SpscBytes::<64>::new();
+    let (mut tx, mut rx) = BytesRingBuffer::new(64);
     for _ in 0..100 {
         tx.push(b"");
         assert_eq!(&*rx.pop(), b"");
@@ -49,7 +49,7 @@ fn zero_length_messages() {
 /// the buffer mid-record.
 #[test]
 fn wrap_padding_every_lap() {
-    let (mut tx, mut rx) = SpscBytes::<64>::new();
+    let (mut tx, mut rx) = BytesRingBuffer::new(64);
     for seq in 0..10_000 {
         tx.push(&payload(seq, 20));
         let msg = rx.pop();
@@ -61,7 +61,7 @@ fn wrap_padding_every_lap() {
 fn try_push_full_then_recovers() {
     // 12-byte payloads make 16-byte records; exactly 4 fill the 64-byte ring
     // with no padding involved.
-    let (mut tx, mut rx) = SpscBytes::<64>::new();
+    let (mut tx, mut rx) = BytesRingBuffer::new(64);
     for seq in 0..4 {
         assert!(tx.try_push(&payload(seq, 12)));
     }
@@ -79,7 +79,7 @@ fn try_push_full_then_recovers() {
 
 #[test]
 fn max_message_len_round_trips() {
-    let (mut tx, mut rx) = SpscBytes::<256>::new();
+    let (mut tx, mut rx) = BytesRingBuffer::new(256);
     let max = tx.max_message_len();
     // Repeat so the max-size record also exercises the padding path.
     for seq in 0..100 {
@@ -91,14 +91,14 @@ fn max_message_len_round_trips() {
 #[test]
 #[should_panic(expected = "exceeds max_message_len")]
 fn oversized_message_panics() {
-    let (mut tx, _rx) = SpscBytes::<256>::new();
+    let (mut tx, _rx) = BytesRingBuffer::new(256);
     let too_big = vec![0u8; tx.max_message_len() + 1];
     tx.push(&too_big);
 }
 
 #[test]
 fn claim_commit_zero_copy() {
-    let (mut tx, mut rx) = SpscBytes::<128>::new();
+    let (mut tx, mut rx) = BytesRingBuffer::new(128);
 
     let mut slot = tx.claim(8);
     slot.copy_from_slice(&[9u8; 8]);
@@ -119,7 +119,7 @@ fn claim_commit_zero_copy() {
 
 #[test]
 fn drain_batches_everything() {
-    let (mut tx, mut rx) = SpscBytes::<1024>::new();
+    let (mut tx, mut rx) = BytesRingBuffer::new(1024);
     for seq in 0..10 {
         tx.push(&payload(seq, seq * 3));
     }
@@ -143,7 +143,7 @@ where
     C: rust_rb::wait::WaitStrategy + Send + Sync + 'static,
 {
     const MESSAGES: usize = 200_000;
-    let (mut tx, mut rx) = SpscBytes::<256, P, C>::new();
+    let (mut tx, mut rx) = BytesRingBuffer::<P, C>::with_wait_strategies(256);
     let max = tx.max_message_len();
 
     let producer = std::thread::spawn(move || {
@@ -182,7 +182,7 @@ fn threaded_stress_noop() {
 #[test]
 fn threaded_try_and_drain() {
     const MESSAGES: usize = 100_000;
-    let (mut tx, mut rx) = SpscBytes::<512, NoOpWait, NoOpWait>::new();
+    let (mut tx, mut rx) = BytesRingBuffer::<NoOpWait, NoOpWait>::with_wait_strategies(512);
     let max = tx.max_message_len();
 
     let producer = std::thread::spawn(move || {

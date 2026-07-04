@@ -2,7 +2,7 @@
 //! round-trip, and a multi-threaded producer/consumer run, exercised across
 //! every wait-strategy combination and both blocking and non-blocking APIs.
 
-use rust_rb::spsc::{Consumer, Producer, Spsc};
+use rust_rb::spsc::{Consumer, Producer, RingBuffer};
 use rust_rb::wait::{CvWait, NoOpWait, PauseWait, WaitStrategy, YieldWait};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -17,7 +17,7 @@ where
     P: WaitStrategy + Send + Sync,
     C: WaitStrategy + Send + Sync,
 {
-    Spsc::<i32, { (ITERATIONS / 2) + 1 }, P, C>::new()
+    RingBuffer::<i32, P, C>::with_wait_strategies((ITERATIONS / 2) + 1)
 }
 
 fn fill_blocking<P, C>()
@@ -186,7 +186,7 @@ fn drops_remaining_elements() {
 
     let drops = Arc::new(AtomicUsize::new(0));
     {
-        let (mut tx, mut rx) = Spsc::<Counted, 16>::new();
+        let (mut tx, mut rx) = RingBuffer::<Counted>::new(16);
         for _ in 0..10 {
             tx.push(Counted(drops.clone()));
         }
@@ -211,7 +211,7 @@ fn drops_remaining_elements() {
 /// Consumer::capacity() directly from the consumer side.
 #[test]
 fn consumer_state_methods() {
-    let (mut tx, mut rx) = Spsc::<i32, 16>::new();
+    let (mut tx, mut rx) = RingBuffer::<i32>::new(16);
 
     // Initially empty
     assert_eq!(rx.len(), 0);
@@ -248,10 +248,12 @@ fn consumer_state_methods() {
 // 2. ZERO CAPACITY (HIGH)
 // -----------------------------------------------------------------------------
 
-// `Spsc::<i32, 0>::new()` is rejected at compile time (monomorphization-time
-// const assert in `Spsc::new`), so there is no runtime panic left to test.
-// Uncommenting the following line must fail to compile:
-// const _: fn() = || { let _ = Spsc::<i32, 0>::new(); };
+/// Capacity is a runtime value now, so a zero capacity is a runtime panic.
+#[test]
+#[should_panic(expected = "capacity must be greater than zero")]
+fn zero_capacity_panics() {
+    let _ = RingBuffer::<i32>::new(0);
+}
 
 // -----------------------------------------------------------------------------
 // 3. EXACT CAPACITY BOUNDARY (MEDIUM)
@@ -260,7 +262,7 @@ fn consumer_state_methods() {
 /// Test exact boundary conditions at capacity.
 #[test]
 fn exact_capacity_boundary() {
-    let (mut tx, mut rx) = Spsc::<i32, 4>::new();
+    let (mut tx, mut rx) = RingBuffer::<i32>::new(4);
 
     // Fill exactly to capacity
     for i in 0..4 {
@@ -311,7 +313,7 @@ impl Drop for MovabilityTracker {
 /// Test with non-Copy struct and custom ownership semantics.
 #[test]
 fn non_primitive_types() {
-    let (mut tx, mut rx) = Spsc::<MovabilityTracker, 16>::new();
+    let (mut tx, mut rx) = RingBuffer::<MovabilityTracker>::new(16);
 
     // Move items into the queue
     for i in 0..8 {
@@ -330,7 +332,7 @@ fn non_primitive_types() {
 /// Test with String (complex ownership) through the queue.
 #[test]
 fn non_primitive_types_string() {
-    let (mut tx, mut rx) = Spsc::<String, 8>::new();
+    let (mut tx, mut rx) = RingBuffer::<String>::new(8);
 
     for i in 0..4 {
         tx.push(format!("item_{}", i));
@@ -350,7 +352,7 @@ fn non_primitive_types_string() {
 /// Exercises cache-line bouncing and verifies all values are correct.
 #[test]
 fn tight_interleaving() {
-    let (mut tx, mut rx) = Spsc::<i32, 2>::new(); // Small capacity for interleaving
+    let (mut tx, mut rx) = RingBuffer::<i32>::new(2); // Small capacity for interleaving
     let iterations = 1000;
 
     let producer = std::thread::spawn(move || {
@@ -404,7 +406,7 @@ fn consumer_only_drop() {
     let drops = Arc::new(AtomicUsize::new(0));
 
     {
-        let (mut tx, mut rx) = Spsc::<CountedDrop, 16>::new();
+        let (mut tx, mut rx) = RingBuffer::<CountedDrop>::new(16);
         for i in 0..10 {
             tx.push(CountedDrop::new(i, drops.clone()));
         }
@@ -439,23 +441,23 @@ fn consumer_only_drop() {
 /// Test capacity rounding for non-power-of-two capacities.
 #[test]
 fn non_power_of_two_capacity() {
-    let (tx, _rx) = Spsc::<i32, 10>::new();
+    let (tx, _rx) = RingBuffer::<i32>::new(10);
     // 10 rounds up to 16
     assert_eq!(tx.capacity(), 16);
 }
 
 #[test]
 fn non_power_of_two_capacity_various() {
-    let (tx1, _) = Spsc::<i32, 3>::new();
+    let (tx1, _) = RingBuffer::<i32>::new(3);
     assert_eq!(tx1.capacity(), 4);
 
-    let (tx2, _) = Spsc::<i32, 5>::new();
+    let (tx2, _) = RingBuffer::<i32>::new(5);
     assert_eq!(tx2.capacity(), 8);
 
-    let (tx3, _) = Spsc::<i32, 17>::new();
+    let (tx3, _) = RingBuffer::<i32>::new(17);
     assert_eq!(tx3.capacity(), 32);
 
-    let (tx4, _) = Spsc::<i32, 33>::new();
+    let (tx4, _) = RingBuffer::<i32>::new(33);
     assert_eq!(tx4.capacity(), 64);
 }
 
@@ -486,7 +488,7 @@ fn wrapping_arithmetic_documentation() {
     //
     // Verification: The tests below exercise many cycles to ensure no
     // regression in normal operation.
-    let (mut tx, mut rx) = Spsc::<i32, 16>::new();
+    let (mut tx, mut rx) = RingBuffer::<i32>::new(16);
 
     // Exercise many cycles
     for _ in 0..100 {
@@ -507,7 +509,7 @@ fn wrapping_arithmetic_documentation() {
 /// Exercises notify/wait interaction and verifies no spurious wakeup bugs.
 #[test]
 fn cv_wait_spurious_wakeup_stress() {
-    let (mut tx, mut rx) = Spsc::<i32, 16, YieldWait, CvWait>::new();
+    let (mut tx, mut rx) = RingBuffer::<i32, YieldWait, CvWait>::with_wait_strategies(16);
     let iterations = 5000;
 
     let producer = std::thread::spawn(move || {
@@ -529,7 +531,7 @@ fn cv_wait_spurious_wakeup_stress() {
 /// Another CvWait stress test with push-one/pop-one interleaving.
 #[test]
 fn cv_wait_tight_interleaving() {
-    let (mut tx, mut rx) = Spsc::<i32, 2, YieldWait, CvWait>::new();
+    let (mut tx, mut rx) = RingBuffer::<i32, YieldWait, CvWait>::with_wait_strategies(2);
     let iterations = 2000;
 
     let producer = std::thread::spawn(move || {
@@ -562,7 +564,7 @@ fn cv_wait_tight_interleaving() {
 /// Use push() to fill, try_pop() to drain.
 #[test]
 fn mixed_blocking_nonblocking_fill_drain() {
-    let (mut tx, mut rx) = Spsc::<i32, 8>::new();
+    let (mut tx, mut rx) = RingBuffer::<i32>::new(8);
 
     // Fill using blocking push
     for i in 0..8 {
@@ -584,7 +586,7 @@ fn mixed_blocking_nonblocking_fill_drain() {
 /// Use try_push() to fill, pop() to drain.
 #[test]
 fn mixed_blocking_nonblocking_try_fill_pop() {
-    let (mut tx, mut rx) = Spsc::<i32, 8>::new();
+    let (mut tx, mut rx) = RingBuffer::<i32>::new(8);
 
     // Fill using non-blocking try_push
     for i in 0..8 {
@@ -607,7 +609,7 @@ fn mixed_blocking_nonblocking_try_fill_pop() {
 /// Test mixed blocking/nonblocking in a producer-consumer thread scenario.
 #[test]
 fn mixed_blocking_nonblocking_multithreaded() {
-    let (mut tx, mut rx) = Spsc::<i32, 4>::new();
+    let (mut tx, mut rx) = RingBuffer::<i32>::new(4);
     let iterations = 1000;
 
     let producer = std::thread::spawn(move || {
@@ -635,7 +637,7 @@ fn mixed_blocking_nonblocking_multithreaded() {
 /// Test mixed blocking/nonblocking: try_push fills, pop drains.
 #[test]
 fn mixed_blocking_nonblocking_try_push_pop_multithreaded() {
-    let (mut tx, mut rx) = Spsc::<i32, 4>::new();
+    let (mut tx, mut rx) = RingBuffer::<i32>::new(4);
     let iterations = 1000;
 
     let producer = std::thread::spawn(move || {
@@ -667,7 +669,7 @@ fn mixed_blocking_nonblocking_try_push_pop_multithreaded() {
 /// the per-element publish of the C++ original.
 #[test]
 fn adaptive_publish_exact_when_caught_up() {
-    let (mut tx, mut rx) = Spsc::<i32, 1024>::new();
+    let (mut tx, mut rx) = RingBuffer::<i32>::new(1024);
 
     // Ping-pong: the consumer catches up on every pop.
     for i in 0..200 {
@@ -694,7 +696,7 @@ fn adaptive_publish_exact_when_caught_up() {
 /// catches up.
 #[test]
 fn adaptive_publish_defers_when_backed_up() {
-    let (mut tx, mut rx) = Spsc::<i32, 1024>::new(); // batch = 64
+    let (mut tx, mut rx) = RingBuffer::<i32>::new(1024); // batch = 64
 
     for i in 0..1024 {
         tx.push(i);
@@ -742,7 +744,7 @@ fn adaptive_publish_no_double_drop_on_consumer_drop() {
     }
 
     let drops = Arc::new(AtomicUsize::new(0));
-    let (mut tx, mut rx) = Spsc::<CountsDrops, 1024>::new(); // batch 64
+    let (mut tx, mut rx) = RingBuffer::<CountsDrops>::new(1024); // batch 64
 
     for _ in 0..100 {
         tx.push(CountsDrops(drops.clone()));
@@ -756,4 +758,103 @@ fn adaptive_publish_no_double_drop_on_consumer_drop() {
     drop(rx);
     drop(tx); // Inner::drop releases the remaining 90 — exactly once each
     assert_eq!(drops.load(Ordering::Relaxed), 100);
+}
+
+// -----------------------------------------------------------------------------
+// 13. ZERO-COPY IN-PLACE ACCESS (claim / pop_ref)
+// -----------------------------------------------------------------------------
+
+/// In-place construction via claim + commit_init round-trips, and an
+/// abandoned claim publishes nothing (the slot is reused).
+#[test]
+fn claim_writes_in_place() {
+    let (mut tx, mut rx) = RingBuffer::<[u64; 8]>::new(8);
+
+    let mut slot = tx.claim();
+    slot.uninit().write([7u64; 8]);
+    // SAFETY: the slot was fully initialized above.
+    unsafe { slot.commit_init() };
+    assert_eq!(rx.pop(), [7u64; 8]);
+
+    // Abandoned claim: nothing published, no element to pop.
+    {
+        let _abandoned = tx.try_claim().unwrap();
+    }
+    assert!(rx.try_pop().is_none());
+
+    // commit() moves a value into a reserved slot.
+    tx.claim().commit([9u64; 8]);
+    assert_eq!(rx.pop(), [9u64; 8]);
+}
+
+/// try_claim reports a full buffer just like try_push.
+#[test]
+fn try_claim_full() {
+    let (mut tx, mut rx) = RingBuffer::<i32>::new(4);
+    for i in 0..4 {
+        tx.claim().commit(i);
+    }
+    assert!(tx.try_claim().is_none());
+    assert_eq!(rx.pop(), 0);
+    tx.try_claim().unwrap().commit(4);
+    for i in 1..5 {
+        assert_eq!(rx.pop(), i);
+    }
+}
+
+/// pop_ref reads the element in the buffer, allows mutation through the
+/// guard, and drops the element exactly once when the guard drops.
+#[test]
+fn pop_ref_reads_in_place() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    struct CountsDrops(Arc<AtomicUsize>, u64);
+    impl Drop for CountsDrops {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    let drops = Arc::new(AtomicUsize::new(0));
+    let (mut tx, mut rx) = RingBuffer::<CountsDrops>::new(8);
+
+    tx.push(CountsDrops(drops.clone(), 5));
+    {
+        let mut item = rx.pop_ref();
+        assert_eq!(item.1, 5);
+        item.1 = 6; // mutation through DerefMut
+        assert_eq!(item.1, 6);
+        assert_eq!(drops.load(Ordering::Relaxed), 0, "still alive in buffer");
+    }
+    assert_eq!(
+        drops.load(Ordering::Relaxed),
+        1,
+        "dropped in place exactly once"
+    );
+    assert!(rx.try_pop_ref().is_none());
+    assert!(tx.is_empty(), "slot released after guard drop");
+}
+
+/// Threaded round-trip through the zero-copy paths on both sides.
+#[test]
+fn claim_pop_ref_threaded() {
+    const MESSAGES: u64 = 100_000;
+    let (mut tx, mut rx) = RingBuffer::<[u64; 4], PauseWait, PauseWait>::with_wait_strategies(256);
+
+    let producer = std::thread::spawn(move || {
+        for i in 0..MESSAGES {
+            let mut slot = tx.claim();
+            slot.uninit().write([i, i + 1, i + 2, i + 3]);
+            // SAFETY: fully initialized above.
+            unsafe { slot.commit_init() };
+        }
+    });
+
+    for i in 0..MESSAGES {
+        let msg = rx.pop_ref();
+        assert_eq!(*msg, [i, i + 1, i + 2, i + 3]);
+    }
+    assert!(rx.try_pop().is_none());
+    producer.join().unwrap();
 }

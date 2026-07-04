@@ -11,7 +11,7 @@
 
 use std::time::Instant;
 
-use rust_rb::spsc_bytes::SpscBytes;
+use rust_rb::spsc_bytes::BytesRingBuffer;
 use rust_rb::wait::{NoOpWait, PauseWait, WaitStrategy};
 
 const NUM_MESSAGES: usize = 20_000_000;
@@ -37,7 +37,7 @@ where
     P: WaitStrategy + Send + Sync + 'static,
     C: WaitStrategy + Send + Sync + 'static,
 {
-    let (mut tx, mut rx) = SpscBytes::<CAPACITY, P, C>::new();
+    let (mut tx, mut rx) = BytesRingBuffer::<P, C>::with_wait_strategies(CAPACITY);
     let consumer_core = cores.map(|(_, c)| c);
 
     let consumer = std::thread::spawn(move || {

@@ -12,34 +12,34 @@ with no hint, or park on a condition variable.
 ## Usage
 
 ```rust
-use rust_rb::spsc::Spsc;
+use rust_rb::RingBuffer;
 
-// Capacity is rounded up to the next power of two (1024 here).
-let (mut tx, mut rx) = Spsc::<u64, 1000>::new();
+// Capacity is chosen at runtime, rounded up to the next power of two.
+let (mut tx, mut rx) = RingBuffer::new(1000);
 
-tx.push(1);
+tx.push(1u64);
 tx.push(2);
-tx.push(3);
 
 assert_eq!(rx.pop(), 1);
 assert_eq!(rx.pop(), 2);
 ```
 
-`Spsc::<T, N, P, C>::new()` returns a `(Producer, Consumer)` pair (`P`/`C` are
-the producer- and consumer-side wait strategies). Move each
+`RingBuffer::new(capacity)` returns a `(Producer, Consumer)` pair. Move each
 half to its thread; the buffer lives in a shared `Arc` and is freed when both
 halves drop. Neither half is `Clone`, so the single-producer / single-consumer
 contract — left to the programmer in the C++ original — is enforced by the type
-system here.
+system here. A runtime capacity costs nothing: the index mask lives in a
+register on the hot path either way (verified on the saturated benchmark), and
+it keeps the door open for alternative backings such as shared memory.
 
 Wait strategies are type parameters (defaulting to `YieldWait` on both sides,
 matching the C++ template defaults):
 
 ```rust
-use rust_rb::spsc::Spsc;
-use rust_rb::wait::PauseWait;
+use rust_rb::{RingBuffer, PauseWait};
 
-let (mut tx, mut rx) = Spsc::<i32, 4096, PauseWait, PauseWait>::new();
+let (mut tx, mut rx) =
+    RingBuffer::<i32, PauseWait, PauseWait>::with_wait_strategies(4096);
 ```
 
 ### API
@@ -48,8 +48,22 @@ let (mut tx, mut rx) = Spsc::<i32, 4096, PauseWait, PauseWait>::new();
 | ------------------- | -------------------- | -------------------------------------- |
 | `push(v)`            | `pop() -> T`         | block (using the wait strategy)        |
 | `try_push(v) -> Result<(), T>` | `try_pop() -> Option<T>` | return immediately when full / empty |
+| `claim()` / `try_claim()` | `pop_ref()` / `try_pop_ref()` | zero-copy: write / read in place |
 
 Both halves also expose `len()`, `is_empty()`, `is_full()`, and `capacity()`.
+
+### Zero-copy access
+
+`claim()` reserves the next slot and returns a `WriteSlot`: construct the
+element directly in the buffer via `uninit()` and publish with the unsafe
+`commit_init()`, or move a value in with `commit(v)`. Dropping the slot
+uncommitted publishes nothing.
+
+`pop_ref()` returns a `PopRef` guard that dereferences to the element where it
+lies in the buffer (mutably too); the element is dropped in place and its slot
+released when the guard drops. Prefer `pop()` to drain quickly — moving the
+value out releases the slot immediately — and `pop_ref()` when the consumer
+must finish with the element before continuing.
 
 ### Wait strategies
 
@@ -97,17 +111,17 @@ publish side:
   up to the deferral bound; consumer-side views are exact, and the consumer
   never waits, reports empty, or drops with progress unpublished.
 
-## Variable-size messages: `SpscBytes`
+## Variable-size messages: `BytesRingBuffer`
 
 When the payload is not one fixed type — serialized structs, wire frames, log
-records of differing lengths — `SpscBytes` transports discrete byte messages
-through one shared ring:
+records of differing lengths — `BytesRingBuffer` transports discrete byte
+messages through one shared ring:
 
 ```rust
-use rust_rb::spsc_bytes::SpscBytes;
+use rust_rb::BytesRingBuffer;
 
 // Capacity is in *bytes*, rounded up to the next power of two.
-let (mut tx, mut rx) = SpscBytes::<4096>::new();
+let (mut tx, mut rx) = BytesRingBuffer::new(4096);
 
 tx.push(b"tick");                 // copy in
 assert_eq!(&*rx.pop(), b"tick"); // zero-copy view, released on drop

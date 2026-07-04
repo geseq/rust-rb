@@ -1,7 +1,7 @@
 //! Single-producer / single-consumer ring buffer for **variable-size**
 //! messages.
 //!
-//! Where [`crate::spsc::Spsc`] moves items of one fixed type `T`, this ring
+//! Where [`crate::spsc::RingBuffer`] moves items of one fixed type `T`, this ring
 //! transports discrete byte messages of differing lengths — serialized
 //! structs, wire frames, log records — through one shared byte buffer.
 //!
@@ -81,13 +81,6 @@ const fn max_message_len(capacity: usize) -> usize {
     }
 }
 
-/// Rejects zero capacities when `new` is monomorphized.
-struct AssertCapacity<const N: usize>;
-
-impl<const N: usize> AssertCapacity<N> {
-    const NON_ZERO: () = assert!(N > 0, "capacity must be greater than zero");
-}
-
 struct Inner<P, C> {
     /// The byte buffer, stored as `u64` words so the base is 8-aligned (a
     /// `Box<[u8]>` allocation only guarantees alignment 1). All access goes
@@ -114,25 +107,40 @@ unsafe impl<P: Send + Sync, C: Send + Sync> Sync for Inner<P, C> {}
 
 /// Builder/namespace for constructing a variable-size-message SPSC ring.
 ///
-/// `N` is the requested minimum capacity in **bytes**; the real capacity is
-/// `N` rounded up to the next power of two (and at least 8). `P` and `C` are
-/// the push-side and pop-side [`WaitStrategy`]s, as in [`crate::spsc::Spsc`].
-pub struct SpscBytes<const N: usize, P = YieldWait, C = YieldWait>(
-    core::marker::PhantomData<(P, C)>,
-);
+/// [`new`](Self::new) takes the minimum capacity in **bytes** at runtime
+/// (rounded up to the next power of two, at least 8) and uses [`YieldWait`]
+/// on both sides. Pick other [`WaitStrategy`]s with
+/// [`with_wait_strategies`](Self::with_wait_strategies): `P` is the
+/// producer-side (push) strategy, `C` the consumer-side (pop) strategy.
+pub struct BytesRingBuffer<P = YieldWait, C = YieldWait>(core::marker::PhantomData<(P, C)>);
 
-impl<const N: usize, P, C> SpscBytes<N, P, C>
+impl BytesRingBuffer {
+    /// Create a ring with the default wait strategies and return its producer
+    /// and consumer halves.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `min_capacity == 0`.
+    #[allow(clippy::new_ret_no_self)] // intentionally returns the producer/consumer pair
+    pub fn new(min_capacity: usize) -> (BytesProducer, BytesConsumer) {
+        BytesRingBuffer::<YieldWait, YieldWait>::with_wait_strategies(min_capacity)
+    }
+}
+
+impl<P, C> BytesRingBuffer<P, C>
 where
     P: WaitStrategy + Send + Sync,
     C: WaitStrategy + Send + Sync,
 {
-    /// Create the ring and return its producer and consumer halves.
+    /// Create the ring with explicit wait strategies and return its producer
+    /// and consumer halves.
     ///
-    /// `N == 0` is rejected at compile time.
-    #[allow(clippy::new_ret_no_self)] // intentionally returns the producer/consumer pair
-    pub fn new() -> (BytesProducer<P, C>, BytesConsumer<P, C>) {
-        let () = AssertCapacity::<N>::NON_ZERO;
-        let capacity = N.next_power_of_two().max(8);
+    /// # Panics
+    ///
+    /// Panics if `min_capacity == 0`.
+    pub fn with_wait_strategies(min_capacity: usize) -> (BytesProducer<P, C>, BytesConsumer<P, C>) {
+        assert!(min_capacity > 0, "capacity must be greater than zero");
+        let capacity = min_capacity.next_power_of_two().max(8);
 
         let mut words = Vec::with_capacity(capacity / 8);
         words.resize_with(capacity / 8, || UnsafeCell::new(MaybeUninit::uninit()));
@@ -180,8 +188,8 @@ where
     }
 }
 
-/// The producing half of an [`SpscBytes`]. Owns the private write cursor.
-pub struct BytesProducer<P, C> {
+/// The producing half of an [`BytesRingBuffer`]. Owns the private write cursor.
+pub struct BytesProducer<P = YieldWait, C = YieldWait> {
     buf: NonNull<u8>,
     mask: usize,
     /// Our published cursor (cached `NonNull` into `inner`).
@@ -448,8 +456,8 @@ impl<P: WaitStrategy, C: WaitStrategy> core::ops::DerefMut for WriteSlot<'_, P, 
     }
 }
 
-/// The consuming half of an [`SpscBytes`]. Owns the private read cursor.
-pub struct BytesConsumer<P, C> {
+/// The consuming half of an [`BytesRingBuffer`]. Owns the private read cursor.
+pub struct BytesConsumer<P = YieldWait, C = YieldWait> {
     buf: NonNull<u8>,
     mask: usize,
     /// The producer's published cursor (cached `NonNull` into `inner`).
