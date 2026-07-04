@@ -78,6 +78,8 @@
 mod cache_padded;
 mod cursor;
 
+#[cfg(all(feature = "shm", target_os = "linux"))]
+pub mod shm;
 pub mod spsc;
 pub mod spsc_bytes;
 pub mod wait;
@@ -87,4 +89,8 @@ pub use spsc::{Consumer, Producer, RingBuffer};
 #[doc(inline)]
 pub use spsc_bytes::{BytesConsumer, BytesProducer, BytesRingBuffer};
 #[doc(inline)]
-pub use wait::{CvWait, NoOpWait, PauseWait, WaitStrategy, YieldWait};
+pub use wait::{CrossProcess, CvWait, NoOpWait, PauseWait, WaitStrategy, YieldWait};
+
+#[cfg(all(feature = "shm", target_os = "linux"))]
+#[doc(inline)]
+pub use shm::{memfd, ShmItem};

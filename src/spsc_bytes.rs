@@ -187,6 +187,11 @@ where
     P: WaitStrategy,
     C: WaitStrategy,
 {
+    #[cfg(all(feature = "shm", target_os = "linux"))]
+    pub(crate) fn from_core(core: ProducerCore<Word, P, C>) -> Self {
+        Self { core }
+    }
+
     /// Block until there is room, then enqueue a copy of `msg`.
     ///
     /// # Panics
@@ -432,6 +437,11 @@ where
     P: WaitStrategy,
     C: WaitStrategy,
 {
+    #[cfg(all(feature = "shm", target_os = "linux"))]
+    pub(crate) fn from_core(core: ConsumerCore<Word, P, C>) -> Self {
+        Self { core }
+    }
+
     /// Block until a message is available, then return a zero-copy view of
     /// it. The message is released (its bytes freed for the producer) when
     /// the returned [`Msg`] drops.

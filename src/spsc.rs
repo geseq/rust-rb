@@ -114,6 +114,11 @@ where
     P: WaitStrategy,
     C: WaitStrategy,
 {
+    #[cfg(all(feature = "shm", target_os = "linux"))]
+    pub(crate) fn from_core(core: ProducerCore<Slot<T>, P, C>) -> Self {
+        Self { core }
+    }
+
     /// Block until there is room, then enqueue `value`.
     #[inline]
     pub fn push(&mut self, value: T) {
@@ -271,6 +276,11 @@ where
     P: WaitStrategy,
     C: WaitStrategy,
 {
+    #[cfg(all(feature = "shm", target_os = "linux"))]
+    pub(crate) fn from_core(core: ConsumerCore<Slot<T>, P, C>) -> Self {
+        Self { core }
+    }
+
     /// Block until an element is available, then dequeue it by value.
     #[inline]
     pub fn pop(&mut self) -> T {

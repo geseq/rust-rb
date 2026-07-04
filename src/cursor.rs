@@ -137,6 +137,12 @@ impl<B: SlotCleanup, P, C> Drop for Shared<B, P, C> {
 pub(crate) enum AnchorKind<B: SlotCleanup, P: WaitStrategy, C: WaitStrategy> {
     /// In-process ring: the shared state lives on the heap in an `Arc`.
     Heap(Arc<Shared<B, P, C>>),
+    /// Cross-process ring: the state lives in a mapped shared region; the
+    /// wait strategies are per-handle (they are `CrossProcess`, i.e.
+    /// stateless spinners). The `B` parameter only describes the buffer's
+    /// slot type; it is not stored here.
+    #[cfg(all(feature = "shm", target_os = "linux"))]
+    Shm(crate::shm::ShmAnchor<P, C>),
 }
 
 impl<B: SlotCleanup, P: WaitStrategy, C: WaitStrategy> AnchorKind<B, P, C> {
@@ -144,6 +150,8 @@ impl<B: SlotCleanup, P: WaitStrategy, C: WaitStrategy> AnchorKind<B, P, C> {
     fn producer_wait(&self) -> &P {
         match self {
             AnchorKind::Heap(shared) => &shared.producer_wait,
+            #[cfg(all(feature = "shm", target_os = "linux"))]
+            AnchorKind::Shm(anchor) => &anchor.producer_wait,
         }
     }
 
@@ -151,6 +159,8 @@ impl<B: SlotCleanup, P: WaitStrategy, C: WaitStrategy> AnchorKind<B, P, C> {
     fn consumer_wait(&self) -> &C {
         match self {
             AnchorKind::Heap(shared) => &shared.consumer_wait,
+            #[cfg(all(feature = "shm", target_os = "linux"))]
+            AnchorKind::Shm(anchor) => &anchor.consumer_wait,
         }
     }
 }
@@ -217,50 +227,63 @@ where
     )
 }
 
-/// Build the handle-cached pointer set and the two cores over shared state
-/// that already lives somewhere (heap or a mapped region). `write_cursor` /
-/// `read_cursor` point at the live cursor atomics; the private caches are
-/// seeded from the current cursor values so recovered/attached handles start
-/// consistent.
+/// Build a producer core over shared state that already lives somewhere
+/// (heap or a mapped region). The private cursor caches are seeded from the
+/// live cursor values, so attached/recovered handles start consistent.
 ///
 /// # Safety
 ///
 /// The pointers must reference live atomics and an in-bounds buffer of
-/// `capacity` cursor units that outlive the returned cores (guaranteed by
-/// the anchors), and the cursor values must satisfy the ring invariant
+/// `capacity` cursor units that outlive the returned core (guaranteed by the
+/// anchor), and the cursor values must satisfy the ring invariant
 /// (`write - read <= capacity`, wrapped).
-#[allow(clippy::too_many_arguments)]
-pub(crate) unsafe fn cores_from_raw<B: SlotCleanup, P: WaitStrategy, C: WaitStrategy>(
+#[cfg_attr(not(all(feature = "shm", target_os = "linux")), allow(dead_code))]
+pub(crate) unsafe fn producer_core_from_raw<B: SlotCleanup, P: WaitStrategy, C: WaitStrategy>(
     buf: NonNull<B>,
     capacity: usize,
     write_cursor: NonNull<AtomicUsize>,
     read_cursor: NonNull<AtomicUsize>,
-    producer_anchor: AnchorKind<B, P, C>,
-    consumer_anchor: AnchorKind<B, P, C>,
-) -> (ProducerCore<B, P, C>, ConsumerCore<B, P, C>) {
+    anchor: AnchorKind<B, P, C>,
+) -> ProducerCore<B, P, C> {
     let write = unsafe { write_cursor.as_ref() }.load(Ordering::Acquire);
     let read = unsafe { read_cursor.as_ref() }.load(Ordering::Acquire);
-    (
-        ProducerCore {
-            buf,
-            mask: capacity - 1,
-            next_free: write_cursor,
-            reader: read_cursor,
-            write_cursor: write,
-            read_cursor_cache: read,
-            anchor: producer_anchor,
-        },
-        ConsumerCore {
-            buf,
-            mask: capacity - 1,
-            next_free: write_cursor,
-            reader: read_cursor,
-            read_cursor: read,
-            published: read,
-            write_cursor_cache: write,
-            anchor: consumer_anchor,
-        },
-    )
+    ProducerCore {
+        buf,
+        mask: capacity - 1,
+        next_free: write_cursor,
+        reader: read_cursor,
+        write_cursor: write,
+        read_cursor_cache: read,
+        anchor,
+    }
+}
+
+/// Build a consumer core over live shared state (see
+/// [`producer_core_from_raw`]).
+///
+/// # Safety
+///
+/// As for [`producer_core_from_raw`].
+#[cfg_attr(not(all(feature = "shm", target_os = "linux")), allow(dead_code))]
+pub(crate) unsafe fn consumer_core_from_raw<B: SlotCleanup, P: WaitStrategy, C: WaitStrategy>(
+    buf: NonNull<B>,
+    capacity: usize,
+    write_cursor: NonNull<AtomicUsize>,
+    read_cursor: NonNull<AtomicUsize>,
+    anchor: AnchorKind<B, P, C>,
+) -> ConsumerCore<B, P, C> {
+    let write = unsafe { write_cursor.as_ref() }.load(Ordering::Acquire);
+    let read = unsafe { read_cursor.as_ref() }.load(Ordering::Acquire);
+    ConsumerCore {
+        buf,
+        mask: capacity - 1,
+        next_free: write_cursor,
+        reader: read_cursor,
+        read_cursor: read,
+        published: read,
+        write_cursor_cache: write,
+        anchor,
+    }
 }
 
 /// The producer half of the engine: private write cursor, cached view of the

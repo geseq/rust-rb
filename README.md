@@ -151,6 +151,37 @@ the producer when it drops.
 The framing, cursor caching, padding, and memory-ordering design is identical
 to the fixed-size ring; the wait strategies are shared between both.
 
+## Shared memory / IPC (feature `shm`, Linux)
+
+Both rings can be backed by a mapped shared region so the producer and
+consumer live in **different processes** — same handle types, same hot paths:
+
+```rust,ignore
+use rust_rb::{memfd, BytesRingBuffer};
+use std::os::fd::AsFd;
+
+let fd = memfd("my-ring")?;
+// SAFETY: the region is only accessed by cooperating rust-rb handles.
+let (mut tx, rx) = unsafe { BytesRingBuffer::create_shm(fd.as_fd(), 1 << 20)? };
+// hand the fd to another process; it attaches its half:
+// let mut rx = unsafe { BytesRingBuffer::attach_shm_consumer(fd.as_fd())? };
+```
+
+- Works with any mappable fd (`memfd` helper included, or `shm_open`).
+- The region carries a validated header (magic/version/ring kind/element
+  size/architecture/capacity, cursor sanity) — accidents are rejected;
+  adversarial peers are out of scope, hence the `unsafe` constructors.
+- **Crash recovery**: each side leases its role (pid) in the header. If a
+  process dies, `recover_shm` reclaims the dead leases and returns both
+  halves with *everything published still intact and drainable* — a record
+  only becomes visible through the producer's single `Release` cursor store,
+  so a mid-write crash just leaves an invisible partial record whose space is
+  reused. Verified by a child-process crash test in `tests/shm.rs`.
+- Only the spin wait strategies (`CrossProcess`) are allowed: `CvWait`'s
+  mutex/condvar are process-local.
+- Element rings require `T: ShmItem` (plain data, valid for peer-written bit
+  patterns); byte rings carry any payload.
+
 ## Benchmark
 
 ```
