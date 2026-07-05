@@ -71,6 +71,20 @@ pub(crate) const fn publish_batch(capacity: usize, max_batch: usize) -> usize {
     }
 }
 
+/// Round a requested minimum capacity to the ring's real capacity: the next
+/// power of two, at least `floor`.
+///
+/// # Panics
+///
+/// Panics if `min_capacity == 0` or the rounding overflows `usize`.
+pub(crate) fn round_capacity(min_capacity: usize, floor: usize) -> usize {
+    assert!(min_capacity > 0, "capacity must be greater than zero");
+    min_capacity
+        .checked_next_power_of_two()
+        .expect("capacity too large to round up to a power of two")
+        .max(floor)
+}
+
 /// The wrap-safe fullness predicate: would writing `needed` more units past
 /// `write` overrun a `capacity`-unit ring whose consumer has read up to
 /// `read`? The single source of truth for "full" (used by the space check
@@ -87,6 +101,16 @@ const fn no_item(write: usize, read: usize) -> bool {
     write.wrapping_sub(read) == 0
 }
 
+/// The consumer-published cache line: the read cursor and, in its padding,
+/// the producer-starving flag (raised by the producer when a space check
+/// fails against the freshest cursor; consumed and cleared by ring layers
+/// that publish immediately on it).
+#[derive(Default)]
+pub(crate) struct ReadSide {
+    read_cursor: AtomicUsize,
+    starving: AtomicUsize,
+}
+
 /// The state both handles share, kept alive by an `Arc`.
 pub(crate) struct Shared<B: SlotCleanup, P, C> {
     pub(crate) buffer: Box<[B]>,
@@ -94,8 +118,12 @@ pub(crate) struct Shared<B: SlotCleanup, P, C> {
 
     /// Published by the producer (Release), read by the consumer (Acquire).
     write_cursor: CachePadded<AtomicUsize>,
-    /// Published by the consumer (Release), read by the producer (Acquire).
-    read_cursor: CachePadded<AtomicUsize>,
+    /// Published by the consumer (Release), read by the producer (Acquire) —
+    /// plus, in the same padded slot, the producer-starving flag: the
+    /// producer already polls this line whenever it matters and the consumer
+    /// already stores to it per flush, so the flag adds no new line to the
+    /// coherence traffic.
+    read_side: CachePadded<ReadSide>,
 
     pub(crate) producer_wait: P,
     pub(crate) consumer_wait: C,
@@ -115,7 +143,7 @@ impl<B: SlotCleanup, P, C> Drop for Shared<B, P, C> {
             // Drop the values still queued: cursor units are slots here
             // (`NEEDS_CLEANUP` is only set by the fixed-size ring, whose
             // buffer length is `mask + 1`).
-            let mut head = self.read_cursor.load(Ordering::Relaxed);
+            let mut head = self.read_side.read_cursor.load(Ordering::Relaxed);
             let tail = self.write_cursor.load(Ordering::Relaxed);
             while head != tail {
                 // SAFETY: every index in `[read, write)` was produced and not
@@ -123,6 +151,73 @@ impl<B: SlotCleanup, P, C> Drop for Shared<B, P, C> {
                 unsafe { self.buffer[head & self.mask].cleanup() };
                 head = head.wrapping_add(1);
             }
+        }
+    }
+}
+
+/// What keeps the ring's memory alive and where the wait strategies live.
+///
+/// The hot paths never touch this: the cores cache raw pointers to the
+/// cursor atomics and the buffer up front. It is consulted only on the cold
+/// paths (blocking waits, notifies for non-spin strategies, teardown). For
+/// the built-in spin strategies the accessors return ZST references, so the
+/// match compiles away entirely.
+pub(crate) enum AnchorKind<B: SlotCleanup, P: WaitStrategy, C: WaitStrategy> {
+    /// In-process ring: the shared state lives on the heap in an `Arc`.
+    Heap(Arc<Shared<B, P, C>>),
+    /// Cross-process ring: the state lives in a mapped shared region; the
+    /// wait strategies are per-handle (they are `CrossProcess`, i.e.
+    /// stateless spinners). The `B` parameter only describes the buffer's
+    /// slot type; it is not stored here. Boxed so enabling the feature does
+    /// not grow this enum (and with it every heap handle) — the extra deref
+    /// is on shm cold paths only.
+    #[cfg(all(feature = "shm", target_os = "linux", target_has_atomic = "64"))]
+    Shm(Box<crate::shm::ShmAnchor<P, C>>),
+}
+
+impl<B: SlotCleanup, P: WaitStrategy, C: WaitStrategy> AnchorKind<B, P, C> {
+    #[inline(always)]
+    fn producer_wait(&self) -> &P {
+        match self {
+            AnchorKind::Heap(shared) => &shared.producer_wait,
+            #[cfg(all(feature = "shm", target_os = "linux", target_has_atomic = "64"))]
+            AnchorKind::Shm(anchor) => &anchor.producer_wait,
+        }
+    }
+
+    #[inline(always)]
+    fn consumer_wait(&self) -> &C {
+        match self {
+            AnchorKind::Heap(shared) => &shared.consumer_wait,
+            #[cfg(all(feature = "shm", target_os = "linux", target_has_atomic = "64"))]
+            AnchorKind::Shm(anchor) => &anchor.consumer_wait,
+        }
+    }
+
+    /// Whether this handle still owns its exclusivity claim on the ring —
+    /// the token check only (one load of a rarely-written line; no
+    /// syscalls). Guards live publish paths against force-takeover
+    /// staleness; the fork case is handled by [`Self::teardown_allowed`] on
+    /// the (cold) teardown paths.
+    #[inline]
+    fn owns_ring(&self) -> bool {
+        match self {
+            AnchorKind::Heap(_) => true,
+            #[cfg(all(feature = "shm", target_os = "linux", target_has_atomic = "64"))]
+            AnchorKind::Shm(anchor) => anchor.owns_lease(),
+        }
+    }
+
+    /// Whether teardown may touch shared state: the token check *plus* the
+    /// constructing-process check (a fork-inherited copy carries an
+    /// identical token, and its exit must not flush over — or release — the
+    /// parent's live role). Costs a `getpid` syscall; used only on drops.
+    #[inline]
+    fn teardown_allowed(&self) -> bool {
+        match self {
+            AnchorKind::Heap(_) => true,
+            #[cfg(all(feature = "shm", target_os = "linux", target_has_atomic = "64"))]
+            AnchorKind::Shm(anchor) => anchor.owned_by_current_process() && anchor.owns_lease(),
         }
     }
 }
@@ -152,7 +247,7 @@ where
         buffer: buffer.into_boxed_slice(),
         mask: capacity - 1,
         write_cursor: CachePadded::new(AtomicUsize::new(0)),
-        read_cursor: CachePadded::new(AtomicUsize::new(0)),
+        read_side: CachePadded::new(ReadSide::default()),
         producer_wait: P::default(),
         consumer_wait: C::default(),
     });
@@ -164,7 +259,8 @@ where
     let buf = NonNull::new(inner.buffer.as_ptr().cast_mut()).expect("buffer is non-null");
     let mask = inner.mask;
     let next_free = NonNull::from(&*inner.write_cursor);
-    let reader = NonNull::from(&*inner.read_cursor);
+    let reader = NonNull::from(&inner.read_side.read_cursor);
+    let starving = NonNull::from(&inner.read_side.starving);
 
     (
         ProducerCore {
@@ -172,21 +268,100 @@ where
             mask,
             next_free,
             reader,
+            starving,
             write_cursor: 0,
             read_cursor_cache: 0,
-            inner: inner.clone(),
+            raised_starving: false,
+            anchor: AnchorKind::Heap(inner.clone()),
         },
         ConsumerCore {
             buf,
             mask,
             next_free,
             reader,
+            starving,
             read_cursor: 0,
             published: 0,
             write_cursor_cache: 0,
-            inner,
+            anchor: AnchorKind::Heap(inner),
         },
     )
+}
+
+/// Build a producer core over shared state that already lives somewhere
+/// (heap or a mapped region). The private cursor caches are seeded from the
+/// live cursor values, so attached/recovered handles start consistent.
+///
+/// # Safety
+///
+/// The pointers must reference live atomics and an in-bounds buffer of
+/// `capacity` cursor units that outlive the returned core (guaranteed by the
+/// anchor), and the cursor values must satisfy the ring invariant
+/// (`write - read <= capacity`, wrapped).
+#[cfg_attr(
+    not(all(feature = "shm", target_os = "linux", target_has_atomic = "64")),
+    allow(dead_code)
+)]
+pub(crate) unsafe fn producer_core_from_raw<B: SlotCleanup, P: WaitStrategy, C: WaitStrategy>(
+    buf: NonNull<B>,
+    capacity: usize,
+    write_cursor: NonNull<AtomicUsize>,
+    read_cursor: NonNull<AtomicUsize>,
+    starving: NonNull<AtomicUsize>,
+    anchor: AnchorKind<B, P, C>,
+) -> ProducerCore<B, P, C> {
+    let write = unsafe { write_cursor.as_ref() }.load(Ordering::Acquire);
+    let read = unsafe { read_cursor.as_ref() }.load(Ordering::Acquire);
+    // A newly-attached producer is not starving; reset the shared flag so a
+    // value left set by a crashed/departed predecessor cannot persist and
+    // pin the consumer in per-message publish mode forever. Only the (single)
+    // producer writes this flag, so the store races nothing.
+    // SAFETY: `starving` references the live shared flag.
+    unsafe { starving.as_ref() }.store(0, Ordering::Release);
+    ProducerCore {
+        buf,
+        mask: capacity - 1,
+        next_free: write_cursor,
+        reader: read_cursor,
+        starving,
+        write_cursor: write,
+        read_cursor_cache: read,
+        raised_starving: false,
+        anchor,
+    }
+}
+
+/// Build a consumer core over live shared state (see
+/// [`producer_core_from_raw`]).
+///
+/// # Safety
+///
+/// As for [`producer_core_from_raw`].
+#[cfg_attr(
+    not(all(feature = "shm", target_os = "linux", target_has_atomic = "64")),
+    allow(dead_code)
+)]
+pub(crate) unsafe fn consumer_core_from_raw<B: SlotCleanup, P: WaitStrategy, C: WaitStrategy>(
+    buf: NonNull<B>,
+    capacity: usize,
+    write_cursor: NonNull<AtomicUsize>,
+    read_cursor: NonNull<AtomicUsize>,
+    starving: NonNull<AtomicUsize>,
+    anchor: AnchorKind<B, P, C>,
+) -> ConsumerCore<B, P, C> {
+    let write = unsafe { write_cursor.as_ref() }.load(Ordering::Acquire);
+    let read = unsafe { read_cursor.as_ref() }.load(Ordering::Acquire);
+    ConsumerCore {
+        buf,
+        mask: capacity - 1,
+        next_free: write_cursor,
+        reader: read_cursor,
+        starving,
+        read_cursor: read,
+        published: read,
+        write_cursor_cache: write,
+        anchor,
+    }
 }
 
 /// The producer half of the engine: private write cursor, cached view of the
@@ -200,13 +375,19 @@ pub(crate) struct ProducerCore<B: SlotCleanup, P: WaitStrategy, C: WaitStrategy>
     next_free: NonNull<AtomicUsize>,
     /// The consumer's published cursor (cached `NonNull` into `inner`).
     reader: NonNull<AtomicUsize>,
+    /// The starving flag (cached `NonNull` into the shared state).
+    starving: NonNull<AtomicUsize>,
     /// Next cursor unit to write (the C++ `next_free_index_2_`). Private to
     /// this thread.
     pub(crate) write_cursor: usize,
     /// Cached snapshot of the consumer's cursor (the C++ `reader_index_cache_`).
     read_cursor_cache: usize,
-    /// Keeps the shared allocation alive and carries the wait strategies.
-    pub(crate) inner: Arc<Shared<B, P, C>>,
+    /// Whether we raised the starving flag and have not yet cleared it
+    /// (producer-local; keeps the never-starved hot path free of any flag
+    /// access).
+    raised_starving: bool,
+    /// Keeps the ring's memory alive and carries the wait strategies.
+    anchor: AnchorKind<B, P, C>,
 }
 
 // SAFETY: the producer core only touches producer-private state plus atomics.
@@ -231,8 +412,42 @@ where
             // SAFETY: `reader` is a `NonNull` into the live `inner`.
             self.read_cursor_cache = unsafe { (*self.reader.as_ptr()).load(Ordering::Acquire) };
             if lacks_space(self.write_cursor, needed, self.read_cursor_cache, capacity) {
+                // Starving: even the freshest published cursor leaves no
+                // room. Raise the flag once per episode (set-if-zero: while
+                // starvation persists this is a read of a line we poll
+                // anyway) so a ring layer that publishes immediately on it
+                // can release us.
+                //
+                // The element ring maintains this flag here but does not
+                // consume it (it uses a cheaper consumer-local `was_full`
+                // check — reading the flag there measured a ~20x slowdown).
+                // The maintenance is effectively free for it: set-if-zero +
+                // the clear-on-comfortable-success hysteresis mean the flag
+                // is written only on starvation *transitions*, which are rare
+                // even under sustained backpressure (the flag stays 1 with no
+                // repeated stores while the ring is pinned full).
+                // SAFETY: `starving` points into the live shared state.
+                unsafe {
+                    let starving = &*self.starving.as_ptr();
+                    if starving.load(Ordering::Relaxed) == 0 {
+                        starving.store(1, Ordering::Release);
+                    }
+                }
+                self.raised_starving = true;
                 return false;
             }
+            // Space appeared only after a reload: still running tight —
+            // keep the flag up (hysteresis; no store churn while the ring
+            // hovers at the edge of starvation).
+            return true;
+        }
+        // The *cached* check passed: comfortably unstarved. Clear our flag
+        // once; the local bool keeps this branch untaken (a register test)
+        // on the never-starved hot path.
+        if self.raised_starving {
+            self.raised_starving = false;
+            // SAFETY: `starving` points into the live shared state.
+            unsafe { (*self.starving.as_ptr()).store(0, Ordering::Release) };
         }
         true
     }
@@ -245,7 +460,7 @@ where
             let write = self.write_cursor;
             let capacity = self.mask + 1;
             let reader = self.reader.as_ptr();
-            self.inner.producer_wait.wait(|| {
+            self.anchor.producer_wait().wait(|| {
                 !lacks_space(
                     write,
                     needed,
@@ -264,7 +479,7 @@ where
         self.write_cursor = self.write_cursor.wrapping_add(amount);
         // SAFETY: `next_free` is a `NonNull` into the live `inner`.
         unsafe { (*self.next_free.as_ptr()).store(self.write_cursor, Ordering::Release) };
-        self.inner.consumer_wait.notify();
+        self.anchor.consumer_wait().notify();
     }
 
     /// The ring's capacity in cursor units.
@@ -281,6 +496,31 @@ where
         // SAFETY: in bounds by masking; `buf` is a live allocation.
         unsafe { self.buf.as_ptr().add(self.write_cursor & self.mask) }
     }
+
+    /// Occupancy per the two shared atomics (the producer-side view; may
+    /// transiently over-count while the consumer defers publishes).
+    #[inline]
+    pub(crate) fn occupancy(&self) -> usize {
+        // SAFETY: the cached pointers reference the live cursor atomics.
+        unsafe {
+            (*self.next_free.as_ptr())
+                .load(Ordering::Acquire)
+                .wrapping_sub((*self.reader.as_ptr()).load(Ordering::Acquire))
+        }
+    }
+
+    /// The producer-side fullness view (write `Relaxed` — it is our own
+    /// cursor — against the consumer's published cursor `Acquire`).
+    #[inline]
+    pub(crate) fn is_full_view(&self) -> bool {
+        // SAFETY: as for `occupancy`.
+        unsafe {
+            (*self.next_free.as_ptr())
+                .load(Ordering::Relaxed)
+                .wrapping_sub((*self.reader.as_ptr()).load(Ordering::Acquire))
+                > self.mask
+        }
+    }
 }
 
 /// The consumer half of the engine: private read cursor, cached view of the
@@ -294,6 +534,8 @@ pub(crate) struct ConsumerCore<B: SlotCleanup, P: WaitStrategy, C: WaitStrategy>
     next_free: NonNull<AtomicUsize>,
     /// Our published cursor (cached `NonNull` into `inner`).
     reader: NonNull<AtomicUsize>,
+    /// The starving flag (cached `NonNull` into the shared state).
+    starving: NonNull<AtomicUsize>,
     /// Next cursor unit to read (the C++ `reader_index_2_`). Private to this
     /// thread.
     pub(crate) read_cursor: usize,
@@ -303,8 +545,8 @@ pub(crate) struct ConsumerCore<B: SlotCleanup, P: WaitStrategy, C: WaitStrategy>
     /// Cached snapshot of the producer's cursor (the C++
     /// `next_free_index_cache_`).
     pub(crate) write_cursor_cache: usize,
-    /// Keeps the shared allocation alive and carries the wait strategies.
-    pub(crate) inner: Arc<Shared<B, P, C>>,
+    /// Keeps the ring's memory alive and carries the wait strategies.
+    anchor: AnchorKind<B, P, C>,
 }
 
 // SAFETY: the consumer core only touches consumer-private state plus atomics.
@@ -320,7 +562,13 @@ impl<B: SlotCleanup, P: WaitStrategy, C: WaitStrategy> Drop for ConsumerCore<B, 
         // out, and a surviving producer would never see the space we freed;
         // without the notify, a producer parked in a genuinely blocking
         // custom `WaitStrategy` would never wake.
-        self.flush_pending();
+        //
+        // Guarded like the lease release: a zombie shm handle whose role was
+        // force-taken — or a fork-inherited copy exiting in the child — must
+        // not store its stale cursor over the live holder's.
+        if self.anchor.teardown_allowed() {
+            self.flush_pending();
+        }
     }
 }
 
@@ -360,8 +608,8 @@ where
         while !self.has_item() {
             let read_cursor = self.read_cursor;
             let next_free = self.next_free.as_ptr();
-            self.inner
-                .consumer_wait
+            self.anchor
+                .consumer_wait()
                 .wait(|| !no_item(unsafe { (*next_free).load(Ordering::Acquire) }, read_cursor));
         }
     }
@@ -370,44 +618,29 @@ where
     /// progress adaptively.
     ///
     /// A publish only costs something when the *other* side is polling the
-    /// published line, and the producer only polls the read cursor when the
-    /// ring is full. So the publish rule adapts to the regime the consumer
-    /// can already see for free:
+    /// published line, and the producer only polls the read cursor when it
+    /// is out of space. The engine publishes when:
     ///
-    /// * **Observed over the full watermark** (occupancy per the latest view
-    ///   exceeds `full_watermark`): publish immediately so a producer blocked
-    ///   for space is released by the first consume that observes the
-    ///   pressure. The fixed ring passes `mask` (fires only at exactly full,
-    ///   once per cursor-reload cycle — no ping-pong). The byte ring passes
-    ///   `capacity / 2`: its producer blocks whenever contiguous space runs
-    ///   out (`free < pad + record`, which can happen well below exactly
-    ///   full, and wrap padding consumed by the frame decoder further skews
-    ///   plain occupancy), and since records are capped at `capacity / 2`,
-    ///   any blocked byte producer implies occupancy above that watermark —
-    ///   its publishes above the watermark are per-message, which the
-    ///   bandwidth-bound byte ring absorbs without measurable cost.
-    /// * **Caught up** (the ring looks empty after this consume): publish
-    ///   immediately — the line is uncontended, and this is the
-    ///   latency-sensitive regime. Identical to the per-element publish of
-    ///   the C++ original.
-    /// * **Behind** (the backpressure regime, where a full-ring producer
-    ///   polls this line): defer, and publish once per `batch` units.
-    ///   Per-element publishes here let the producer's polling steal the
-    ///   cache line between every store, collapsing both threads into a
+    /// * **`publish_now`** — the ring layer's immediate trigger. The element
+    ///   ring passes "occupancy per my latest view == capacity" (fires once
+    ///   per cursor-reload cycle, releasing a blocked producer without
+    ///   per-element ping-pong). The byte ring passes the producer-starving
+    ///   flag (exact: a space check failed against the freshest cursor),
+    ///   preserving batching under mere backpressure.
+    /// * **Caught up** — the ring looks empty after this consume: publish
+    ///   immediately (uncontended line, latency-sensitive regime; identical
+    ///   to the per-element publish of the C++ original).
+    /// * **Batch boundary** — while backed up, publish once per `batch`
+    ///   units so a polling producer cannot collapse both threads into a
     ///   lockstep line ping-pong (~3.5x lower throughput end to end).
     ///
     /// Because catching up always flushes, the consumer can never wait (or
-    /// report empty) with progress unpublished. The residual window: if the
-    /// consumer's cached view predates the ring becoming full and the
-    /// consumer then stops consuming mid-batch, a blocked producer waits
-    /// until the consumer's next flush (at most `batch` units of consumption
-    /// away, or the consumer catching up or dropping).
+    /// report empty) with progress unpublished; the batch clamp bounds any
+    /// deferral the immediate trigger misses.
     #[inline(always)]
-    pub(crate) fn advance(&mut self, amount: usize, batch: usize, full_watermark: usize) {
-        let over_watermark =
-            self.write_cursor_cache.wrapping_sub(self.read_cursor) > full_watermark;
+    pub(crate) fn advance(&mut self, amount: usize, batch: usize, publish_now: bool) {
         self.read_cursor = self.read_cursor.wrapping_add(amount);
-        if over_watermark
+        if publish_now
             || self.read_cursor == self.write_cursor_cache
             || self.read_cursor.wrapping_sub(self.published) >= batch
         {
@@ -418,12 +651,37 @@ where
     /// Publish the private read cursor to the shared atomic and wake a
     /// producer blocked on a full ring. The wake-up is a no-op for spin
     /// strategies.
+    ///
+    /// Guarded by lease ownership: every consumer publish path (per-item
+    /// advance, batch boundary, drain guard, guard-object drops, teardown)
+    /// funnels through here, so a zombie shm handle whose role was
+    /// force-taken can never store its stale cursor over the successor's.
+    /// The guard is consumer-side only by design: consumer teardown
+    /// *publishes* (drop flush, outstanding `Msg`/`PopRef` guards), while
+    /// producer teardown publishes nothing — a stale producer can only
+    /// interfere by actively pushing, which the force contract already
+    /// forbids. For heap anchors the check is a compile-time constant `true`
+    /// and vanishes; on shm handles it is one load of a rarely-written line
+    /// (measured: no throughput change).
     #[inline(always)]
     pub(crate) fn flush(&mut self) {
+        if !self.anchor.owns_ring() {
+            // Mark as published so retry paths don't spin on the dead lease.
+            self.published = self.read_cursor;
+            return;
+        }
         // SAFETY: `reader` is a `NonNull` into the live `inner`.
         unsafe { (*self.reader.as_ptr()).store(self.read_cursor, Ordering::Release) };
         self.published = self.read_cursor;
-        self.inner.producer_wait.notify();
+        self.anchor.producer_wait().notify();
+    }
+
+    /// Whether the producer has signalled that a space check failed against
+    /// the freshest published cursor (see `ProducerCore::has_space`).
+    #[inline(always)]
+    pub(crate) fn producer_starving(&self) -> bool {
+        // SAFETY: `starving` points into the live shared state.
+        (unsafe { (*self.starving.as_ptr()).load(Ordering::Acquire) }) != 0
     }
 
     /// [`flush`](Self::flush) only if there is unpublished progress.
@@ -463,28 +721,4 @@ where
         // SAFETY: in bounds by masking; `buf` is a live allocation.
         unsafe { self.buf.as_ptr().add(self.read_cursor & self.mask) }
     }
-}
-
-/// Occupancy in cursor units per the two shared atomics (the producer-side
-/// view; may transiently over-count while the consumer defers publishes).
-#[inline]
-pub(crate) fn shared_len<B: SlotCleanup, P, C>(inner: &Shared<B, P, C>) -> usize {
-    inner
-        .write_cursor
-        .load(Ordering::Acquire)
-        .wrapping_sub(inner.read_cursor.load(Ordering::Acquire))
-}
-
-#[inline]
-pub(crate) fn shared_is_empty<B: SlotCleanup, P, C>(inner: &Shared<B, P, C>) -> bool {
-    shared_len(inner) == 0
-}
-
-#[inline]
-pub(crate) fn shared_is_full<B: SlotCleanup, P, C>(inner: &Shared<B, P, C>) -> bool {
-    inner
-        .write_cursor
-        .load(Ordering::Relaxed)
-        .wrapping_sub(inner.read_cursor.load(Ordering::Acquire))
-        > inner.mask
 }

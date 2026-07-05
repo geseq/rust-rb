@@ -13,6 +13,28 @@ use std::sync::atomic::{fence, AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
+/// Marker for wait strategies that are safe across process boundaries.
+///
+/// A cross-process strategy must carry no process-local state that the
+/// *other* side's `notify` needs to reach: the spin strategies qualify
+/// (waiting is purely local re-checking; `notify` is a no-op), while
+/// [`CvWait`] does not — its mutex/condvar live in one process's memory.
+///
+/// # Safety
+///
+/// Implementors assert that `wait` makes progress without ever requiring a
+/// `notify` delivered from another process (e.g. by re-checking the
+/// predicate or spinning), and that the strategy value works correctly when
+/// each process constructs its own instance.
+pub unsafe trait CrossProcess: WaitStrategy {}
+
+// SAFETY: pure spinning; no shared state, notify is a no-op.
+unsafe impl CrossProcess for NoOpWait {}
+// SAFETY: pure spinning with a CPU hint; no shared state.
+unsafe impl CrossProcess for PauseWait {}
+// SAFETY: spinning with a scheduler yield; no shared state.
+unsafe impl CrossProcess for YieldWait {}
+
 /// Behaviour shared by every wait strategy.
 ///
 /// Implementors must be cheap to default-construct: the queue builds one

@@ -39,12 +39,8 @@
 
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
-use std::sync::Arc;
 
-use crate::cursor::{
-    channel, publish_batch, shared_is_empty, shared_is_full, shared_len, ConsumerCore,
-    ProducerCore, Shared,
-};
+use crate::cursor::{channel, publish_batch, round_capacity, ConsumerCore, ProducerCore};
 use crate::wait::{WaitStrategy, YieldWait};
 
 /// The slot type: a cell the producer writes and the consumer moves out of,
@@ -93,10 +89,7 @@ where
     ///
     /// Panics if `min_capacity == 0`.
     pub fn with_wait_strategies(min_capacity: usize) -> (Producer<T, P, C>, Consumer<T, P, C>) {
-        assert!(min_capacity > 0, "capacity must be greater than zero");
-        let capacity = min_capacity
-            .checked_next_power_of_two()
-            .expect("capacity too large to round up to a power of two");
+        let capacity = round_capacity(min_capacity, 1);
 
         let (producer, consumer) =
             channel(
@@ -118,6 +111,11 @@ where
     P: WaitStrategy,
     C: WaitStrategy,
 {
+    #[cfg(all(feature = "shm", target_os = "linux", target_has_atomic = "64"))]
+    pub(crate) fn from_core(core: ProducerCore<Slot<T>, P, C>) -> Self {
+        Self { core }
+    }
+
     /// Block until there is room, then enqueue `value`.
     #[inline]
     pub fn push(&mut self, value: T) {
@@ -192,14 +190,14 @@ where
     /// under-counts.
     #[inline]
     pub fn len(&self) -> usize {
-        shared_len(self.shared())
+        self.core.occupancy()
     }
 
     /// Whether the queue is empty. Exact whenever the consumer has caught up
     /// (see [`len`](Self::len)); never reports `true` for a non-empty queue.
     #[inline]
     pub fn is_empty(&self) -> bool {
-        shared_is_empty(self.shared())
+        self.core.occupancy() == 0
     }
 
     /// Whether the queue is full (no room for another `push`). May transiently
@@ -208,7 +206,7 @@ where
     /// full queue.
     #[inline]
     pub fn is_full(&self) -> bool {
-        shared_is_full(self.shared())
+        self.core.is_full_view()
     }
 
     /// The buffer's true capacity (the requested minimum rounded up to a
@@ -216,11 +214,6 @@ where
     #[inline]
     pub fn capacity(&self) -> usize {
         self.core.capacity()
-    }
-
-    #[inline(always)]
-    fn shared(&self) -> &Arc<Shared<Slot<T>, P, C>> {
-        &self.core.inner
     }
 }
 
@@ -280,6 +273,11 @@ where
     P: WaitStrategy,
     C: WaitStrategy,
 {
+    #[cfg(all(feature = "shm", target_os = "linux", target_has_atomic = "64"))]
+    pub(crate) fn from_core(core: ConsumerCore<Slot<T>, P, C>) -> Self {
+        Self { core }
+    }
+
     /// Block until an element is available, then dequeue it by value.
     #[inline]
     pub fn pop(&mut self) -> T {
@@ -344,10 +342,24 @@ where
     #[inline(always)]
     fn advance_one(&mut self) {
         let capacity = self.core.capacity();
-        // Watermark = mask: the immediate flush fires only when the queue was
-        // observed exactly full (a blocked element producer needs one slot).
+        // Immediate trigger: the queue was observed exactly full per this
+        // side's latest cached view — a purely CONSUMER-LOCAL computation
+        // (`write_cursor_cache` and `read_cursor` are both our own fields),
+        // so it costs no shared load. The byte ring instead consumes the
+        // producer's exact starving flag because its records are variable
+        // size (a local occupancy compare cannot tell whether the producer's
+        // next record fits); the element ring's fixed unit makes the local
+        // check both sufficient and free. Reading the shared flag here
+        // instead measured a ~20x slowdown on the pure-cursor-traffic
+        // element workload — its Acquire load serializes against the
+        // producer's writes to that line.
+        let was_full = self
+            .core
+            .write_cursor_cache
+            .wrapping_sub(self.core.read_cursor)
+            > capacity - 1;
         self.core
-            .advance(1, publish_batch(capacity, MAX_PUBLISH_BATCH), capacity - 1);
+            .advance(1, publish_batch(capacity, MAX_PUBLISH_BATCH), was_full);
     }
 
     /// Number of elements currently queued. Exact on this side: uses the

@@ -7,12 +7,24 @@ description = "High-performance SPSC ring buffers — fixed-size items and varia
 license = "MIT"
 repository = "https://github.com/geseq/rust-rb"
 readme = "README.md"
-keywords = ["spsc", "mpsc", "ringbuffer", "queue", "lockfree"]
+keywords = ["spsc", "ipc", "ringbuffer", "queue", "lockfree"]
 categories = ["concurrency", "data-structures"]
 
 [lib]
 name = "rust_rb"
 path = "src/lib.rs"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[features]
+# Shared-memory-backed rings (Linux): memfd/mmap constructors, leases,
+# crash recovery. Adds a `libc` dependency; no effect on other targets.
+shm = ["dep:libc"]
+
+[dependencies]
+libc = { version = "0.2", optional = true }
 
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dev-dependencies]
 libc = "0.2"
@@ -33,3 +45,8 @@ path = "examples/bench.rs"
 [[example]]
 name = "bench_bytes"
 path = "examples/bench_bytes.rs"
+
+[[example]]
+name = "bench_shm"
+path = "examples/bench_shm.rs"
+required-features = ["shm"]

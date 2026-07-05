@@ -151,11 +151,53 @@ the producer when it drops.
 The framing, cursor caching, padding, and memory-ordering design is identical
 to the fixed-size ring; the wait strategies are shared between both.
 
+## Shared memory / IPC (feature `shm`, Linux)
+
+Both rings can be backed by a mapped shared region so the producer and
+consumer live in **different processes** — same handle types, same hot paths:
+
+```rust,ignore
+use rust_rb::{memfd, BytesRingBuffer};
+use std::os::fd::AsFd;
+
+let fd = memfd("my-ring")?;
+// SAFETY: the region is only accessed by cooperating rust-rb handles.
+let (mut tx, rx) = unsafe { BytesRingBuffer::create_shm(fd.as_fd(), 1 << 20)? };
+// create_shm returns (and leases) BOTH halves; release the one the peer
+// will own, then hand the fd over so it can attach:
+drop(rx);
+// in the peer process:
+// let mut rx = unsafe { BytesRingBuffer::attach_shm_consumer(fd.as_fd())? };
+```
+
+- Works with any mappable fd (`memfd` helper included, or `shm_open`).
+- The region carries a validated header (magic/version/ring kind/element
+  size/architecture/capacity, cursor sanity) — accidents are rejected;
+  adversarial peers are out of scope, hence the `unsafe` constructors.
+- **Crash recovery**: each side holds an opaque lease token in the header
+  (released on drop, guarded so stale handles can't revoke a successor).
+  Recovery is an explicit, unconditional takeover — the caller asserts the
+  previous holder is gone (liveness is knowledge only the application has;
+  pids are namespace-relative and deliberately not used):
+  `force_attach_shm_producer`/`_consumer` replace one dead side while the
+  peer keeps running, `recover_shm` takes over both. Everything published is
+  intact and drainable — a record only becomes visible through the
+  producer's single `Release` cursor store, so a mid-write crash leaves an
+  invisible partial record whose space is reused. Consumer-side recovery is
+  **at-least-once**: up to the deferred-publish window (`capacity / 8`, max
+  4096 bytes / 64 elements) of already-consumed messages may be delivered
+  again. Verified by a child-process crash test in `tests/shm.rs`.
+- Only the spin wait strategies (`CrossProcess`) are allowed: `CvWait`'s
+  mutex/condvar are process-local.
+- Element rings require `T: ShmItem` (plain data, valid for peer-written bit
+  patterns); byte rings carry any payload.
+
 ## Benchmark
 
 ```
 cargo run --release --example bench          # fixed-size ring
 cargo run --release --example bench_bytes    # variable-size ring
+cargo run --release --features shm --example bench_shm   # shm rings (Linux)
 ```
 
 For meaningful numbers, pin the producer and consumer to dedicated cores, e.g.
@@ -173,6 +215,13 @@ strategies, saturating producer:
 | `BytesRingBuffer` (cap 64 KiB) | 8 B/msg | ~4.9 ns/msg, ~205 M msgs/s | ~1.6 GB/s |
 | `BytesRingBuffer` (cap 64 KiB) | 64 B/msg | ~13 ns/msg, ~77 M msgs/s | ~5 GB/s |
 | `BytesRingBuffer` (cap 64 KiB) | 256 B/msg | ~27–46 ns/msg, ~25–37 M msgs/s | ~6–9 GB/s |
+| shm `RingBuffer<i64>`, same process | 8 B/element | ~1.13 ns/op, ~880 M msgs/s | — |
+| shm `RingBuffer<i64>`, **cross-process** | 8 B/element | ~1.3–1.7 ns/op, ~580–795 M msgs/s | — |
+| shm `BytesRingBuffer`, **cross-process** | 8 B/msg | ~6.2 ns/msg, ~162 M msgs/s | ~1.3 GB/s |
+
+The shm same-process row matching the heap ring is the point: the backing is
+free (identical hot path, different memory). Cross-process numbers include
+real scheduler/IPC noise and vary more run to run.
 
 The two benchmarks measure different work: the fixed-size ring hands off
 8-byte values (pure queue overhead — the C++ original measures ~2.4 ns/op on

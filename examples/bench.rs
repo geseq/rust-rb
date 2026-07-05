@@ -13,26 +13,15 @@
 
 use std::time::Instant;
 
+#[path = "common/mod.rs"]
+mod common;
+use common::{cores_announced, pin};
+
 use rust_rb::spsc::RingBuffer;
 use rust_rb::wait::{NoOpWait, PauseWait, WaitStrategy, YieldWait};
 
 const NUM_ITERATIONS: i64 = 100_000_000;
 const CAPACITY: usize = 32_768;
-
-#[cfg(any(target_os = "linux", target_os = "android"))]
-fn pin(core: usize) {
-    // SAFETY: zero-initialising a cpu_set_t and calling the libc affinity
-    // helpers with valid arguments is sound.
-    unsafe {
-        let mut set: libc::cpu_set_t = std::mem::zeroed();
-        libc::CPU_ZERO(&mut set);
-        libc::CPU_SET(core, &mut set);
-        libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
-    }
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
-fn pin(_core: usize) {}
 
 fn run<P, C>(name: &str, cores: Option<(usize, usize)>)
 where
@@ -73,20 +62,7 @@ where
 }
 
 fn main() {
-    let args: Vec<usize> = std::env::args()
-        .skip(1)
-        .filter_map(|a| a.parse().ok())
-        .collect();
-    let cores = match args.as_slice() {
-        [p, c] => {
-            println!("pinning producer -> core {p}, consumer -> core {c}");
-            Some((*p, *c))
-        }
-        _ => {
-            println!("unpinned (pass two core ids to pin, e.g. `bench 18 19`)");
-            None
-        }
-    };
+    let cores = cores_announced("bench");
 
     // Run twice, as the C++ benchmark does, to let caches/governors settle.
     for _ in 0..2 {
