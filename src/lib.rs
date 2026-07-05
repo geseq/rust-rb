@@ -71,13 +71,70 @@
 //! assert_eq!(&*rx.pop(), b"a longer message");
 //! ```
 //!
+//! # Which ring do I want?
+//!
+//! - **One fixed `T`** (a struct, an `i64`, a `[u8; N]`) → [`RingBuffer<T>`]. It
+//!   stores `T` by value with no per-message framing overhead.
+//! - **Variable-length byte payloads** (serialized messages, wire frames) →
+//!   [`BytesRingBuffer`]. Each record is length-framed inside one contiguous
+//!   ring.
+//! - **Two processes sharing one ring** (`shm` feature, Linux) → the
+//!   [`create_shm`](RingBuffer::create_shm)/[`attach_shm_producer`](RingBuffer::attach_shm_producer)
+//!   constructors on either ring. See the [shared-memory guide](guide::shm_ipc).
+//!
+//! Both rings are **single-producer / single-consumer**: the [`Producer`] and
+//! [`Consumer`] halves are `Send` but not `Clone`, so the SPSC contract is
+//! enforced at compile time.
+//!
+//! # Module map
+//!
+//! - [`spsc`] — the fixed-size element ring ([`RingBuffer`], [`Producer`],
+//!   [`Consumer`]).
+//! - [`spsc_bytes`] — the variable-size byte ring ([`BytesRingBuffer`] and its
+//!   handles).
+//! - [`wait`] — the [`WaitStrategy`] trait and the [`PauseWait`], [`YieldWait`],
+//!   [`NoOpWait`], and [`CvWait`] implementations selected per side as type
+//!   parameters `P` (producer) and `C` (consumer).
+//! - [`shm`] — shared-memory backing for cross-process rings (Linux, behind the
+//!   `shm` feature).
+//!
+//! # Guides
+//!
+//! The [`guide`] module holds task-oriented walkthroughs that go beyond the
+//! item-by-item reference:
+//!
+//! - [Configuration](guide::configuration) — choosing a capacity and a wait
+//!   strategy.
+//! - [API usage](guide::api_usage) — which method to reach for, per use case.
+//! - [Semantics & gotchas](guide::semantics) — the behaviours that surprise
+//!   people (transient `len`/`is_full` over-count, `mem::forget` re-delivery,
+//!   the single-P/single-C contract).
+//! - [Performance tuning](guide::performance) — core pinning, the adaptive
+//!   read-cursor publish, and a reproducible benchmarking recipe.
+//! - [Shared memory / IPC](guide::shm_ipc) — running a ring across two
+//!   processes, the trust model, and crash recovery.
+//! - [Migrating from `cpp-fastchan`](guide::migration).
+//!
+//! # Feature flags
+//!
+//! - **`shm`** (Linux only) — enables shared-memory backing constructors
+//!   ([`shm`], [`RingBuffer::create_shm`], etc.) for cross-process rings. Pulls
+//!   in `libc`. A no-op on non-Linux targets.
+//!
 //! [`YieldWait`]: wait::YieldWait
+//! [`PauseWait`]: wait::PauseWait
+//! [`NoOpWait`]: wait::NoOpWait
+//! [`CvWait`]: wait::CvWait
+//! [`WaitStrategy`]: wait::WaitStrategy
+//! [`RingBuffer<T>`]: RingBuffer
 
 #![deny(unsafe_op_in_unsafe_fn)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
 mod cache_padded;
 mod cursor;
+
+pub mod guide;
 
 #[cfg(all(feature = "shm", target_os = "linux", target_has_atomic = "64"))]
 #[cfg_attr(docsrs, doc(cfg(feature = "shm")))]
