@@ -531,3 +531,91 @@ Pre-registered gates from §5, measured (`examples/bench_spmc.rs`,
 
 Perf-shape findings are tracked as bd issues; correctness was unaffected
 throughout (accounting exact, no torn accepts, zero missed under keep-up).
+
+## 9. Third machine: `anchored::` — required consumers + lossy observers
+
+_Added 2026-07-05 post-PR-open, per owner grill: shape = required+observers;
+required get the full spmc API; module `anchored::`; full surface
+element→bytes→shm. Composes the two verified machines; only the seams are
+new._
+
+### 9.1 Semantics
+
+| Role | Membership | Gate | Read API | Loss |
+|---|---|---|---|---|
+| `Anchor` (required) | registry (spmc-style), dynamic | producer min-gates on anchors | full spmc surface: `pop_ref` (`&T`), clone-`pop`, `drain`, `Result<_, Closed>` | never (guaranteed by gate) |
+| `Observer` | unbounded pure readers | none | broadcast surface: validated copy-out, `Result<_, PopError{Lagged, Closed}>` | on lap, exact |
+
+"At least one consumer must have read" = one `Anchor`. Zero anchors ⇒
+degenerates to pure broadcast (producer free-runs; M-F1 own-cursor default
+forces one rescan per lap so a joining anchor is seen within a lap —
+verbatim from spmc).
+
+### 9.2 Composition (element ring)
+
+- **Slot layout = broadcast's**: `#[repr(C)] { seq: AtomicU64, payload }`,
+  u64 generations `2s+1/2s+2`, **word-atomic producer payload writes**
+  (observers race them; M-F10). `T: NoUninit + Send + Sync` (NoUninit for
+  observer copies; Sync for anchor `&T` borrows).
+- **Producer = spmc gate ∘ broadcast bracket**: fast path gates on
+  `cached_min` over the ANCHOR registry (selective refresh, SeqCst-fence
+  choreography with the registration-RMW-before-fence fix from d0549dc);
+  after the gate, the write is broadcast's bracket (Relaxed invalidate →
+  Release fence → word-atomic payload → Release publish of the slot seq) —
+  then ONE per-push Release store of the unified cursor (`tail` ≡
+  `write_cursor`: both roles spin on the same line; observers also need it
+  for subscribe/Lagged exactness).
+- **Anchor `&T` soundness (the novel claim, for the audit)**: the gate
+  guarantees the producer never writes slot `s` until every anchor passed
+  it, so an anchor's borrow never overlaps a producer write. A *plain* `&T`
+  read of bytes last written by *atomic* stores is race-free given
+  happens-before (Acquire on the cursor) — mixed atomicity only matters for
+  RACING accesses. Anchors skip seq validation entirely (can't tear);
+  their PopRef is spmc's (no DerefMut, advance-only).
+- **Observers**: broadcast consumer verbatim (tail spin, copy-validate,
+  slack reposition, `skip_to_latest`, closed drain).
+- **Drop-on-overwrite**: NONE — `T: NoUninit` is `Copy`, nothing to drop
+  (simpler than spmc; the watermark machinery does not port and is not
+  needed).
+
+### 9.3 Bytes variant
+
+spmc_bytes' gate (byte-granularity min over anchors, lag-filtered starving
+flag) ∘ broadcast_bytes' observer protocol (tail_intent/latest counters,
+window checks, jump-to-latest). One framing (u32 LE headers, padding
+records); **`max_message_len = capacity/8`** — the observers' window
+tolerance binds (anchors alone would allow capacity/2−4; the ring must
+satisfy both). Producer per push: declare intent → gate already held →
+write lanes (uniform AtomicU32) → latest → tail. Anchors parse frames
+in-place (`Msg` borrows, spmc_bytes style — gate-protected, no validation);
+observers copy-out with the three-counter window checks.
+
+### 9.4 shm
+
+Kinds **7 (anchored elems) / 8 (anchored bytes)**. Header = spmc-shm's
+anchor table (max_anchors at create; per-slot lease + epoch|state control;
+force_detach_consumer + retirement; recover resumes at slowest anchor —
+always a frame boundary) ∪ broadcast-shm's counters (bytes: intent_floor +
+latest healing on producer attach). Observers attach **PROT_READ,
+lease-free, unbounded** (broadcast-shm verbatim, incl. the RO-mapping
+enforcement suite). Closed = end-of-session (reopenable), both roles.
+
+### 9.5 Naming note
+
+The crate's internal seam enums are already called `*Anchor`
+(ProducerAnchor/ConsumerAnchor, ShmAnchor — crate-private). The public
+`anchored::Anchor` consumer type does not collide in API, but inside the
+module the seam enums should be renamed locally (e.g. `*Backing`) to keep
+the code readable.
+
+### 9.6 Verification plan
+
+Same per-commit gates. Novel-composition audit targets: the anchor-borrow
+mixed-atomicity claim (§9.2); gate-vs-bracket ordering (does the intent
+declare need to precede the gate check or only the writes — bytes);
+zero-anchor→first-anchor-join under a free-running producer (M-F1 analog
+with observers present); observer window checks against a gated (slower)
+producer frontier; unified-cursor semantics serving both spin protocols.
+Tests: per-role suites + a combined torture test (1 anchor rate-limited +
+2 observers, one permanently lagging: anchor sees ALL exactly; observers'
+accounting exact; producer throughput tracks the anchor).
