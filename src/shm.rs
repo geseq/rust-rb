@@ -1,7 +1,6 @@
 //! Shared-memory-backed rings (Linux, feature `shm`).
 //!
-//! Backs [`RingBuffer`](crate::spsc::RingBuffer) and
-//! [`BytesRingBuffer`](crate::spsc_bytes::BytesRingBuffer) with a mapped
+//! Backs [`RingBuffer`] and [`BytesRingBuffer`] with a mapped
 //! region (memfd, `shm_open`, or any mappable fd) so the producer and
 //! consumer can live in **different processes**. The handles returned are
 //! the ordinary [`Producer`]/[`Consumer`]/[`BytesProducer`]/[`BytesConsumer`]
