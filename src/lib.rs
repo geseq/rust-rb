@@ -122,6 +122,12 @@
 //!   consumer repositions to the latest record and reports the loss in
 //!   exact **bytes**
 //!   ([`Lagged`](broadcast_bytes::PopError::Lagged)`.missed_bytes`).
+//! - [`anchored`] — the **composed** multi-consumer ring
+//!   ([`anchored::RingBuffer`] and its handles): required
+//!   [`Anchor`](anchored::Anchor)s get the lossless gating contract while
+//!   unbounded lossy [`Observer`](anchored::Observer)s tap the same stream
+//!   with exact [`Lagged`](anchored::PopError::Lagged) accounting; with zero
+//!   anchors the producer free-runs like the lossy broadcast.
 //! - [`wait`] — the [`WaitStrategy`] trait and the [`PauseWait`], [`YieldWait`],
 //!   [`NoOpWait`], [`SleepWait`], [`BackoffWait`], and [`CvWait`]
 //!   implementations selected per side as type parameters `P` (producer) and
@@ -174,6 +180,8 @@
 mod cache_padded;
 mod cursor;
 
+#[cfg(target_has_atomic = "64")]
+pub mod anchored;
 #[cfg(target_has_atomic = "64")]
 pub mod broadcast;
 #[cfg(target_has_atomic = "64")]
