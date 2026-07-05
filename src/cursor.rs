@@ -312,6 +312,12 @@ pub(crate) unsafe fn producer_core_from_raw<B: SlotCleanup, P: WaitStrategy, C: 
 ) -> ProducerCore<B, P, C> {
     let write = unsafe { write_cursor.as_ref() }.load(Ordering::Acquire);
     let read = unsafe { read_cursor.as_ref() }.load(Ordering::Acquire);
+    // A newly-attached producer is not starving; reset the shared flag so a
+    // value left set by a crashed/departed predecessor cannot persist and
+    // pin the consumer in per-message publish mode forever. Only the (single)
+    // producer writes this flag, so the store races nothing.
+    // SAFETY: `starving` references the live shared flag.
+    unsafe { starving.as_ref() }.store(0, Ordering::Release);
     ProducerCore {
         buf,
         mask: capacity - 1,

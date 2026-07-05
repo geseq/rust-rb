@@ -55,7 +55,7 @@ use crate::wait::{WaitStrategy, YieldWait};
 /// construction and nothing on the hot path. (Shm rings inherit the same
 /// guarantee differently: mapped file bytes are always initialized memory,
 /// and `create_shm` zeroes the buffer area explicitly.)
-type Word = UnsafeCell<u64>;
+pub(crate) type Word = UnsafeCell<u64>;
 
 // The byte ring's slots are plain words with nothing to drop, and its cursors
 // are byte-granular, so the engine's teardown slot-walk is skipped.

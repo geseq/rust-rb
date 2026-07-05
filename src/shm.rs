@@ -71,17 +71,15 @@
 //! work across processes as-is, while `CvWait`'s mutex/condvar are
 //! process-local.
 
-use std::cell::UnsafeCell;
 use std::io;
-use std::mem::MaybeUninit;
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use crate::cursor::{consumer_core_from_raw, producer_core_from_raw, AnchorKind, SlotCleanup};
-use crate::spsc::{Consumer, Producer, RingBuffer};
-use crate::spsc_bytes::{BytesConsumer, BytesProducer, BytesRingBuffer};
+use crate::spsc::{Consumer, Producer, RingBuffer, Slot};
+use crate::spsc_bytes::{BytesConsumer, BytesProducer, BytesRingBuffer, Word};
 use crate::wait::CrossProcess;
 
 const MAGIC: u64 = u64::from_le_bytes(*b"rust_rb1");
@@ -373,10 +371,20 @@ fn force_claim_lease(region: &ShmRegion, role: Role) -> u64 {
 }
 
 fn region_len(capacity: usize, unit_size: usize) -> io::Result<usize> {
-    capacity
+    let len = capacity
         .checked_mul(unit_size)
         .and_then(|b| b.checked_add(BUFFER_OFFSET))
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "capacity overflows region"))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "capacity overflows region"))?;
+    // `ftruncate`/`mmap` take `off_t`, which is 32-bit on some 32-bit Linux
+    // targets — a length in [2^31, off_t::MAX+1) would sign-flip negative and
+    // surface as a bare EINVAL instead of this validation error.
+    if len as u64 > libc::off_t::MAX as u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "region length exceeds the platform file-offset limit",
+        ));
+    }
+    Ok(len)
 }
 
 /// Initialize a fresh region: size the fd, map it, write the header, take
@@ -388,7 +396,7 @@ fn create_region(
     unit_size: usize,
 ) -> io::Result<(Arc<ShmRegion>, u64, u64)> {
     let len = region_len(capacity, unit_size)?;
-    // SAFETY: valid fd for the borrow; len fits off_t for any real capacity.
+    // SAFETY: valid fd for the borrow; `region_len` confirmed `len` fits off_t.
     if unsafe { libc::ftruncate(fd.as_raw_fd(), len as libc::off_t) } != 0 {
         return Err(io::Error::last_os_error());
     }
@@ -485,9 +493,10 @@ fn open_region(
     cursor_align: usize,
 ) -> io::Result<(Arc<ShmRegion>, usize, u64)> {
     // Touching mapped pages past the file's end is SIGBUS, not an error
-    // return — validate the size before every mapping.
+    // return — validate the size (once) before mapping.
     let err = |m: &str| io::Error::new(io::ErrorKind::InvalidData, m.to_string());
-    if fd_len(fd)? < BUFFER_OFFSET as u64 {
+    let file_len = fd_len(fd)?;
+    if file_len < BUFFER_OFFSET as u64 {
         return Err(err("region too small to hold a ring header"));
     }
     // Map just the header first to learn the capacity.
@@ -524,7 +533,7 @@ fn open_region(
     drop(header);
 
     let len = region_len(capacity, unit_size)?;
-    if fd_len(fd)? < len as u64 {
+    if file_len < len as u64 {
         return Err(err("region smaller than its declared capacity"));
     }
     let region = ShmRegion::map(fd, len)?;
@@ -679,6 +688,33 @@ where
     }))
 }
 
+/// Force-take BOTH roles over a validated region and wrap them in the ring's
+/// handle types — the shared body of both rings' `recover_shm_with`. Force
+/// cannot fail, so no partial-failure path can leak a lease.
+///
+/// # Safety
+///
+/// As for [`attach_producer_role`]/[`attach_consumer_role`].
+#[allow(clippy::type_complexity)]
+unsafe fn recover_pair<B, P, C, TX, RX>(
+    opened: (Arc<ShmRegion>, usize, u64),
+    wrap_tx: impl FnOnce(crate::cursor::ProducerCore<B, P, C>) -> TX,
+    wrap_rx: impl FnOnce(crate::cursor::ConsumerCore<B, P, C>) -> RX,
+) -> io::Result<(TX, RX)>
+where
+    B: SlotCleanup,
+    P: CrossProcess + Default,
+    C: CrossProcess + Default,
+{
+    let producer_opened = (opened.0.clone(), opened.1, opened.2);
+    // SAFETY: forwarded caller contract (validated region).
+    unsafe {
+        let tx = attach_producer_role(producer_opened, true, wrap_tx)?;
+        let rx = attach_consumer_role(opened, true, wrap_rx)?;
+        Ok((tx, rx))
+    }
+}
+
 /// Consumer analog of [`attach_producer_role`].
 ///
 /// # Safety
@@ -706,7 +742,6 @@ where
     }))
 }
 
-type Word = UnsafeCell<u64>;
 /// Both halves of a shm-backed byte ring.
 pub type BytesPair<P, C> = (BytesProducer<P, C>, BytesConsumer<P, C>);
 /// Both halves of a shm-backed element ring.
@@ -857,24 +892,16 @@ where
     ///
     /// See [`recover_shm`](BytesRingBuffer::recover_shm).
     pub unsafe fn recover_shm_with(fd: BorrowedFd<'_>) -> io::Result<BytesPair<P, C>> {
-        let opened = Self::open(fd)?;
-        // Unconditional: force both roles. No partial-failure path exists
-        // (force cannot fail), so no lease can leak. Caches are rebuilt from
-        // the live cursors by the core constructors.
         // SAFETY: forwarded caller contract; region validated by open().
         unsafe {
-            let tx = attach_producer_role(
-                (opened.0.clone(), opened.1, opened.2),
-                true,
+            recover_pair(
+                Self::open(fd)?,
                 BytesProducer::from_core,
-            )?;
-            let rx = attach_consumer_role(opened, true, BytesConsumer::from_core)?;
-            Ok((tx, rx))
+                BytesConsumer::from_core,
+            )
         }
     }
 }
-
-type Slot<T> = UnsafeCell<MaybeUninit<T>>;
 
 /// Element-type invariants for shm rings, enforced consistently on create
 /// AND attach as errors (never panics — these surface on fallible paths).
@@ -1018,16 +1045,7 @@ where
     /// See [`BytesRingBuffer::recover_shm`], plus the `T` caveat of
     /// [`attach_shm_producer`](Self::attach_shm_producer).
     pub unsafe fn recover_shm_with(fd: BorrowedFd<'_>) -> io::Result<ElemPair<T, P, C>> {
-        let opened = Self::open(fd)?;
         // SAFETY: forwarded caller contract; region validated by open().
-        unsafe {
-            let tx = attach_producer_role(
-                (opened.0.clone(), opened.1, opened.2),
-                true,
-                Producer::from_core,
-            )?;
-            let rx = attach_consumer_role(opened, true, Consumer::from_core)?;
-            Ok((tx, rx))
-        }
+        unsafe { recover_pair(Self::open(fd)?, Producer::from_core, Consumer::from_core) }
     }
 }

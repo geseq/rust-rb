@@ -11,33 +11,15 @@
 
 use std::time::Instant;
 
+#[path = "common/mod.rs"]
+mod common;
+use common::pin;
+
 use rust_rb::spsc_bytes::BytesRingBuffer;
 use rust_rb::wait::{NoOpWait, PauseWait, WaitStrategy};
 
 const NUM_MESSAGES: usize = 20_000_000;
 const CAPACITY: usize = 64 * 1024;
-
-#[cfg(any(target_os = "linux", target_os = "android"))]
-fn pin(core: usize) {
-    // SAFETY: zero-initialising a cpu_set_t and calling the libc affinity
-    // helpers with valid arguments is sound.
-    unsafe {
-        let mut set: libc::cpu_set_t = std::mem::zeroed();
-        libc::CPU_ZERO(&mut set);
-        libc::CPU_SET(core, &mut set);
-        // Reported numbers claim to be pinned; a silent failure (offline
-        // core, cgroup cpuset) would publish unpinned results as pinned.
-        assert_eq!(
-            libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set),
-            0,
-            "failed to pin to core {core}: {}",
-            std::io::Error::last_os_error()
-        );
-    }
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
-fn pin(_core: usize) {}
 
 fn run<P, C>(name: &str, msg_len: usize, drain: bool, cores: Option<(usize, usize)>)
 where

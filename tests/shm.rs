@@ -271,3 +271,38 @@ fn element_ring_lease_force_and_recovery() {
     assert_eq!(rx3.pop(), 5);
     assert!(rx3.try_pop().is_none());
 }
+
+/// Recovering a producer that departed while the ring was full (its starving
+/// flag left set in the region) must reset that flag, so the recovered ring
+/// does not silently run in per-message publish mode. Functionally the ring
+/// stays correct either way; this exercises the reset path and confirms
+/// data integrity across a full-ring takeover.
+#[test]
+fn recover_producer_after_full_ring_starve() {
+    let fd = memfd("rb-recover-full").unwrap();
+    // 8-byte records; 512 fill a 4096-byte ring exactly.
+    // SAFETY: fresh private memfd.
+    let (mut tx, rx) = unsafe { BytesRingBuffer::create_shm(fd.as_fd(), 4096) }.unwrap();
+    let mut n = 0u32;
+    while tx.try_push(&n.to_le_bytes()) {
+        n += 1;
+    }
+    assert!(n > 0);
+    // Producer is now starving (a try_push just failed). Simulate its
+    // departure without cleanup, then take over both roles.
+    std::mem::forget(tx);
+    std::mem::forget(rx);
+    // SAFETY: previous holders are gone (leaked, never used again).
+    let (mut tx2, mut rx2) = unsafe { BytesRingBuffer::recover_shm(fd.as_fd()) }.unwrap();
+
+    // All queued records survive, in order.
+    for expect in 0..n {
+        let mut b = [0u8; 4];
+        b.copy_from_slice(&rx2.pop());
+        assert_eq!(u32::from_le_bytes(b), expect);
+    }
+    assert!(rx2.try_pop().is_none());
+    // The recovered ring keeps working after the full-ring takeover.
+    tx2.push(b"ok");
+    assert_eq!(&*rx2.pop(), b"ok");
+}

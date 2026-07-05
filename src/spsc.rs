@@ -45,7 +45,7 @@ use crate::wait::{WaitStrategy, YieldWait};
 
 /// The slot type: a cell the producer writes and the consumer moves out of,
 /// ordered by the cursor atomics.
-type Slot<T> = UnsafeCell<MaybeUninit<T>>;
+pub(crate) type Slot<T> = UnsafeCell<MaybeUninit<T>>;
 
 /// The fixed ring's clamp for the shared publish-batch policy: at most 64
 /// elements of deferred, already-consumed progress.
@@ -343,8 +343,16 @@ where
     fn advance_one(&mut self) {
         let capacity = self.core.capacity();
         // Immediate trigger: the queue was observed exactly full per this
-        // side's latest view (a blocked element producer needs one slot).
-        // Fires once per cursor-reload cycle — no per-element ping-pong.
+        // side's latest cached view — a purely CONSUMER-LOCAL computation
+        // (`write_cursor_cache` and `read_cursor` are both our own fields),
+        // so it costs no shared load. The byte ring instead consumes the
+        // producer's exact starving flag because its records are variable
+        // size (a local occupancy compare cannot tell whether the producer's
+        // next record fits); the element ring's fixed unit makes the local
+        // check both sufficient and free. Reading the shared flag here
+        // instead measured a ~20x slowdown on the pure-cursor-traffic
+        // element workload — its Acquire load serializes against the
+        // producer's writes to that line.
         let was_full = self
             .core
             .write_cursor_cache

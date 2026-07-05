@@ -15,9 +15,15 @@
 //! is excluded; the number is sustained consumer-side throughput.
 
 #[cfg(all(feature = "shm", target_os = "linux", target_has_atomic = "64"))]
+#[path = "common/mod.rs"]
+mod common;
+
+#[cfg(all(feature = "shm", target_os = "linux", target_has_atomic = "64"))]
 mod bench {
     use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
     use std::time::Instant;
+
+    use super::common::{cores, pin};
 
     use rust_rb::spsc_bytes::BytesRingBuffer;
     use rust_rb::wait::PauseWait;
@@ -27,35 +33,6 @@ mod bench {
     const CAPACITY: usize = 32_768;
     const BYTES_MSGS: usize = 20_000_000;
     const BYTES_CAPACITY: usize = 64 * 1024;
-
-    fn pin(core: usize) {
-        // SAFETY: zero-initialising a cpu_set_t and calling the libc affinity
-        // helpers with valid arguments is sound.
-        unsafe {
-            let mut set: libc::cpu_set_t = std::mem::zeroed();
-            libc::CPU_ZERO(&mut set);
-            libc::CPU_SET(core, &mut set);
-            // Reported numbers claim to be pinned; a silent failure (offline
-            // core, cgroup cpuset) would publish unpinned results as pinned.
-            assert_eq!(
-                libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set),
-                0,
-                "failed to pin to core {core}: {}",
-                std::io::Error::last_os_error()
-            );
-        }
-    }
-
-    fn cores() -> Option<(usize, usize)> {
-        let args: Vec<usize> = std::env::args()
-            .skip(1)
-            .filter_map(|a| a.parse().ok())
-            .collect();
-        match args.as_slice() {
-            [p, c] => Some((*p, *c)),
-            _ => None,
-        }
-    }
 
     /// Same process, two threads, ring state in the shm mapping.
     fn same_process(cores: Option<(usize, usize)>) {
@@ -147,6 +124,24 @@ mod bench {
             .expect("spawn child producer")
     }
 
+    /// Wait for the producer to publish something, but do not spin forever if
+    /// the child died before pushing (e.g. a failed core pin): poll the
+    /// child's liveness while waiting for the first item.
+    fn await_first_or_child_death(
+        child: &mut std::process::Child,
+        mut try_consume_one: impl FnMut() -> bool,
+    ) {
+        loop {
+            if try_consume_one() {
+                return;
+            }
+            if let Ok(Some(status)) = child.try_wait() {
+                panic!("child producer exited before producing (status {status:?})");
+            }
+            std::hint::spin_loop();
+        }
+    }
+
     /// Cross-process element ring: child produces, parent consumes.
     fn cross_process_elems(cores: Option<(usize, usize)>) {
         let fd = memfd("bench-shm-xproc-elem").unwrap();
@@ -164,9 +159,15 @@ mod bench {
             pin(c);
         }
 
-        // Exclude child startup: time from the first message.
-        let first = rx.pop();
-        assert_eq!(first, 0);
+        // Exclude child startup: time from the first message. Guard against
+        // a child that never produces (failed pin) rather than hanging.
+        await_first_or_child_death(&mut child, || match rx.try_pop() {
+            Some(v) => {
+                assert_eq!(v, 0);
+                true
+            }
+            None => false,
+        });
         let start = Instant::now();
         for i in 1..NUM_ITEMS {
             let got = rx.pop();
@@ -192,7 +193,8 @@ mod bench {
             pin(c);
         }
 
-        drop(rx.pop()); // first message: producer is up
+        // first message: producer is up (guarded against a dead child).
+        await_first_or_child_death(&mut child, || rx.try_pop().is_some());
         let start = Instant::now();
         for _ in 1..BYTES_MSGS {
             drop(rx.pop());
