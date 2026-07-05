@@ -78,8 +78,8 @@ use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use crate::cursor::{consumer_core_from_raw, producer_core_from_raw, AnchorKind, SlotCleanup};
-use crate::spsc::{Consumer, Producer, RingBuffer, Slot};
-use crate::spsc_bytes::{BytesConsumer, BytesProducer, BytesRingBuffer, Word};
+use crate::spsc::{Consumer, Producer, RingBuffer};
+use crate::spsc_bytes::{BytesConsumer, BytesProducer, BytesRingBuffer};
 use crate::wait::CrossProcess;
 
 const MAGIC: u64 = u64::from_le_bytes(*b"rust_rb1");
@@ -463,7 +463,10 @@ fn create_region(
     };
 
     // Match the heap ring's zeroed-buffer guarantee even when the fd is
-    // reused and carries old contents (one pass at create time).
+    // reused and carries old contents (one pass at create time). This also
+    // pre-faults and commits every buffer page here rather than on the first
+    // hot-path touch — desirable for a latency-sensitive ring, and the whole
+    // constructor is cold.
     // SAFETY: the buffer span is inside the mapping.
     unsafe {
         std::ptr::write_bytes(region.at(BUFFER_OFFSET), 0, len - BUFFER_OFFSET);
@@ -688,6 +691,34 @@ where
     }))
 }
 
+/// Build both handle cores over a freshly-created region and wrap them in the
+/// ring's handle types — the shared body of both rings' `create_shm_with`.
+///
+/// # Safety
+///
+/// The region must have been initialized by `create_region` for this ring
+/// kind (layout matches `B`).
+unsafe fn create_pair<B, P, C, TX, RX>(
+    created: (Arc<ShmRegion>, u64, u64),
+    capacity: usize,
+    wrap_tx: impl FnOnce(crate::cursor::ProducerCore<B, P, C>) -> TX,
+    wrap_rx: impl FnOnce(crate::cursor::ConsumerCore<B, P, C>) -> RX,
+) -> (TX, RX)
+where
+    B: SlotCleanup,
+    P: CrossProcess + Default,
+    C: CrossProcess + Default,
+{
+    let (region, pt, ct) = created;
+    // SAFETY: freshly initialized region matches the ring layout.
+    unsafe {
+        (
+            wrap_tx(shm_producer_core::<B, P, C>(region.clone(), capacity, pt)),
+            wrap_rx(shm_consumer_core::<B, P, C>(region, capacity, ct)),
+        )
+    }
+}
+
 /// Force-take BOTH roles over a validated region and wrap them in the ring's
 /// handle types — the shared body of both rings' `recover_shm_with`. Force
 /// cannot fail, so no partial-failure path can leak a lease.
@@ -812,16 +843,14 @@ where
         min_capacity: usize,
     ) -> io::Result<BytesPair<P, C>> {
         let capacity = crate::cursor::round_capacity(min_capacity, BYTES_MIN_CAPACITY);
-        let (region, pt, ct) = create_region(fd, KIND_BYTES, capacity, 1)?;
+        let created = create_region(fd, KIND_BYTES, capacity, 1)?;
         // SAFETY: freshly initialized region matches the byte-ring layout.
         Ok(unsafe {
-            (
-                BytesProducer::from_core(shm_producer_core::<Word, P, C>(
-                    region.clone(),
-                    capacity,
-                    pt,
-                )),
-                BytesConsumer::from_core(shm_consumer_core::<Word, P, C>(region, capacity, ct)),
+            create_pair(
+                created,
+                capacity,
+                BytesProducer::from_core,
+                BytesConsumer::from_core,
             )
         })
     }
@@ -977,18 +1006,9 @@ where
     ) -> io::Result<ElemPair<T, P, C>> {
         check_elem_type::<T>()?;
         let capacity = crate::cursor::round_capacity(min_capacity, 1);
-        let (region, pt, ct) = create_region(fd, KIND_ELEMS, capacity, std::mem::size_of::<T>())?;
+        let created = create_region(fd, KIND_ELEMS, capacity, std::mem::size_of::<T>())?;
         // SAFETY: freshly initialized region matches the element-ring layout.
-        Ok(unsafe {
-            (
-                Producer::from_core(shm_producer_core::<Slot<T>, P, C>(
-                    region.clone(),
-                    capacity,
-                    pt,
-                )),
-                Consumer::from_core(shm_consumer_core::<Slot<T>, P, C>(region, capacity, ct)),
-            )
-        })
+        Ok(unsafe { create_pair(created, capacity, Producer::from_core, Consumer::from_core) })
     }
 
     /// Attach to an existing element ring as the producer.

@@ -45,7 +45,7 @@ use crate::wait::{WaitStrategy, YieldWait};
 
 /// The slot type: a cell the producer writes and the consumer moves out of,
 /// ordered by the cursor atomics.
-pub(crate) type Slot<T> = UnsafeCell<MaybeUninit<T>>;
+type Slot<T> = UnsafeCell<MaybeUninit<T>>;
 
 /// The fixed ring's clamp for the shared publish-batch policy: at most 64
 /// elements of deferred, already-consumed progress.

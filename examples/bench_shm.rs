@@ -131,12 +131,19 @@ mod bench {
         child: &mut std::process::Child,
         mut try_consume_one: impl FnMut() -> bool,
     ) {
+        // Check child liveness only occasionally: try_wait() is a waitpid
+        // syscall, and a slow-starting child (fork/exec/link) would otherwise
+        // draw millions of them in this spin.
+        let mut spins = 0u32;
         loop {
             if try_consume_one() {
                 return;
             }
-            if let Ok(Some(status)) = child.try_wait() {
-                panic!("child producer exited before producing (status {status:?})");
+            spins += 1;
+            if spins % 4096 == 0 {
+                if let Ok(Some(status)) = child.try_wait() {
+                    panic!("child producer exited before producing (status {status:?})");
+                }
             }
             std::hint::spin_loop();
         }

@@ -13,7 +13,7 @@ use std::time::Instant;
 
 #[path = "common/mod.rs"]
 mod common;
-use common::pin;
+use common::{cores, pin};
 
 use rust_rb::spsc_bytes::BytesRingBuffer;
 use rust_rb::wait::{NoOpWait, PauseWait, WaitStrategy};
@@ -66,20 +66,11 @@ where
 }
 
 fn main() {
-    let args: Vec<usize> = std::env::args()
-        .skip(1)
-        .filter_map(|a| a.parse().ok())
-        .collect();
-    let cores = match args.as_slice() {
-        [p, c] => {
-            println!("pinning producer -> core {p}, consumer -> core {c}");
-            Some((*p, *c))
-        }
-        _ => {
-            println!("unpinned (pass two core ids to pin, e.g. `bench_bytes 18 19`)");
-            None
-        }
-    };
+    let cores = cores();
+    match cores {
+        Some((p, c)) => println!("pinning producer -> core {p}, consumer -> core {c}"),
+        None => println!("unpinned (pass two core ids to pin, e.g. `bench_bytes 18 19`)"),
+    }
 
     // Run twice, as the fixed-size benchmark does, to let caches settle.
     for _ in 0..2 {

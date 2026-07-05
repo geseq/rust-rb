@@ -15,7 +15,7 @@ use std::time::Instant;
 
 #[path = "common/mod.rs"]
 mod common;
-use common::pin;
+use common::{cores, pin};
 
 use rust_rb::spsc::RingBuffer;
 use rust_rb::wait::{NoOpWait, PauseWait, WaitStrategy, YieldWait};
@@ -62,20 +62,11 @@ where
 }
 
 fn main() {
-    let args: Vec<usize> = std::env::args()
-        .skip(1)
-        .filter_map(|a| a.parse().ok())
-        .collect();
-    let cores = match args.as_slice() {
-        [p, c] => {
-            println!("pinning producer -> core {p}, consumer -> core {c}");
-            Some((*p, *c))
-        }
-        _ => {
-            println!("unpinned (pass two core ids to pin, e.g. `bench 18 19`)");
-            None
-        }
-    };
+    let cores = cores();
+    match cores {
+        Some((p, c)) => println!("pinning producer -> core {p}, consumer -> core {c}"),
+        None => println!("unpinned (pass two core ids to pin, e.g. `bench 18 19`)"),
+    }
 
     // Run twice, as the C++ benchmark does, to let caches/governors settle.
     for _ in 0..2 {
