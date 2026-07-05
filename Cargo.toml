@@ -50,3 +50,8 @@ path = "examples/bench_bytes.rs"
 name = "bench_shm"
 path = "examples/bench_shm.rs"
 required-features = ["shm"]
+
+[[example]]
+name = "ipc_pair"
+path = "examples/ipc_pair.rs"
+required-features = ["shm"]
