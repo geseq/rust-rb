@@ -564,7 +564,10 @@ verbatim from spmc).
   Release fence → word-atomic payload → Release publish of the slot seq) —
   then ONE per-push Release store of the unified cursor (`tail` ≡
   `write_cursor`: both roles spin on the same line; observers also need it
-  for subscribe/Lagged exactness).
+  for subscribe/Lagged exactness). **The unified cursor is `u64`** (the
+  slot generations `2s+1/2s+2` require it); the gate arithmetic lifts from
+  spmc's `usize` accordingly. The producer's publish carries spmc's
+  `notify()` for blocking anchor strategies; observers stay `SelfTimed`.
 - **Anchor `&T` soundness (the novel claim, for the audit)**: the gate
   guarantees the producer never writes slot `s` until every anchor passed
   it, so an anchor's borrow never overlaps a producer write. A *plain* `&T`
@@ -585,8 +588,16 @@ flag) ∘ broadcast_bytes' observer protocol (tail_intent/latest counters,
 window checks, jump-to-latest). One framing (u32 LE headers, padding
 records); **`max_message_len = capacity/8`** — the observers' window
 tolerance binds (anchors alone would allow capacity/2−4; the ring must
-satisfy both). Producer per push: declare intent → gate already held →
-write lanes (uniform AtomicU32) → latest → tail. Anchors parse frames
+satisfy both). Producer per push — **the order is normative** [audit F3]:
+**(1) gate** (wait until every anchor passed `new_tail − capacity`) →
+**(2) declare `tail_intent`** → **(3) `fence(Release)`** →
+**(4) write lanes** (uniform AtomicU32) → **(5) `latest`, then `tail`**.
+Intent must NEVER precede the gate wait: a producer stalled at the gate
+with a published `intent = tail + total` makes nearly every observer fail
+its window check against fully intact bytes and loop on spurious
+`Lagged{missed_bytes: 0}` (reposition clamps to `latest ≤ pos`) until the
+gate opens — a livelock on readable data. Gate-first keeps
+`intent == tail` whenever the producer is stalled. Anchors parse frames
 in-place (`Msg` borrows, spmc_bytes style — gate-protected, no validation);
 observers copy-out with the three-counter window checks.
 
@@ -594,8 +605,11 @@ observers copy-out with the three-counter window checks.
 
 Kinds **7 (anchored elems) / 8 (anchored bytes)**. Header = spmc-shm's
 anchor table (max_anchors at create; per-slot lease + epoch|state control;
-force_detach_consumer + retirement; recover resumes at slowest anchor —
-always a frame boundary) ∪ broadcast-shm's counters (bytes: intent_floor +
+force_detach_consumer + retirement; recover: the *returned anchor*
+resumes at the slowest registered anchor cursor (at-least-once, always a
+frame boundary); the *producer* resumes at the committed tail with its
+gating caches seeded to force a first-push rescan) ∪ broadcast-shm's
+counters (bytes: intent_floor +
 latest healing on producer attach). Observers attach **PROT_READ,
 lease-free, unbounded** (broadcast-shm verbatim, incl. the RO-mapping
 enforcement suite). Closed = end-of-session (reopenable), both roles.
@@ -609,6 +623,18 @@ module the seam enums should be renamed locally (e.g. `*Backing`) to keep
 the code readable.
 
 ### 9.6 Verification plan
+
+**Named proof obligation (audit F4 — the free-run join induction):** the
+soundness of unvalidated anchor borrows on a previously free-running ring
+rests on four spmc-verbatim preconditions: per-push cursor publish; the
+empty-registry gate default `cached_min = next_seq − 1` (the **minus one**
+is load-bearing — it caps the grant at seqs ≤ S + capacity − 2, strictly
+below any joiner's re-read J ≥ S); the registration-RMW-before-SeqCst-fence
+join; and the joiner's post-fence re-read of the unified cursor as its join
+point. Any scan that misses the joiner implies J ≥ S, so free-run
+overwrites destroy only seqs < J; the miss case dies within one lap. An
+implementer must not "optimize" the −1, batch the cursor publish, or
+reorder the join RMW — this is a loom target.
 
 Same per-commit gates. Novel-composition audit targets: the anchor-borrow
 mixed-atomicity claim (§9.2); gate-vs-bracket ordering (does the intent
