@@ -65,8 +65,16 @@ teardown walk must read it (a producer-local field is unreachable from
 double-drops after a panicking overwrite-drop or a forgotten `WriteSlot`).
 
 Single-writer everywhere; every cross-thread word `CachePadded` (128 B).
-`MAX_CONSUMERS`: constructor parameter, **default 8** (not 64 — the shm
-header pays the table; the bitmap word caps MAX at 64) **[OPEN: default]**.
+
+**Registry bound [DECIDED — final grill]:** heap membership is **unbounded**:
+the registry is an append-only list of 64-slot chunks (each chunk = bitmap
+word + 64 padded cursor slots). Chunks are never moved or freed (single-writer
+and consumers' cached slot pointers stay valid); growth is a cold append
+(`Arc`-linked next pointer, CAS-installed). The producer's rescan walks the
+chunk list — one bitmap + one block in the common (≤64 consumers) case,
+identical to a fixed-64 registry. **shm keeps a create-time
+`max_consumers`** — a mapped region's layout cannot grow; that constraint is
+physical, not a design choice, and is documented as such.
 
 ### 2.2 Producer — gate, scan, publish
 
@@ -80,8 +88,9 @@ Producer-local plain fields (padded): `next_seq`, `cached_min`, and a
 - Gate failure (slow path):
   1. `fence(SeqCst)` (Disruptor `setVolatile` analog — pairs with the
      joiner fence, M-F2, and bounds staleness vs parked consumers M-F4).
-  2. Load `active_bitmap` (Relaxed; L1-resident — written only on membership
-     change).
+  2. Walk the registry chunk list; per chunk load its bitmap (Relaxed;
+     L1-resident — written only on membership change). Common case (≤64
+     consumers) = one chunk, one word.
   3. **Selective refresh** [P-F3]: for each set bit whose
      `cached_cursor[i] < wrap_point`, reload slot i (Relaxed); one
      `fence(Acquire)` after the loop [P-F1] — misses overlap in the MLP
@@ -163,7 +172,8 @@ deferral, ≤ capacity/8 max 64 — same producer-visible bound as SPSC
   *before* the registry CAS — makes the subscribe-vs-teardown race
   structurally unreachable [A-2.2]. Returns
   `Result<Consumer, SubscribeError>`, `enum SubscribeError { Closed, Full }`
-  [A-1.4].
+  [A-1.4] — `Full` reachable only on shm rings (fixed `max_consumers`);
+  heap subscribe appends a chunk instead.
 - Zero consumers: `push`/`try_push` **succeed** (free-run +
   drop-on-overwrite; an error would race every subscribe and joiners can't
   see pre-join messages anyway — unlike tokio there's no retention
@@ -198,16 +208,20 @@ deferral, ≤ capacity/8 max 64 — same producer-visible bound as SPSC
   unaffected. Document in the semantics guide.
 - shm: `T: ShmItem` ⇒ no Drop ⇒ this machinery compiles away.
 
-### 2.6 Wait strategies
+### 2.6 Wait strategies **[DECIDED — final grill]**
 
 - Consumer waits on `write_cursor`: existing machinery.
-- Producer waits on min-cursor movement. **v1: spin-only, both sides
-  [OPEN: confirm]** — with a CvWait producer, every consumer flush pays
-  lock+signal at peak backpressure (N-contended mutex exactly when it
-  hurts); a shared consumer-side CvWait has a real lost-wakeup defect for
-  N waiters (`waiting: AtomicBool` — A wakes, clears the flag, parked B is
-  skipped; saved only by the 100 ns timed recheck) [M-F4/P-F7]. If blocking
-  ever ships: per-consumer wait words + targeted wake + waiter *counter*.
+- **v1 strategy family: the self-timed set, Aeron-style** — `NoOpWait`,
+  `PauseWait`, `YieldWait`, plus a new **`BackoffWait`** (spin N → yield M →
+  escalating `sleep(ns)`; Aeron `BackoffIdleStrategy` / Disruptor
+  `SleepingWaitStrategy` shape). All make progress without peer notifies, so
+  they work on every side of both machines (and are `CrossProcess` by
+  construction). **`CvWait` is excluded from SPMC v1**: a CvWait producer
+  makes every consumer flush pay lock+signal at peak backpressure, and the
+  shared-flag elision has a real lost-wakeup defect for N waiters
+  (`waiting: AtomicBool` — A wakes, clears, parked B skipped) [M-F4/P-F7].
+  If blocking ever ships: per-consumer wait words + targeted wake + waiter
+  counter.
 - Producer wait predicate must **re-scan the min inside the wait loop**
   (a cached min in the predicate is a deadlock) [M-F4].
 
@@ -315,14 +329,15 @@ consumer at position s (hot path):
 
 - Lap ⇒ `Err(Lagged { missed: u64 })`, **exact** as of detection (per-push
   tail makes it free; the every-k question is dead).
-- Reposition [A-3.2]: `new_pos = tail − capacity + SLACK`,
-  **SLACK = capacity/8** (same constant family as adaptive publish).
-  Guarantees: `capacity − capacity/8` messages immediately readable; the
-  producer must advance ≥ capacity/8 before the consumer can lag again —
-  `Lagged` frequency bounded to one per capacity/8 pushes, and cumulative
-  `missed` across successive errors is gap-free and overlap-free
-  (`missed = new_pos − old_pos`). Kills the lag-storm livelock of naive
-  jump-to-oldest.
+- Reposition [A-3.2, slack **configurable** per final grill]:
+  `new_pos = tail − capacity + slack`, with `slack` a constructor knob
+  (**default `capacity/8`**, validated `< capacity`). Guarantees:
+  `capacity − slack` messages immediately readable; the producer must
+  advance ≥ `slack` before this consumer can lag again — `Lagged` frequency
+  bounded to one per `slack` pushes; cumulative `missed` across successive
+  errors is gap-free and overlap-free (`missed = new_pos − old_pos`). Kills
+  the lag-storm livelock of naive jump-to-oldest. Larger slack = fewer,
+  bigger loss events; smaller = maximal salvage.
 - `skip_to_latest()` (`pos = tail`) as the explicit market-data method.
 - API + closed contract unified [A-1.2]:
   `pop() -> Result<T, PopError>`, `try_pop() -> Result<Option<T>, PopError>`,
@@ -471,20 +486,20 @@ closed/forget/counters/panic table. Lands with PR-1/PR-2 docs.
 4. **PR-4** shm — gating consumer table + zombie answer; broadcast
    read-only lease-free attach + PROT_READ suite; churn bench.
 
-## 7. Open questions (final grill round)
+## 7. Final grill outcomes (2026-07-05) — design CLOSED
 
-All audit findings have adopted resolutions in the text above; these are the
-decisions that remain the owner's:
+1. **Registry**: heap unbounded (append-only 64-slot chunk list); shm
+   `max_consumers` fixed at create (physical constraint of a mapped
+   layout).
+2. **Closed contract**: adopted as proposed (`Result<T, Closed>` /
+   `PopError{Lagged, Closed}`).
+3. **Lossy reposition**: oldest + slack, **slack configurable**
+   (constructor knob, default `capacity/8`); `skip_to_latest()`; `pop`
+   naming kept.
+4. **Wait strategies**: the self-timed family — NoOp/Pause/Yield **+ new
+   `BackoffWait`** (Aeron-style spin→yield→sleep escalation) — on all sides
+   of both machines. No `CvWait` in SPMC v1.
+5. **Zombie answer**: slot retirement + epoch control word, adopted.
 
-1. **`MAX_CONSUMERS` default** — proposal: 8 (hard cap 64 = the bitmap
-   word; shm header pays 128 B/slot).
-2. **Confirm the closed-contract API shape** — gating `pop()` becomes
-   `Result<T, Closed>` (SPSC `pop()` stays `-> T`); lossy
-   `Result<T, PopError{Lagged, Closed}>`. Necessary (blocking-forever is
-   unshippable) but it does diverge the two rings' signatures from SPSC's.
-3. **Confirm lossy reposition** — oldest + capacity/8 slack default,
-   `skip_to_latest()` opt-in, `pop` naming kept.
-4. **Confirm v1 spin-only** end-to-end (gating producer side + all lossy).
-5. **Confirm the zombie answer** — slot retirement + epoch control word;
-   retired slots unavailable until `recover_shm`; `force_detach` documented
-   as revoking the victim's read validity.
+Implementation proceeds per §6 phasing; ADRs to be recorded from
+**[DECIDED]** items.
