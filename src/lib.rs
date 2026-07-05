@@ -95,6 +95,10 @@
 //! - [`spmc`] — the single-producer / **multi**-consumer gating broadcast
 //!   ring ([`spmc::RingBuffer`] and its handles): every consumer observes
 //!   every message; a slow consumer gates the producer.
+//! - [`broadcast`] — the single-producer / multi-consumer **lossy** broadcast
+//!   ring ([`broadcast::RingBuffer`] and its handles): the producer never
+//!   blocks and never reads consumer state; a slow consumer loses messages
+//!   and gets an exact [`Lagged`](broadcast::PopError::Lagged) count.
 //! - [`wait`] — the [`WaitStrategy`] trait and the [`PauseWait`], [`YieldWait`],
 //!   [`NoOpWait`], and [`CvWait`] implementations selected per side as type
 //!   parameters `P` (producer) and `C` (consumer).
@@ -136,6 +140,8 @@
 mod cache_padded;
 mod cursor;
 
+#[cfg(target_has_atomic = "64")]
+pub mod broadcast;
 pub mod guide;
 
 #[cfg(all(feature = "shm", target_os = "linux", target_has_atomic = "64"))]
@@ -146,6 +152,9 @@ pub mod spsc;
 pub mod spsc_bytes;
 pub mod wait;
 
+#[cfg(target_has_atomic = "64")]
+#[doc(inline)]
+pub use broadcast::NoUninit;
 #[doc(inline)]
 pub use spsc::{Consumer, Producer, RingBuffer};
 #[doc(inline)]

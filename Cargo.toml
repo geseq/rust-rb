@@ -18,6 +18,13 @@ path = "src/lib.rs"
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
+[lints.rust]
+# `rust_rb_volatile_copy` is a private dev switch (set via RUSTFLAGS, not a
+# cargo feature) that swaps the broadcast ring's strict word-wise atomic
+# payload copy for whole-payload volatile copies — the copy A/B benchmark
+# alternative, never part of the public API.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(rust_rb_volatile_copy)"] }
+
 [features]
 # Shared-memory-backed rings (Linux): memfd/mmap constructors, leases,
 # crash recovery. Adds a `libc` dependency; no effect on other targets.
