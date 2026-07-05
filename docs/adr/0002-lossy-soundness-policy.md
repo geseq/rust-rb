@@ -1,6 +1,19 @@
 # ADR 0002: Lossy-read soundness — portable orderings, symmetric atomic copy, bench-gated relaxation
 
-Date: 2026-07-05 · Status: accepted · Tracked: rust-rb-owp
+Date: 2026-07-05 · Status: accepted; **A/B resolved 2026-07-05 — strict copy is
+permanent** · Tracked: rust-rb-owp
+
+## Resolution (bench outcome)
+
+The copy A/B ran on GB10/Cortex-X925 (same-core ping-pong isolating copy
+codegen; `examples/bench_broadcast.rs`). The decision rule ("volatile ships
+per-arch only if strict is >25% slower at 64 B") was **not met on either
+side**: strict push/pop 6.72/5.87 ns at 64 B vs volatile 5.80/15.44 (pop
+2.6× *slower* volatile); at 256 B volatile collapses (69 ns pop vs 18) —
+LLVM cannot coalesce or vectorize volatile accesses, while the atomic word
+loop optimizes. The `rust_rb_volatile_copy` dev cfg remains only as a bench
+artifact; the strict word-wise atomic copy is the sole shipping
+implementation.
 
 ## Context
 

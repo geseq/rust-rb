@@ -505,3 +505,29 @@ closed/forget/counters/panic table. Lands with PR-1/PR-2 docs.
 
 Implementation proceeds per §6 phasing; ADRs to be recorded from
 **[DECIDED]** items.
+
+## 8. Bench outcomes (2026-07-05, GB10 DGX Spark / Cortex-X925 — NOT the
+## historical Grace box; SPSC-Yield baseline here = 2.36 ns/op)
+
+Pre-registered gates from §5, measured (`examples/bench_spmc.rs`,
+`examples/bench_broadcast.rs`, pinned X925 cores 15–19, warm pass):
+
+- **N=1 SPSC parity (gating): HELD** — 0.99–1.06× across strategies.
+- **Backpressure percentiles: GOOD** — p50 16 / p99 32 ns (timer-tick
+  quantized), mean ~24 ns at cap 1024 under sustained gating.
+- **Straggler: HELD, textbook** — producer 46.17 ns/op vs straggler 45.98.
+- **Caught-up N-scaling (gating): FAILED flat shape** — +24% at N=2, +114%
+  at N=4 (within §2.9's saturated bound; filed for investigation).
+- **Lossy k-independence: FAILED (the key gate)** — producer 4.5 ns/push
+  at k=0 → 25.3 at k=1 → 65.5 at k=4 caught-up spinning consumers;
+  a lagged consumer decouples to 8.7. Lockstep coupling in the caught-up
+  regime; filed as rust-rb bug with re-measure-on-Grace and mitigation
+  candidates (see bd).
+- **Lap behavior: HELD** — exact accounting (accepted+missed = pushed);
+  producer 7.57 ns/push with a permanently lagging consumer.
+- **Copy A/B: RESOLVED — strict permanent** (ADR 0002 updated): volatile
+  is 2.6× slower on pop at 64 B and collapses at 256 B; the decision rule
+  was not met in either direction.
+
+Perf-shape findings are tracked as bd issues; correctness was unaffected
+throughout (accounting exact, no torn accepts, zero missed under keep-up).

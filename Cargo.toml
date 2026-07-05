@@ -54,6 +54,14 @@ name = "bench_bytes"
 path = "examples/bench_bytes.rs"
 
 [[example]]
+name = "bench_spmc"
+path = "examples/bench_spmc.rs"
+
+[[example]]
+name = "bench_broadcast"
+path = "examples/bench_broadcast.rs"
+
+[[example]]
 name = "bench_shm"
 path = "examples/bench_shm.rs"
 required-features = ["shm"]

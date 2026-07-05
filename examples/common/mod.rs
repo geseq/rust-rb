@@ -51,3 +51,83 @@ pub fn cores() -> Option<(usize, usize)> {
         _ => None,
     }
 }
+
+/// Parse a pinned core list from argv — the first id is the producer core,
+/// the rest are consumer cores — falling back to `defaults` when no numeric
+/// args are given, and print the resulting layout. `example` is used in the
+/// "how to pin" hint.
+pub fn core_list_announced(example: &str, defaults: &[usize]) -> Vec<usize> {
+    let args: Vec<usize> = std::env::args()
+        .skip(1)
+        .filter_map(|a| a.parse().ok())
+        .collect();
+    let cores = if args.is_empty() {
+        defaults.to_vec()
+    } else {
+        args
+    };
+    assert!(
+        cores.len() >= 2,
+        "need a producer core and at least one consumer core, e.g. `{example} 15 16 17 18 19`"
+    );
+    println!(
+        "pinning producer -> core {}, consumers -> cores {:?}",
+        cores[0],
+        &cores[1..]
+    );
+    cores
+}
+
+/// Print a one-line machine identification so bench logs are attributable.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub fn announce_machine() {
+    // SAFETY: uname fills a zero-initialised utsname; the fields are
+    // NUL-terminated C strings by contract.
+    unsafe {
+        let mut u: libc::utsname = std::mem::zeroed();
+        if libc::uname(&mut u) == 0 {
+            let s = |f: *const libc::c_char| std::ffi::CStr::from_ptr(f).to_string_lossy();
+            println!(
+                "machine: {} {} {} ({} cpus)",
+                s(u.nodename.as_ptr()),
+                s(u.release.as_ptr()),
+                s(u.machine.as_ptr()),
+                std::thread::available_parallelism().map_or(0, |n| n.get()),
+            );
+            return;
+        }
+    }
+    announce_machine_fallback();
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+pub fn announce_machine() {
+    announce_machine_fallback();
+}
+
+fn announce_machine_fallback() {
+    println!(
+        "machine: {} ({} cpus)",
+        std::env::consts::ARCH,
+        std::thread::available_parallelism().map_or(0, |n| n.get()),
+    );
+}
+
+/// Busy-wait for `iters` spin-loop hints — the rate-limit knob for the
+/// deliberately-slow-consumer benches. Calibrate with [`spin_ns_per_iter`].
+#[inline]
+pub fn spin_delay(iters: u32) {
+    for _ in 0..iters {
+        std::hint::spin_loop();
+    }
+}
+
+/// Measure the cost of one `spin_loop` hint on the current core, in ns.
+/// Pin the thread first: the clusters of a heterogeneous part differ.
+pub fn spin_ns_per_iter() -> f64 {
+    let start = std::time::Instant::now();
+    for _ in 0..1_000_000 {
+        std::hint::spin_loop();
+    }
+    start.elapsed().as_nanos() as f64 / 1e6
+}
