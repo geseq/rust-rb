@@ -211,17 +211,18 @@ deferral, ≤ capacity/8 max 64 — same producer-visible bound as SPSC
 ### 2.6 Wait strategies **[DECIDED — final grill]**
 
 - Consumer waits on `write_cursor`: existing machinery.
-- **v1 strategy family: the self-timed set, Aeron-style** — `NoOpWait`,
-  `PauseWait`, `YieldWait`, plus a new **`BackoffWait`** (spin N → yield M →
-  escalating `sleep(ns)`; Aeron `BackoffIdleStrategy` / Disruptor
-  `SleepingWaitStrategy` shape). All make progress without peer notifies, so
-  they work on every side of both machines (and are `CrossProcess` by
-  construction). **`CvWait` is excluded from SPMC v1**: a CvWait producer
-  makes every consumer flush pay lock+signal at peak backpressure, and the
-  shared-flag elision has a real lost-wakeup defect for N waiters
-  (`waiting: AtomicBool` — A wakes, clears, parked B skipped) [M-F4/P-F7].
-  If blocking ever ships: per-consumer wait words + targeted wake + waiter
-  counter.
+- **v1 strategy family: four self-timed primitive tiers + the combo**
+  (per final grill): `NoOpWait` (tight loop), `PauseWait` (spin with pause
+  hint), `YieldWait`, and a new **`SleepWait`** (timed sleep, `parkNanos`
+  shape) — plus **`BackoffWait`** composing the tiers with escalation
+  (spin → yield → sleep; Aeron `BackoffIdleStrategy`). All make progress
+  without peer notifies, so they work on every side of both machines (and
+  are `CrossProcess` by construction). **`CvWait` is excluded from SPMC
+  v1**: a CvWait producer makes every consumer flush pay lock+signal at
+  peak backpressure, and the shared-flag elision has a real lost-wakeup
+  defect for N waiters (`waiting: AtomicBool` — A wakes, clears, parked B
+  skipped) [M-F4/P-F7]. If blocking ever ships: per-consumer wait words +
+  targeted wake + waiter counter.
 - Producer wait predicate must **re-scan the min inside the wait loop**
   (a cached min in the predicate is a deadlock) [M-F4].
 
@@ -496,9 +497,10 @@ closed/forget/counters/panic table. Lands with PR-1/PR-2 docs.
 3. **Lossy reposition**: oldest + slack, **slack configurable**
    (constructor knob, default `capacity/8`); `skip_to_latest()`; `pop`
    naming kept.
-4. **Wait strategies**: the self-timed family — NoOp/Pause/Yield **+ new
-   `BackoffWait`** (Aeron-style spin→yield→sleep escalation) — on all sides
-   of both machines. No `CvWait` in SPMC v1.
+4. **Wait strategies**: four self-timed primitive tiers —
+   **NoOp / Spin (Pause) / Yield / new Sleep** — plus **`BackoffWait`**
+   composing them with Aeron-style escalation (spin→yield→sleep), on all
+   sides of both machines. No `CvWait` in SPMC v1.
 5. **Zombie answer**: slot retirement + epoch control word, adopted.
 
 Implementation proceeds per §6 phasing; ADRs to be recorded from

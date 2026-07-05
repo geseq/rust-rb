@@ -37,12 +37,13 @@ gating math or an innocent re-subscriber under the naive design.
    land on state nobody reads. `force_detach` is documented as revoking the
    victim's read validity (caller-asserts-death, same trust register as
    `force_attach`).
-5. **Wait strategies (v1).** The self-timed family on all sides of both
-   machines: `NoOpWait`, `PauseWait`, `YieldWait`, plus new `BackoffWait`
-   (spin → yield → escalating sleep; Aeron `BackoffIdleStrategy` shape).
-   No `CvWait` in SPMC v1 (single-flag elision has an N-waiter lost-wakeup
-   defect; a blocking option requires per-consumer wait words + waiter
-   counters + targeted wake).
+5. **Wait strategies (v1).** Four self-timed primitive tiers on all sides
+   of both machines — `NoOpWait` (tight loop), `PauseWait` (spin/pause
+   hint), `YieldWait`, and new `SleepWait` (timed sleep) — plus
+   `BackoffWait` composing them with escalation (spin → yield → sleep;
+   Aeron `BackoffIdleStrategy` shape). No `CvWait` in SPMC v1 (single-flag
+   elision has an N-waiter lost-wakeup defect; a blocking option requires
+   per-consumer wait words + waiter counters + targeted wake).
 
 ## Consequences
 
