@@ -23,7 +23,7 @@ mod bench {
     use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
     use std::time::Instant;
 
-    use super::common::{cores, pin};
+    use super::common::{cores_announced, pin};
 
     use rust_rb::spsc_bytes::BytesRingBuffer;
     use rust_rb::wait::PauseWait;
@@ -213,11 +213,7 @@ mod bench {
 
     pub fn run() {
         maybe_run_child();
-        let cores = cores();
-        match cores {
-            Some((p, c)) => println!("pinning producer -> core {p}, consumer -> core {c}"),
-            None => println!("unpinned (pass two core ids to pin, e.g. `bench_shm 18 19`)"),
-        }
+        let cores = cores_announced("bench_shm");
         // Run twice, as the other benches do, to let caches settle.
         for _ in 0..2 {
             same_process(cores);

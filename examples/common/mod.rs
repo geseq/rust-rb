@@ -29,6 +29,17 @@ pub fn pin(core: usize) {
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 pub fn pin(_core: usize) {}
 
+/// Parse the pin pair from argv and print the pin/unpinned announcement,
+/// returning the pair. `example` is used in the "how to pin" hint.
+pub fn cores_announced(example: &str) -> Option<(usize, usize)> {
+    let cores = cores();
+    match cores {
+        Some((p, c)) => println!("pinning producer -> core {p}, consumer -> core {c}"),
+        None => println!("unpinned (pass two core ids to pin, e.g. `{example} 18 19`)"),
+    }
+    cores
+}
+
 /// Parse an optional `(producer_core, consumer_core)` pin pair from argv.
 pub fn cores() -> Option<(usize, usize)> {
     let args: Vec<usize> = std::env::args()

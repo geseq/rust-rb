@@ -417,6 +417,15 @@ where
                 // starvation persists this is a read of a line we poll
                 // anyway) so a ring layer that publishes immediately on it
                 // can release us.
+                //
+                // The element ring maintains this flag here but does not
+                // consume it (it uses a cheaper consumer-local `was_full`
+                // check — reading the flag there measured a ~20x slowdown).
+                // The maintenance is effectively free for it: set-if-zero +
+                // the clear-on-comfortable-success hysteresis mean the flag
+                // is written only on starvation *transitions*, which are rare
+                // even under sustained backpressure (the flag stays 1 with no
+                // repeated stores while the ring is pinned full).
                 // SAFETY: `starving` points into the live shared state.
                 unsafe {
                     let starving = &*self.starving.as_ptr();
