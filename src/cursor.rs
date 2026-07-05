@@ -574,8 +574,20 @@ where
     /// Publish the private read cursor to the shared atomic and wake a
     /// producer blocked on a full ring. The wake-up is a no-op for spin
     /// strategies.
+    ///
+    /// Guarded by lease ownership: every publish path (per-item advance,
+    /// batch boundary, drain guard, guard-object drops, consumer teardown)
+    /// funnels through here, so a zombie shm handle whose role was
+    /// force-taken can never store its stale cursor over the successor's.
+    /// For heap anchors the check is a compile-time constant `true` and
+    /// vanishes.
     #[inline(always)]
     pub(crate) fn flush(&mut self) {
+        if !self.anchor.owns_ring() {
+            // Mark as published so retry paths don't spin on the dead lease.
+            self.published = self.read_cursor;
+            return;
+        }
         // SAFETY: `reader` is a `NonNull` into the live `inner`.
         unsafe { (*self.reader.as_ptr()).store(self.read_cursor, Ordering::Release) };
         self.published = self.read_cursor;

@@ -34,7 +34,14 @@ fn pin(core: usize) {
         let mut set: libc::cpu_set_t = std::mem::zeroed();
         libc::CPU_ZERO(&mut set);
         libc::CPU_SET(core, &mut set);
-        libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
+        // Reported numbers claim to be pinned; a silent failure (offline
+        // core, cgroup cpuset) would publish unpinned results as pinned.
+        assert_eq!(
+            libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set),
+            0,
+            "failed to pin to core {core}: {}",
+            std::io::Error::last_os_error()
+        );
     }
 }
 

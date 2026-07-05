@@ -105,12 +105,12 @@ unsafe fn decode_record(base: *const u8, mask: usize, mut cur: usize) -> (usize,
     let mut pos = cur & mask;
     // SAFETY: header reads are 4-aligned (records and padding are ALIGN
     // multiples, base is 8-aligned) and in bounds via the mask.
-    let mut header = unsafe { base.add(pos).cast::<u32>().read() };
+    let mut header = u32::from_le(unsafe { base.add(pos).cast::<u32>().read() });
     if header == PADDING {
         cur = cur.wrapping_add((mask + 1) - pos);
         pos = 0;
         // SAFETY: as above, at offset zero.
-        header = unsafe { base.cast::<u32>().read() };
+        header = u32::from_le(unsafe { base.cast::<u32>().read() });
         debug_assert!(header != PADDING, "padding is never followed by padding");
     }
     let len = header as usize;
@@ -336,12 +336,14 @@ where
         unsafe {
             if pad > 0 {
                 // `frame` only pads mid-buffer, where at least HEADER bytes
-                // remain before the end.
-                base.add(cur & mask).cast::<u32>().write(PADDING);
+                // remain before the end. (PADDING is all-ones: endian-proof.)
+                base.add(cur & mask).cast::<u32>().write(PADDING.to_le());
                 cur = cur.wrapping_add(pad); // now at a capacity boundary
             }
             let pos = cur & mask;
-            base.add(pos).cast::<u32>().write(len as u32);
+            // Headers are little-endian on every target, as the module docs
+            // promise (free on LE machines; a byte swap on BE ones).
+            base.add(pos).cast::<u32>().write((len as u32).to_le());
             if let Some(src) = src {
                 std::ptr::copy_nonoverlapping(src, base.add(pos + HEADER), len);
             }

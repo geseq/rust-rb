@@ -21,6 +21,7 @@
 //! 32   arch_bits u32      usize width; cross-arch attach is rejected
 //! 40   producer_lease u64 (atomic) opaque token of the producer holder, 0 = free
 //! 48   consumer_lease u64 (atomic) opaque token of the consumer holder, 0 = free
+//! 56   generation u64 (atomic) seqlock: odd while (re)initializing
 //! 128  write_cursor  usize (atomic, own 128-byte slot)
 //! 256  read_cursor   usize (atomic, own 128-byte slot)
 //! 384  buffer        capacity * unit_size bytes
@@ -87,6 +88,12 @@ const OFF_UNIT_SIZE: usize = 24;
 const OFF_ARCH_BITS: usize = 32;
 const OFF_PRODUCER_LEASE: usize = 40;
 const OFF_CONSUMER_LEASE: usize = 48;
+/// Seqlock-style initialization generation: odd while `create_shm` is
+/// (re)writing the header, bumped to even when complete. Validators read it
+/// before their header reads and re-check after reads and lease claims; any
+/// change (or an odd value) means a concurrent re-create, and the attach
+/// fails rather than trusting a chimera of old and new fields.
+const OFF_GENERATION: usize = 56;
 const OFF_WRITE_CURSOR: usize = 128;
 const OFF_READ_CURSOR: usize = 256;
 /// Buffer start: past the cursor slots, 128-byte aligned (mappings are
@@ -289,12 +296,29 @@ fn lease_token() -> u64 {
 
 /// Claim a free `role` in the region. Fails with `AddrInUse` if any holder's
 /// token is present — cooperative exclusivity, no liveness guessing.
-fn claim_lease(region: &ShmRegion, role: Role) -> io::Result<u64> {
+/// `generation` is the seqlock snapshot from validation: if `create_shm`
+/// re-initialized the region between the header reads and this claim, the
+/// claim is rolled back and the attach fails — otherwise the creator's
+/// unconditional lease stores could silently overwrite ours, leaving two
+/// holders of one role.
+fn claim_lease(region: &ShmRegion, role: Role, generation: u64) -> io::Result<u64> {
     // SAFETY: lease offsets are 8-aligned and inside the mapping.
     let lease: &AtomicU64 = unsafe { region.atomic(role.lease_offset()) };
     let token = lease_token();
     match lease.compare_exchange(0, token, Ordering::AcqRel, Ordering::Acquire) {
-        Ok(_) => Ok(token),
+        Ok(_) => {
+            // SAFETY: OFF_GENERATION is 8-aligned and inside the mapping.
+            let gen_now =
+                unsafe { region.atomic::<AtomicU64>(OFF_GENERATION) }.load(Ordering::Acquire);
+            if gen_now != generation {
+                let _ = lease.compare_exchange(token, 0, Ordering::AcqRel, Ordering::Acquire);
+                return Err(io::Error::new(
+                    io::ErrorKind::AddrInUse,
+                    "ring was re-initialized during attach",
+                ));
+            }
+            Ok(token)
+        }
         Err(_) => Err(io::Error::new(
             io::ErrorKind::AddrInUse,
             "ring role already held (drop the existing handle, or use the \
@@ -341,10 +365,16 @@ fn create_region(
     // attacher in another process no ordering at all.
     // SAFETY: all header offsets are naturally aligned and inside the mapping.
     let (producer_token, consumer_token) = unsafe {
-        // Invalidate any previous ring in this fd FIRST (SeqCst store: must
-        // neither be elided nor sink past the field stores), so a concurrent
-        // validator can only ever observe "no ring" or a complete header —
-        // never the old magic over half-new fields.
+        // Seqlock write protocol: make the generation odd (initializing)
+        // BEFORE touching anything, so a concurrent validator that read any
+        // pre-clear state sees the generation change on its re-check and
+        // discards what it read — it can never act on a chimera of old and
+        // new fields, nor keep a lease the stores below overwrite.
+        let generation = region.atomic::<AtomicU64>(OFF_GENERATION);
+        let g = generation.load(Ordering::Relaxed);
+        generation.store(g | 1, Ordering::SeqCst);
+        // Invalidate any previous ring in this fd (SeqCst: neither elidable
+        // nor able to sink past the field stores).
         region
             .atomic::<AtomicU64>(OFF_MAGIC)
             .store(0, Ordering::SeqCst);
@@ -382,6 +412,8 @@ fn create_region(
         region
             .atomic::<AtomicU64>(OFF_MAGIC)
             .store(MAGIC, Ordering::Release);
+        // Seqlock close: even generation, strictly greater than before.
+        generation.store((g | 1).wrapping_add(1), Ordering::Release);
         (pt, ct)
     };
 
@@ -414,7 +446,7 @@ fn open_region(
     unit_size: usize,
     min_capacity: usize,
     cursor_align: usize,
-) -> io::Result<(Arc<ShmRegion>, usize)> {
+) -> io::Result<(Arc<ShmRegion>, usize, u64)> {
     // Touching mapped pages past the file's end is SIGBUS, not an error
     // return — validate the size before every mapping.
     let err = |m: &str| io::Error::new(io::ErrorKind::InvalidData, m.to_string());
@@ -423,6 +455,13 @@ fn open_region(
     }
     // Map just the header first to learn the capacity.
     let header = ShmRegion::map(fd, BUFFER_OFFSET)?;
+    // Seqlock read: snapshot the generation before any header read; callers
+    // re-check it after their lease claim. Odd = mid-initialization.
+    // SAFETY: OFF_GENERATION is 8-aligned and inside the mapping.
+    let generation = unsafe { header.atomic::<AtomicU64>(OFF_GENERATION) }.load(Ordering::Acquire);
+    if generation & 1 == 1 {
+        return Err(err("ring is being initialized by another process"));
+    }
     if header.read_magic() != MAGIC {
         return Err(err("bad magic: not a rust-rb shm ring"));
     }
@@ -463,7 +502,13 @@ fn open_region(
     if write % cursor_align != 0 || read % cursor_align != 0 {
         return Err(err("corrupt cursors: not record-aligned"));
     }
-    Ok((Arc::new(region), capacity))
+    // Seqlock re-check on the full mapping: if the header changed while we
+    // were reading it, everything above may be a chimera.
+    // SAFETY: OFF_GENERATION is 8-aligned and inside the mapping.
+    if unsafe { region.atomic::<AtomicU64>(OFF_GENERATION) }.load(Ordering::Acquire) != generation {
+        return Err(err("ring was re-initialized during validation"));
+    }
+    Ok((Arc::new(region), capacity, generation))
 }
 
 impl ShmRegion {
@@ -594,7 +639,7 @@ where
     P: CrossProcess + Send + Sync,
     C: CrossProcess + Send + Sync,
 {
-    fn open(fd: BorrowedFd<'_>) -> io::Result<(Arc<ShmRegion>, usize)> {
+    fn open(fd: BorrowedFd<'_>) -> io::Result<(Arc<ShmRegion>, usize, u64)> {
         open_region(fd, KIND_BYTES, 1, BYTES_MIN_CAPACITY, BYTES_CURSOR_ALIGN)
     }
 
@@ -634,8 +679,8 @@ where
     /// producer handle exists (the lease enforces this against cooperating
     /// processes only).
     pub unsafe fn attach_shm_producer(fd: BorrowedFd<'_>) -> io::Result<BytesProducer<P, C>> {
-        let (region, capacity) = Self::open(fd)?;
-        let token = claim_lease(&region, Role::Producer)?;
+        let (region, capacity, generation) = Self::open(fd)?;
+        let token = claim_lease(&region, Role::Producer, generation)?;
         // SAFETY: validated byte-ring region.
         Ok(unsafe {
             BytesProducer::from_core(shm_producer_core::<Word, P, C>(region, capacity, token))
@@ -649,8 +694,8 @@ where
     ///
     /// Trust model, plus single-consumer.
     pub unsafe fn attach_shm_consumer(fd: BorrowedFd<'_>) -> io::Result<BytesConsumer<P, C>> {
-        let (region, capacity) = Self::open(fd)?;
-        let token = claim_lease(&region, Role::Consumer)?;
+        let (region, capacity, generation) = Self::open(fd)?;
+        let token = claim_lease(&region, Role::Consumer, generation)?;
         // SAFETY: validated byte-ring region.
         Ok(unsafe {
             BytesConsumer::from_core(shm_consumer_core::<Word, P, C>(region, capacity, token))
@@ -667,7 +712,7 @@ where
     /// Trust model, plus: unconditional takeover — the caller asserts the
     /// previous producer is gone (a live one would corrupt the ring).
     pub unsafe fn force_attach_shm_producer(fd: BorrowedFd<'_>) -> io::Result<BytesProducer<P, C>> {
-        let (region, capacity) = Self::open(fd)?;
+        let (region, capacity, _generation) = Self::open(fd)?;
         let token = force_claim_lease(&region, Role::Producer);
         // SAFETY: validated byte-ring region.
         Ok(unsafe {
@@ -687,7 +732,7 @@ where
     /// As for [`force_attach_shm_producer`](Self::force_attach_shm_producer),
     /// for the consumer role.
     pub unsafe fn force_attach_shm_consumer(fd: BorrowedFd<'_>) -> io::Result<BytesConsumer<P, C>> {
-        let (region, capacity) = Self::open(fd)?;
+        let (region, capacity, _generation) = Self::open(fd)?;
         let token = force_claim_lease(&region, Role::Consumer);
         // SAFETY: validated byte-ring region.
         Ok(unsafe {
@@ -702,7 +747,7 @@ where
     ///
     /// See [`recover_shm`](BytesRingBuffer::recover_shm).
     pub unsafe fn recover_shm_with(fd: BorrowedFd<'_>) -> io::Result<BytesPair<P, C>> {
-        let (region, capacity) = Self::open(fd)?;
+        let (region, capacity, _generation) = Self::open(fd)?;
         // Unconditional: force both roles. No partial-failure path exists
         // (force cannot fail), so no lease can leak.
         let pt = force_claim_lease(&region, Role::Producer);
@@ -762,7 +807,7 @@ where
     P: CrossProcess + Send + Sync,
     C: CrossProcess + Send + Sync,
 {
-    fn open(fd: BorrowedFd<'_>) -> io::Result<(Arc<ShmRegion>, usize)> {
+    fn open(fd: BorrowedFd<'_>) -> io::Result<(Arc<ShmRegion>, usize, u64)> {
         // The invariants create_shm_with asserts must hold on ATTACH too —
         // an attacher instantiated with a different `T` of the same size but
         // higher alignment would otherwise get misaligned slots (UB).
@@ -814,8 +859,8 @@ where
     /// Trust model, plus single-producer, plus `T` must be the exact type
     /// the ring was created with (only its size is validated).
     pub unsafe fn attach_shm_producer(fd: BorrowedFd<'_>) -> io::Result<Producer<T, P, C>> {
-        let (region, capacity) = Self::open(fd)?;
-        let token = claim_lease(&region, Role::Producer)?;
+        let (region, capacity, generation) = Self::open(fd)?;
+        let token = claim_lease(&region, Role::Producer, generation)?;
         // SAFETY: validated element-ring region.
         Ok(unsafe {
             Producer::from_core(shm_producer_core::<Slot<T>, P, C>(region, capacity, token))
@@ -828,8 +873,8 @@ where
     ///
     /// As for [`attach_shm_producer`](Self::attach_shm_producer).
     pub unsafe fn attach_shm_consumer(fd: BorrowedFd<'_>) -> io::Result<Consumer<T, P, C>> {
-        let (region, capacity) = Self::open(fd)?;
-        let token = claim_lease(&region, Role::Consumer)?;
+        let (region, capacity, generation) = Self::open(fd)?;
+        let token = claim_lease(&region, Role::Consumer, generation)?;
         // SAFETY: validated element-ring region.
         Ok(unsafe {
             Consumer::from_core(shm_consumer_core::<Slot<T>, P, C>(region, capacity, token))
@@ -844,7 +889,7 @@ where
     /// See [`BytesRingBuffer::force_attach_shm_producer`], plus the `T`
     /// caveat of [`attach_shm_producer`](Self::attach_shm_producer).
     pub unsafe fn force_attach_shm_producer(fd: BorrowedFd<'_>) -> io::Result<Producer<T, P, C>> {
-        let (region, capacity) = Self::open(fd)?;
+        let (region, capacity, _generation) = Self::open(fd)?;
         let token = force_claim_lease(&region, Role::Producer);
         // SAFETY: validated element-ring region.
         Ok(unsafe {
@@ -861,7 +906,7 @@ where
     /// See [`BytesRingBuffer::force_attach_shm_consumer`], plus the `T`
     /// caveat of [`attach_shm_producer`](Self::attach_shm_producer).
     pub unsafe fn force_attach_shm_consumer(fd: BorrowedFd<'_>) -> io::Result<Consumer<T, P, C>> {
-        let (region, capacity) = Self::open(fd)?;
+        let (region, capacity, _generation) = Self::open(fd)?;
         let token = force_claim_lease(&region, Role::Consumer);
         // SAFETY: validated element-ring region.
         Ok(unsafe {
@@ -877,7 +922,7 @@ where
     /// See [`BytesRingBuffer::recover_shm`], plus the `T` caveat of
     /// [`attach_shm_producer`](Self::attach_shm_producer).
     pub unsafe fn recover_shm_with(fd: BorrowedFd<'_>) -> io::Result<ElemPair<T, P, C>> {
-        let (region, capacity) = Self::open(fd)?;
+        let (region, capacity, _generation) = Self::open(fd)?;
         let pt = force_claim_lease(&region, Role::Producer);
         let ct = force_claim_lease(&region, Role::Consumer);
         // SAFETY: validated element-ring region.

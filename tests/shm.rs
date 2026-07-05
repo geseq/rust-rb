@@ -162,9 +162,10 @@ fn crash_child_entry() {
     for seq in 0..100u32 {
         tx.push(&seq.to_le_bytes());
     }
-    // Simulated crash: exit without running any destructors — leases stay
-    // set to our (soon dead) pid, deferred consumer state is irrelevant, and
-    // only the producer's published cursor matters.
+    // Simulated crash: exit without running any destructors — the role
+    // leases keep their (opaque, meaningless-after-death) tokens, deferred
+    // consumer state is irrelevant, and only the producer's published cursor
+    // matters.
     std::process::exit(0);
 }
 
