@@ -15,26 +15,39 @@
 //! 0    magic     u64      "rust_rb1"
 //! 8    version   u32
 //! 12   kind      u32      1 = byte ring, 2 = element ring,
-//!                         3 = SPMC byte ring, 4 = SPMC element ring
+//!                         3 = SPMC byte ring, 4 = SPMC element ring,
+//!                         5 = broadcast element ring, 6 = broadcast byte ring
 //! 16   capacity  u64      cursor units (power of two)
 //! 24   unit_size u64      bytes per cursor unit (1, or size_of::<T>())
 //! 32   arch_bits u32      usize width; cross-arch attach is rejected
-//! 36   max_consumers u32  SPMC kinds only: consumer-table slots (>= 1)
+//! 36   max_consumers u32  SPMC kinds only: consumer-table slots (>= 1);
+//!                         0 on every other kind (broadcast membership is
+//!                         unbounded — consumers keep no shared state)
 //! 40   producer_lease u64 (atomic) opaque token of the producer holder, 0 = free
 //! 48   consumer_lease u64 (atomic) opaque token of the consumer holder, 0 = free
-//!                         (SPSC kinds only; SPMC leases are per table slot)
+//!                         (SPSC kinds only; SPMC leases are per table slot;
+//!                         broadcast consumers are lease-free)
 //! 56   generation u64 (atomic) seqlock: odd while (re)initializing
 //! 128  write_cursor  usize (atomic, own 128-byte slot)
-//! 136  closed    usize (atomic) SPMC kinds: graceful-close flag (in the
-//!                         write-cursor slot — the line consumers poll)
+//!                         broadcast kinds: the u64 `tail` (count of
+//!                         published messages / committed bytes) — the one
+//!                         line consumers spin on
+//! 136  closed    usize (atomic) SPMC + broadcast kinds: graceful-close flag
+//!                         (in the write-cursor slot — the line consumers
+//!                         poll)
 //! 144  aux       usize (atomic) SPMC kinds: starving flag (byte ring) /
 //!                         dropped_through (element ring; unused, `ShmItem`
-//!                         has no drop) — same padded slot
+//!                         has no drop) — same padded slot.
+//!                         Broadcast element kind: the u64 reposition slack
+//!                         (create-time config, read once at attach).
 //! 256  read_cursor   usize (atomic, own 128-byte slot; SPSC kinds only)
+//!                         broadcast BYTE kind: the u64 `tail_intent`
+//!                         (declared write frontier, own padded slot)
 //! 264  starving  usize (atomic) producer out-of-space signal (in read slot;
 //!                         SPSC kinds only)
-//! SPSC kinds:
-//! 384  buffer        capacity * unit_size bytes
+//! SPSC kinds + broadcast element kind (5):
+//! 384  buffer        capacity * unit_size bytes (SPSC), or capacity slots
+//!                    (broadcast elements; see the slot-stride math below)
 //! SPMC kinds:
 //! 384  consumer table: max_consumers slots of 128 bytes, each
 //!        +0  lease   u64  (atomic) opaque token of the slot holder, 0 = free
@@ -45,7 +58,44 @@
 //!      (one line per consumer: the producer's scan reads control + cursor
 //!       from the line the consumer's flush already owns)
 //! 384 + 128 * max_consumers  buffer  capacity * unit_size bytes
+//! Broadcast byte kind (6):
+//! 384  latest    u64 (atomic) start of the most recent record — the
+//!                    lap-recovery jump target, own 128-byte slot
+//! 512  buffer        capacity bytes
 //! ```
+//!
+//! Broadcast element slot-stride math (kind 5): each of the `capacity` slots
+//! is the heap ring's `repr(C)` `{ seq: AtomicU64, payload: T-storage }`, so
+//! the physical stride is `align_up(max(8, align_of::<T>()) + size_of::<T>(),
+//! max(8, align_of::<T>()))` — the payload sits at offset `max(8, align)`
+//! (`repr(C)` pads between the seq word and an over-aligned payload) and the
+//! whole slot rounds to the slot alignment; in code this is simply
+//! `size_of::<Slot<T>>()`, which equals it by construction. The header's `unit_size` records `size_of::<T>()` (the
+//! stronger type check); both create and open recompute the stride from the
+//! instantiated `T`, and the region-length validation catches a stride
+//! mismatch (same-size, higher-alignment `T`s inflate the required length).
+//!
+//! # Broadcast kinds: lossy rings, read-only lease-free consumers
+//!
+//! The broadcast kinds (5/6) back [`crate::broadcast`] and
+//! [`crate::broadcast_bytes`]. Only the **producer** is a role: it takes the
+//! producer lease exactly like every other ring. Consumers are pure readers
+//! with no shared state at all — [`attach_shm_consumer`](crate::broadcast::RingBuffer::attach_shm_consumer)
+//! validates the header, maps the region **`PROT_READ`**, takes **no
+//! lease**, and never writes a byte; membership is unbounded and dropping a
+//! consumer is just `munmap`. The read-only mapping is also the enforcement:
+//! any store regression in the consumer path is a deterministic SIGSEGV.
+//!
+//! Like the SPMC kinds, the broadcast `closed` flag is **end-of-session**,
+//! not terminal: a new producer attach resets it and the ring is open again
+//! (a *crashed* producer never sets it at all — crash detection stays
+//! lease/watchdog territory). Producer crash recovery is
+//! `force_attach_shm_producer` (or `recover_shm`, the same thing here:
+//! consumers keep no shared state, so there is nothing else to reset).
+//! Everything published stays drainable throughout; a consumer racing the
+//! recovered producer self-heals via the ordinary validation (slot seqlock
+//! generations on the element ring; the declared-intent window — kept
+//! monotonic across producer sessions — on the byte ring).
 //!
 //! All multi-byte fields use the host's **native** byte order, and a region is
 //! **same-host only**: the producer and consumer are two processes on one
@@ -115,6 +165,8 @@ const KIND_BYTES: u32 = 1;
 const KIND_ELEMS: u32 = 2;
 const KIND_SPMC_BYTES: u32 = 3;
 const KIND_SPMC_ELEMS: u32 = 4;
+const KIND_BCAST_ELEMS: u32 = 5;
+const KIND_BCAST_BYTES: u32 = 6;
 
 const OFF_MAGIC: usize = 0;
 const OFF_VERSION: usize = 8;
@@ -152,6 +204,32 @@ const OFF_READ_CURSOR: usize = 256;
 /// Buffer start: past the cursor slots, 128-byte aligned (mappings are
 /// page-aligned, so every offset here is honored in memory).
 const BUFFER_OFFSET: usize = 384;
+
+// --- Broadcast counter geometry (kinds 5/6) ----------------------------------
+
+/// Broadcast kinds: the u64 tail (the write-cursor slot — every kind's
+/// producer-published line).
+const OFF_BCAST_TAIL: usize = OFF_WRITE_CURSOR;
+/// Broadcast kinds: the graceful-close word, co-resident in the tail's
+/// padded slot (the one line consumers spin on) — the same offset as the
+/// SPMC closed word.
+const OFF_BCAST_CLOSED: usize = OFF_WRITE_CURSOR + 8;
+/// Broadcast element kind: the reposition slack (a create-time constructor
+/// knob every consumer inherits, validated `< capacity` on attach). Parked
+/// in the tail slot's third word — written only at create, so it adds no
+/// write traffic to the polled line.
+const OFF_BCAST_SLACK: usize = OFF_WRITE_CURSOR + 16;
+/// Broadcast byte kind: `tail_intent` (the declared write frontier, stored
+/// per push, loaded twice per pop) in its own 128-byte slot — the SPSC
+/// read-cursor slot, which is meaningless for a lossy ring.
+const OFF_BCAST_INTENT: usize = OFF_READ_CURSOR;
+/// Broadcast byte kind: `latest` (the lap-recovery jump target, stored per
+/// push) in its own 128-byte slot after the intent's — which pushes the
+/// byte kind's buffer start to 512.
+const OFF_BCAST_LATEST: usize = 384;
+/// Broadcast byte kind's buffer start (the element kind keeps the common
+/// [`BUFFER_OFFSET`]: it needs no third counter slot).
+const BCAST_BYTES_BUFFER_OFFSET: usize = 512;
 
 // --- SPMC consumer table geometry (kinds 3/4) --------------------------------
 
@@ -308,12 +386,24 @@ impl Drop for ShmRegion {
 
 impl ShmRegion {
     fn map(fd: BorrowedFd<'_>, len: usize) -> io::Result<Self> {
+        Self::map_prot(fd, len, libc::PROT_READ | libc::PROT_WRITE)
+    }
+
+    /// Map `len` bytes of `fd` **read-only**. The broadcast kinds' consumer
+    /// attach uses this: a lossy consumer is a pure reader, and the
+    /// `PROT_READ` mapping turns any accidental store in its path into a
+    /// deterministic SIGSEGV [P-F8].
+    fn map_read_only(fd: BorrowedFd<'_>, len: usize) -> io::Result<Self> {
+        Self::map_prot(fd, len, libc::PROT_READ)
+    }
+
+    fn map_prot(fd: BorrowedFd<'_>, len: usize, prot: libc::c_int) -> io::Result<Self> {
         // SAFETY: length is non-zero and the fd is valid for the borrow.
         let ptr = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
                 len,
-                libc::PROT_READ | libc::PROT_WRITE,
+                prot,
                 libc::MAP_SHARED,
                 fd.as_raw_fd(),
                 0,
@@ -789,6 +879,52 @@ impl ShmRegion {
     pub(crate) fn spmc_buffer(&self, max_consumers: usize) -> NonNull<u8> {
         NonNull::new(self.at(SPMC_TABLE_OFFSET + max_consumers * SPMC_SLOT_STRIDE))
             .expect("mapping is non-null")
+    }
+
+    // --- Broadcast accessors (meaningful only over regions of the
+    //     broadcast kinds; offsets are validated header geometry, inside
+    //     any mapping that passed `open_bcast_region`/`create_bcast_region`.
+    //     Consumers hold these through read-only mappings: loads only.) ---
+
+    /// The broadcast tail (published message count / committed bytes).
+    pub(crate) fn bcast_tail(&self) -> &AtomicU64 {
+        // SAFETY: OFF_BCAST_TAIL is 8-aligned and inside the mapping.
+        unsafe { self.atomic(OFF_BCAST_TAIL) }
+    }
+
+    /// The broadcast graceful-close word (0 = open).
+    pub(crate) fn bcast_closed(&self) -> &AtomicU64 {
+        // SAFETY: OFF_BCAST_CLOSED is 8-aligned and inside the mapping.
+        unsafe { self.atomic(OFF_BCAST_CLOSED) }
+    }
+
+    /// The broadcast element ring's reposition slack (create-time config).
+    pub(crate) fn bcast_slack(&self) -> u64 {
+        self.read_u64(OFF_BCAST_SLACK)
+    }
+
+    /// The broadcast byte ring's `tail_intent` (declared write frontier).
+    pub(crate) fn bcast_intent(&self) -> &AtomicU64 {
+        // SAFETY: OFF_BCAST_INTENT is 8-aligned and inside the mapping.
+        unsafe { self.atomic(OFF_BCAST_INTENT) }
+    }
+
+    /// The broadcast byte ring's `latest` (lap-recovery jump target).
+    pub(crate) fn bcast_latest(&self) -> &AtomicU64 {
+        // SAFETY: OFF_BCAST_LATEST is 8-aligned and inside the mapping.
+        unsafe { self.atomic(OFF_BCAST_LATEST) }
+    }
+
+    /// Base of a broadcast element region's slot buffer (128-byte aligned;
+    /// slot alignment above 128 is rejected at construction).
+    pub(crate) fn bcast_elem_buffer(&self) -> NonNull<u8> {
+        NonNull::new(self.at(BUFFER_OFFSET)).expect("mapping is non-null")
+    }
+
+    /// Base of a broadcast byte region's buffer (past the third counter
+    /// slot).
+    pub(crate) fn bcast_bytes_buffer(&self) -> NonNull<u8> {
+        NonNull::new(self.at(BCAST_BYTES_BUFFER_OFFSET)).expect("mapping is non-null")
     }
 }
 
@@ -2306,6 +2442,709 @@ where
                 ),
             ))
         }
+    }
+}
+
+// =============================================================================
+// LOSSY broadcast rings (kinds 5/6): producer lease only, read-only
+// lease-free consumers.
+// =============================================================================
+//
+// The producer role reuses the SPSC lease at `OFF_PRODUCER_LEASE` verbatim.
+// There is no consumer-side shared state whatsoever [§3.4/§3.7]: consumers
+// attach over a PROT_READ mapping, take no lease, write nothing, and are
+// unbounded in count — their drop is just an munmap. That is also why
+// `recover_shm` degenerates to force-attaching the producer: there is
+// nothing else to reset.
+
+/// Region length for a broadcast ring: header (+ counter slots) + buffer.
+/// `stride` is the bytes one capacity unit occupies in the file — the slot
+/// stride for the element kind (seq word + payload, see the module docs'
+/// layout math), 1 for the byte kind.
+fn bcast_region_len(capacity: usize, stride: usize, buffer_offset: usize) -> io::Result<usize> {
+    let len = capacity
+        .checked_mul(stride)
+        .and_then(|b| b.checked_add(buffer_offset))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "capacity overflows region"))?;
+    // Same off_t clamp as `region_len` (32-bit sign-flip guard).
+    if len as u64 > libc::off_t::MAX as u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "region length exceeds the platform file-offset limit",
+        ));
+    }
+    Ok(len)
+}
+
+/// Initialize a fresh broadcast region: size the fd, map it, write the
+/// header (zeroed counters, the element kind's slack) and a zeroed buffer,
+/// take the producer lease — the only lease a broadcast ring has. The
+/// seqlock write protocol is identical to `create_region`'s.
+fn create_bcast_region(
+    fd: BorrowedFd<'_>,
+    kind: u32,
+    capacity: usize,
+    unit_size: usize,
+    stride: usize,
+    buffer_offset: usize,
+    slack: u64,
+) -> io::Result<(Arc<ShmRegion>, u64)> {
+    let len = bcast_region_len(capacity, stride, buffer_offset)?;
+    // SAFETY: valid fd for the borrow; `bcast_region_len` confirmed `len`
+    // fits off_t.
+    if unsafe { libc::ftruncate(fd.as_raw_fd(), len as libc::off_t) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let region = ShmRegion::map(fd, len)?;
+
+    // SAFETY: all header offsets are naturally aligned and inside the
+    // mapping (see `create_region` for the seqlock/atomics rationale).
+    let producer_token = unsafe {
+        // Seqlock open: odd generation before touching anything.
+        let generation = region.atomic::<AtomicU64>(OFF_GENERATION);
+        let g = generation.load(Ordering::Relaxed);
+        generation.store(g | 1, Ordering::SeqCst);
+        region
+            .atomic::<AtomicU64>(OFF_MAGIC)
+            .store(0, Ordering::SeqCst);
+        region
+            .atomic::<AtomicU32>(OFF_VERSION)
+            .store(VERSION, Ordering::Relaxed);
+        region
+            .atomic::<AtomicU32>(OFF_KIND)
+            .store(kind, Ordering::Relaxed);
+        region
+            .atomic::<AtomicU64>(OFF_CAPACITY)
+            .store(capacity as u64, Ordering::Relaxed);
+        region
+            .atomic::<AtomicU64>(OFF_UNIT_SIZE)
+            .store(unit_size as u64, Ordering::Relaxed);
+        region
+            .atomic::<AtomicU32>(OFF_ARCH_BITS)
+            .store(usize::BITS, Ordering::Relaxed);
+        // No consumer table: membership is unbounded (pure readers).
+        region
+            .atomic::<AtomicU32>(OFF_MAX_CONSUMERS)
+            .store(0, Ordering::Relaxed);
+        let pt = lease_token();
+        region
+            .atomic::<AtomicU64>(OFF_PRODUCER_LEASE)
+            .store(pt, Ordering::Relaxed);
+        // The SPSC consumer lease is unused by broadcast kinds (consumers
+        // are lease-free); keep it deterministically zero.
+        region
+            .atomic::<AtomicU64>(OFF_CONSUMER_LEASE)
+            .store(0, Ordering::Relaxed);
+        // Counters + buffer: zero wholesale from the cursor area down
+        // (tail, closed, slack, intent, latest, buffer — also pre-faults
+        // every page and matches the heap rings' zeroed-buffer guarantee:
+        // the byte ring's lapped readers legitimately load bytes the
+        // producer never wrote, and an element slot's seq 0 is below every
+        // accepted generation). Still pre-publish: a racing validator sees
+        // the odd generation and discards.
+        std::ptr::write_bytes(region.at(OFF_WRITE_CURSOR), 0, len - OFF_WRITE_CURSOR);
+        region
+            .atomic::<AtomicU64>(OFF_BCAST_SLACK)
+            .store(slack, Ordering::Relaxed);
+        // Publish the magic last with Release, then close the seqlock.
+        region
+            .atomic::<AtomicU64>(OFF_MAGIC)
+            .store(MAGIC, Ordering::Release);
+        generation.store((g | 1).wrapping_add(1), Ordering::Release);
+        pt
+    };
+    Ok((Arc::new(region), producer_token))
+}
+
+/// A validated broadcast region plus the header facts every constructor
+/// needs.
+struct BcastOpened {
+    region: Arc<ShmRegion>,
+    capacity: usize,
+    generation: u64,
+    slack: u64,
+}
+
+/// Map and validate an existing broadcast region (the broadcast face of
+/// `open_region`). `read_only` selects the consumer's `PROT_READ` mapping —
+/// this path performs **no writes at all** (no lease claim, no cursor
+/// touch), so it works over either protection. There is no occupancy check:
+/// a lossy ring has no consumer cursors to judge, and the tail is a bare
+/// monotonic count (only its record alignment is checked, on the byte
+/// kind).
+// One geometry knob per header invariant; a param struct would only re-name
+// the call sites (there are exactly two, one per kind).
+#[allow(clippy::too_many_arguments)]
+fn open_bcast_region(
+    fd: BorrowedFd<'_>,
+    kind: u32,
+    unit_size: usize,
+    stride: usize,
+    buffer_offset: usize,
+    min_capacity: usize,
+    tail_align: u64,
+    read_only: bool,
+) -> io::Result<BcastOpened> {
+    let err = |m: &str| io::Error::new(io::ErrorKind::InvalidData, m.to_string());
+    let file_len = fd_len(fd)?;
+    if file_len < BUFFER_OFFSET as u64 {
+        return Err(err("region too small to hold a ring header"));
+    }
+    // Map just the header first to learn the capacity (read-only: this probe
+    // never writes, whichever role is attaching).
+    let header = ShmRegion::map_read_only(fd, BUFFER_OFFSET)?;
+    // Seqlock read (see `open_region`).
+    // SAFETY: OFF_GENERATION is 8-aligned and inside the mapping.
+    let generation = unsafe { header.atomic::<AtomicU64>(OFF_GENERATION) }.load(Ordering::Acquire);
+    if generation & 1 == 1 {
+        return Err(err("ring is being initialized by another process"));
+    }
+    if header.read_magic() != MAGIC {
+        return Err(err("bad magic: not a rust-rb shm ring"));
+    }
+    if header.read_u32(OFF_VERSION) != VERSION {
+        return Err(err("unsupported ring version"));
+    }
+    if header.read_u32(OFF_KIND) != kind {
+        return Err(err("ring kind mismatch"));
+    }
+    if unit_size == 0 {
+        return Err(err("zero-sized elements are not supported in shm rings"));
+    }
+    if header.read_u64(OFF_UNIT_SIZE) != unit_size as u64 {
+        return Err(err("element size mismatch"));
+    }
+    if header.read_u32(OFF_ARCH_BITS) != usize::BITS {
+        return Err(err("architecture (usize width) mismatch"));
+    }
+    let capacity = header.read_u64(OFF_CAPACITY) as usize;
+    if capacity == 0 || !capacity.is_power_of_two() || capacity < min_capacity {
+        return Err(err("corrupt capacity"));
+    }
+    // The slack is meaningful on the element kind (the byte kind writes 0);
+    // `slack < capacity` is the constructor invariant either way.
+    let slack = header.read_u64(OFF_BCAST_SLACK);
+    if slack >= capacity as u64 {
+        return Err(err("corrupt slack: not below the capacity"));
+    }
+    drop(header);
+
+    let len = bcast_region_len(capacity, stride, buffer_offset)
+        .map_err(|_| err("corrupt geometry: region length overflows"))?;
+    if file_len < len as u64 {
+        return Err(err("region smaller than its declared capacity"));
+    }
+    let region = if read_only {
+        ShmRegion::map_read_only(fd, len)?
+    } else {
+        ShmRegion::map(fd, len)?
+    };
+
+    // Alignment holds for every individually-published tail value (byte
+    // kind: committed tails are record boundaries; element kind: any count
+    // decodes, align 1).
+    if region.bcast_tail().load(Ordering::Acquire) % tail_align != 0 {
+        return Err(err("corrupt tail: not record-aligned"));
+    }
+    // Seqlock re-check on the full mapping.
+    // SAFETY: OFF_GENERATION is 8-aligned and inside the mapping.
+    if unsafe { region.atomic::<AtomicU64>(OFF_GENERATION) }.load(Ordering::Acquire) != generation {
+        return Err(err("ring was re-initialized during validation"));
+    }
+    Ok(BcastOpened {
+        region: Arc::new(region),
+        capacity,
+        generation,
+        slack,
+    })
+}
+
+/// The shm anchor for a lossy broadcast **producer**: keeps the read-write
+/// mapping alive and holds the producer role lease (same offset and
+/// discipline as every other ring's producer). It carries no consumer-side
+/// state at all — lossy consumers are lease-free pure readers, and every
+/// wait strategy lives in a ([`SelfTimed`]) consumer handle.
+pub(crate) struct BcastProducerAnchor {
+    region: Arc<ShmRegion>,
+    token: u64,
+    /// Fork guard, exactly as in [`ShmAnchor`].
+    owner_pid: libc::pid_t,
+}
+
+impl BcastProducerAnchor {
+    fn new(region: Arc<ShmRegion>, token: u64) -> Self {
+        Self {
+            region,
+            token,
+            // SAFETY: getpid is always safe.
+            owner_pid: unsafe { libc::getpid() },
+        }
+    }
+
+    pub(crate) fn region(&self) -> &Arc<ShmRegion> {
+        &self.region
+    }
+
+    /// Whether the producer lease still holds this handle's token (see
+    /// [`ShmAnchor::owns_lease`]).
+    pub(crate) fn owns_lease(&self) -> bool {
+        // SAFETY: the lease offset is 8-aligned and inside the mapping.
+        let lease: &AtomicU64 = unsafe { self.region.atomic(OFF_PRODUCER_LEASE) };
+        lease.load(Ordering::Acquire) == self.token
+    }
+
+    /// Fork guard (see [`ShmAnchor::owned_by_current_process`]).
+    pub(crate) fn owned_by_current_process(&self) -> bool {
+        // SAFETY: getpid is always safe.
+        (unsafe { libc::getpid() }) == self.owner_pid
+    }
+}
+
+impl Drop for BcastProducerAnchor {
+    fn drop(&mut self) {
+        // Guarded lease release, exactly as [`ShmAnchor`]'s: pid guard
+        // against fork copies, token CAS against force-takeovers.
+        if !self.owned_by_current_process() {
+            return;
+        }
+        // SAFETY: the lease offset is 8-aligned and inside the mapping.
+        let lease: &AtomicU64 = unsafe { self.region.atomic(OFF_PRODUCER_LEASE) };
+        let _ = lease.compare_exchange(self.token, 0, Ordering::AcqRel, Ordering::Acquire);
+    }
+}
+
+/// Claim (or force-take) the producer role over a validated broadcast
+/// region and reset the closed word — a (re)attached producer re-opens the
+/// ring (shm `Closed` is end-of-session, not terminal; only the producer
+/// ever writes that word, and we now hold its lease).
+fn bcast_attach_producer_anchor(
+    opened: &BcastOpened,
+    force: bool,
+) -> io::Result<Box<BcastProducerAnchor>> {
+    let region = Arc::clone(&opened.region);
+    let token = if force {
+        force_claim_lease(&region, Role::Producer)
+    } else {
+        claim_lease(&region, Role::Producer, opened.generation)?
+    };
+    region.bcast_closed().store(0, Ordering::Release);
+    Ok(Box::new(BcastProducerAnchor::new(region, token)))
+}
+
+/// Element-type invariants for the broadcast element ring, enforced on
+/// create AND attach (as errors — fallible paths). The slot carries the seq
+/// word in front of the payload, so the alignment bound is the *slot's*.
+fn check_bcast_elem_type<T>() -> io::Result<()> {
+    let err = |m: &str| io::Error::new(io::ErrorKind::InvalidInput, m.to_string());
+    if std::mem::size_of::<T>() == 0 {
+        return Err(err("zero-sized elements are not supported in shm rings"));
+    }
+    if crate::broadcast::shm_slot_align::<T>() > 128 {
+        return Err(err("element alignment exceeds the buffer offset alignment"));
+    }
+    Ok(())
+}
+
+/// Open a broadcast element region for `T` (shared by every constructor;
+/// `read_only` is the consumer path).
+fn open_bcast_elems<T: ShmItem + crate::broadcast::NoUninit>(
+    fd: BorrowedFd<'_>,
+    read_only: bool,
+) -> io::Result<BcastOpened> {
+    check_bcast_elem_type::<T>()?;
+    open_bcast_region(
+        fd,
+        KIND_BCAST_ELEMS,
+        std::mem::size_of::<T>(),
+        crate::broadcast::shm_slot_stride::<T>(),
+        BUFFER_OFFSET,
+        1,
+        1,
+        read_only,
+    )
+}
+
+impl<T> crate::broadcast::RingBuffer<T>
+where
+    // Both element bounds, because the two traits assert *different*
+    // directions of bit-validity: `ShmItem` says every bit pattern a
+    // cooperating peer writes is a valid `T` (cross-process reads of
+    // untrusted-by-construction memory), while `NoUninit` says every byte of
+    // a valid `T` is initialized data (the racing word-wise atomic copies
+    // read and write every byte of the representation). Neither implies the
+    // other — see their docs.
+    T: ShmItem + crate::broadcast::NoUninit + Send,
+{
+    /// Initialize `fd` as a fresh shm-backed lossy broadcast element ring
+    /// and return **the producer** (there is no initial consumer: broadcast
+    /// consumers are unbounded lease-free pure readers — attach any number
+    /// with [`attach_shm_consumer`](Self::attach_shm_consumer), each over
+    /// its own **read-only** mapping).
+    ///
+    /// The real capacity is `min_capacity` rounded up to the next power of
+    /// two; the reposition slack defaults to `capacity / 8`, clamped exactly
+    /// as the heap constructor's (see
+    /// [`create_shm_with_slack`](Self::create_shm_with_slack) for the knob).
+    ///
+    /// ```
+    /// use std::os::fd::AsFd;
+    /// use rust_rb::{broadcast, memfd};
+    /// # fn main() -> std::io::Result<()> {
+    /// let fd = memfd("bcast-doc")?;
+    /// // SAFETY: fresh private memfd, only cooperating handles touch it.
+    /// let mut tx = unsafe { broadcast::RingBuffer::<u64>::create_shm(fd.as_fd(), 64)? };
+    /// // Consumers attach lease-free, over a read-only mapping.
+    /// // SAFETY: cooperating handles only.
+    /// let mut rx = unsafe { broadcast::RingBuffer::<u64>::attach_shm_consumer(fd.as_fd())? };
+    /// tx.push(7);
+    /// assert_eq!(rx.pop(), Ok(7));
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Safety
+    ///
+    /// See [the module's trust model](self): the region must only ever be
+    /// accessed by cooperating rust-rb handles.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `min_capacity == 0`.
+    pub unsafe fn create_shm(
+        fd: BorrowedFd<'_>,
+        min_capacity: usize,
+    ) -> io::Result<crate::broadcast::Producer<T>> {
+        let capacity = crate::cursor::round_capacity(min_capacity, 1);
+        let slack = crate::broadcast::shm_default_slack(capacity as u64);
+        // SAFETY: forwarded caller contract.
+        unsafe { Self::create_shm_with_slack(fd, min_capacity, slack as usize) }
+    }
+
+    /// [`create_shm`](Self::create_shm) with an explicit reposition `slack`
+    /// [A-3.2] — the create-time knob every consumer of this ring inherits
+    /// (it is stored in the region header and validated on attach). See
+    /// [`crate::broadcast::RingBuffer::with_slack`] for the semantics.
+    ///
+    /// # Safety
+    ///
+    /// See [`create_shm`](Self::create_shm).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `min_capacity == 0`. Unlike the heap constructor,
+    /// `slack >= capacity` is an **error** (`InvalidInput`), not a panic —
+    /// shm constructors surface misuse on their fallible path.
+    pub unsafe fn create_shm_with_slack(
+        fd: BorrowedFd<'_>,
+        min_capacity: usize,
+        slack: usize,
+    ) -> io::Result<crate::broadcast::Producer<T>> {
+        check_bcast_elem_type::<T>()?;
+        let capacity = crate::cursor::round_capacity(min_capacity, 1);
+        if slack >= capacity {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "slack must be less than the capacity",
+            ));
+        }
+        let (region, producer_token) = create_bcast_region(
+            fd,
+            KIND_BCAST_ELEMS,
+            capacity,
+            std::mem::size_of::<T>(),
+            crate::broadcast::shm_slot_stride::<T>(),
+            BUFFER_OFFSET,
+            slack as u64,
+        )?;
+        let anchor = Box::new(BcastProducerAnchor::new(region, producer_token));
+        // SAFETY: freshly initialized region matches this ring's layout.
+        Ok(unsafe { crate::broadcast::Producer::from_shm(anchor, capacity) })
+    }
+
+    /// Attach to an existing broadcast element ring as the producer. Fails
+    /// with `AddrInUse` while the producer lease is held; resets the
+    /// graceful `closed` flag (the ring is open again — shm `Closed` is
+    /// end-of-session, and live consumers simply see the new session).
+    /// Publishing resumes exactly after the last published message.
+    ///
+    /// # Safety
+    ///
+    /// Trust model, plus single-producer, plus `T` must be the exact type
+    /// the ring was created with (only its size is validated).
+    pub unsafe fn attach_shm_producer(
+        fd: BorrowedFd<'_>,
+    ) -> io::Result<crate::broadcast::Producer<T>> {
+        let opened = open_bcast_elems::<T>(fd, false)?;
+        let anchor = bcast_attach_producer_anchor(&opened, false)?;
+        // SAFETY: region validated by the open; forwarded caller contract.
+        Ok(unsafe { crate::broadcast::Producer::from_shm(anchor, opened.capacity) })
+    }
+
+    /// Unconditionally take over the producer role — crash recovery while
+    /// consumers keep running (they need no help: everything published
+    /// stays drainable, and a reader racing the recovered producer's
+    /// re-publishes self-heals via the slot seqlock generations).
+    ///
+    /// # Safety
+    ///
+    /// Trust model, plus: unconditional takeover — the caller asserts the
+    /// previous producer is gone (a live one would corrupt the ring), plus
+    /// the `T` caveat of [`attach_shm_producer`](Self::attach_shm_producer).
+    pub unsafe fn force_attach_shm_producer(
+        fd: BorrowedFd<'_>,
+    ) -> io::Result<crate::broadcast::Producer<T>> {
+        let opened = open_bcast_elems::<T>(fd, false)?;
+        let anchor = bcast_attach_producer_anchor(&opened, true)?;
+        // SAFETY: region validated by the open; forwarded caller contract.
+        Ok(unsafe { crate::broadcast::Producer::from_shm(anchor, opened.capacity) })
+    }
+
+    /// Unconditionally take over an existing broadcast ring — the same
+    /// operation as
+    /// [`force_attach_shm_producer`](Self::force_attach_shm_producer),
+    /// under the crate-wide recovery name: the producer is a broadcast
+    /// ring's **only** role, and consumers keep no shared state, so there
+    /// is nothing else to reset. (Contrast `recover_shm` on the SPSC/SPMC
+    /// rings, which must also reclaim consumer leases or tables.)
+    ///
+    /// # Safety
+    ///
+    /// See [`force_attach_shm_producer`](Self::force_attach_shm_producer).
+    pub unsafe fn recover_shm(fd: BorrowedFd<'_>) -> io::Result<crate::broadcast::Producer<T>> {
+        // SAFETY: forwarded caller contract.
+        unsafe { Self::force_attach_shm_producer(fd) }
+    }
+}
+
+impl<T, C> crate::broadcast::RingBuffer<T, C>
+where
+    T: ShmItem + crate::broadcast::NoUninit + Send,
+    // `SelfTimed` is the ring's own consumer bound (nobody ever notifies a
+    // lossy reader); `CrossProcess` is the shm bound — and every SelfTimed
+    // tier is CrossProcess by construction, so the pair costs nothing.
+    C: CrossProcess + SelfTimed + Send,
+{
+    /// Attach a **new consumer**: validates the header and maps the region
+    /// **read-only** (`PROT_READ`). The consumer takes **no lease** and
+    /// never writes a byte of shared state — membership is unbounded, and
+    /// dropping the consumer just unmaps. Its join point is the tail at
+    /// attach time.
+    ///
+    /// Attaching to a *closed* ring succeeds (mirroring the heap
+    /// `subscribe`): the consumer is born drained and pops
+    /// [`Closed`](crate::broadcast::PopError::Closed) — until a new
+    /// producer attach reopens the session.
+    ///
+    /// The read-only mapping doubles as enforcement: a store accidentally
+    /// introduced anywhere in the consumer path is a deterministic SIGSEGV
+    /// rather than silent corruption.
+    ///
+    /// # Safety
+    ///
+    /// Trust model, plus the `T` caveat of
+    /// [`attach_shm_producer`](crate::broadcast::RingBuffer::attach_shm_producer).
+    pub unsafe fn attach_shm_consumer(
+        fd: BorrowedFd<'_>,
+    ) -> io::Result<crate::broadcast::Consumer<T, C>> {
+        let opened = open_bcast_elems::<T>(fd, true)?;
+        // SAFETY: region validated by the open; forwarded caller contract.
+        Ok(unsafe {
+            crate::broadcast::Consumer::from_shm(opened.region, opened.capacity, opened.slack)
+        })
+    }
+}
+
+/// Byte-ring capacity floor and record alignment for the broadcast byte
+/// ring, shared with the ring's own constructor and frame decoder so they
+/// cannot drift.
+const BCAST_BYTES_MIN_CAPACITY: usize = crate::broadcast_bytes::MIN_CAPACITY;
+const BCAST_BYTES_TAIL_ALIGN: u64 = crate::broadcast_bytes::ALIGN as u64;
+
+/// Open a broadcast byte region (shared by every constructor; `read_only`
+/// is the consumer path).
+fn open_bcast_bytes(fd: BorrowedFd<'_>, read_only: bool) -> io::Result<BcastOpened> {
+    open_bcast_region(
+        fd,
+        KIND_BCAST_BYTES,
+        1,
+        1,
+        BCAST_BYTES_BUFFER_OFFSET,
+        BCAST_BYTES_MIN_CAPACITY,
+        BCAST_BYTES_TAIL_ALIGN,
+        read_only,
+    )
+}
+
+/// The byte ring's producer-attach healing: compute the intent floor and
+/// repair `latest` after a mid-push crash.
+///
+/// A producer that died between declaring `tail_intent` and committing
+/// `tail` leaves `intent > tail`, with the bytes just under that declared
+/// frontier destroyed. Two repairs, both writes only the lease holder may
+/// make (cold, attach-time):
+///
+/// * **Intent floor** = `max(intent, tail)`: the new producer's pushes
+///   declare `max(new_tail, floor)`, so the declared frontier never
+///   regresses across sessions — the destroyed bytes stay strictly below
+///   `intent - capacity`, permanently outside every consumer's validation
+///   window. (Without the floor, a first record smaller than the dead one
+///   would re-admit a sliver of destroyed bytes to the window check.)
+/// * **`latest = tail`** when `intent != tail`: the dead push may have
+///   stored `latest` pointing into its never-committed span; `tail` is the
+///   one boundary guaranteed committed, and no consumer reads at or past it
+///   until the new session publishes there. A consumer that repositioned to
+///   the *old* `latest` before this repair lands is protected by the
+///   tail-wait, not the window check (the dead intent is within a capacity
+///   of the old latest, so the window check alone would pass): its
+///   reposition refreshed `tail_cache = tail <= pos`, so it *waits*, and by
+///   the time `tail` moves past its position the new session has committed
+///   real bytes there.
+fn bcast_bytes_heal_on_attach(opened: &BcastOpened) -> u64 {
+    let tail = opened.region.bcast_tail().load(Ordering::Acquire);
+    let intent = opened.region.bcast_intent().load(Ordering::Acquire);
+    if intent != tail {
+        opened.region.bcast_latest().store(tail, Ordering::Release);
+    }
+    intent.max(tail)
+}
+
+impl crate::broadcast_bytes::BytesRingBuffer {
+    /// Initialize `fd` as a fresh shm-backed lossy broadcast **byte** ring
+    /// and return **the producer** (capacity is in bytes, minimum 8; there
+    /// is no initial consumer — attach any number with
+    /// [`attach_shm_consumer`](Self::attach_shm_consumer), each lease-free
+    /// over its own **read-only** mapping).
+    ///
+    /// ```
+    /// use std::os::fd::AsFd;
+    /// use rust_rb::{broadcast_bytes, memfd};
+    /// # fn main() -> std::io::Result<()> {
+    /// let fd = memfd("bcast-bytes-doc")?;
+    /// // SAFETY: fresh private memfd, only cooperating handles touch it.
+    /// let mut tx =
+    ///     unsafe { broadcast_bytes::BytesRingBuffer::create_shm(fd.as_fd(), 4096)? };
+    /// // SAFETY: cooperating handles only. (The annotation picks the
+    /// // default `YieldWait` consumer strategy.)
+    /// let mut rx: broadcast_bytes::BytesConsumer =
+    ///     unsafe { broadcast_bytes::BytesRingBuffer::attach_shm_consumer(fd.as_fd())? };
+    /// tx.push(b"tick");
+    /// assert_eq!(rx.pop().unwrap(), b"tick");
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Safety
+    ///
+    /// See [the module's trust model](self).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `min_capacity == 0`.
+    pub unsafe fn create_shm(
+        fd: BorrowedFd<'_>,
+        min_capacity: usize,
+    ) -> io::Result<crate::broadcast_bytes::BytesProducer> {
+        let capacity = crate::cursor::round_capacity(min_capacity, BCAST_BYTES_MIN_CAPACITY);
+        let (region, producer_token) = create_bcast_region(
+            fd,
+            KIND_BCAST_BYTES,
+            capacity,
+            1,
+            1,
+            BCAST_BYTES_BUFFER_OFFSET,
+            0,
+        )?;
+        let anchor = Box::new(BcastProducerAnchor::new(region, producer_token));
+        // SAFETY: freshly initialized region matches this ring's layout
+        // (fresh counters: the intent floor is 0).
+        Ok(unsafe { crate::broadcast_bytes::BytesProducer::from_shm(anchor, capacity, 0) })
+    }
+
+    /// Attach to an existing broadcast byte ring as the producer (see
+    /// [`broadcast::RingBuffer::attach_shm_producer`](crate::broadcast::RingBuffer::attach_shm_producer)
+    /// for the lease and reopen story). Also heals a predecessor's mid-push
+    /// crash: the declared-intent frontier stays monotonic across producer
+    /// sessions and `latest` is repaired to the committed tail, so
+    /// consumers' validation windows never re-admit destroyed bytes.
+    ///
+    /// # Safety
+    ///
+    /// Trust model, plus single-producer.
+    pub unsafe fn attach_shm_producer(
+        fd: BorrowedFd<'_>,
+    ) -> io::Result<crate::broadcast_bytes::BytesProducer> {
+        let opened = open_bcast_bytes(fd, false)?;
+        let anchor = bcast_attach_producer_anchor(&opened, false)?;
+        let floor = bcast_bytes_heal_on_attach(&opened);
+        // SAFETY: region validated by the open; forwarded caller contract;
+        // `floor` is the sampled `max(intent, tail)`.
+        Ok(unsafe {
+            crate::broadcast_bytes::BytesProducer::from_shm(anchor, opened.capacity, floor)
+        })
+    }
+
+    /// Unconditionally take over the producer role — crash recovery while
+    /// consumers keep running (see
+    /// [`attach_shm_producer`](Self::attach_shm_producer) for the mid-push
+    /// healing; everything published stays drainable throughout).
+    ///
+    /// # Safety
+    ///
+    /// Trust model, plus: unconditional takeover — the caller asserts the
+    /// previous producer is gone.
+    pub unsafe fn force_attach_shm_producer(
+        fd: BorrowedFd<'_>,
+    ) -> io::Result<crate::broadcast_bytes::BytesProducer> {
+        let opened = open_bcast_bytes(fd, false)?;
+        let anchor = bcast_attach_producer_anchor(&opened, true)?;
+        let floor = bcast_bytes_heal_on_attach(&opened);
+        // SAFETY: region validated by the open; forwarded caller contract;
+        // `floor` is the sampled `max(intent, tail)`.
+        Ok(unsafe {
+            crate::broadcast_bytes::BytesProducer::from_shm(anchor, opened.capacity, floor)
+        })
+    }
+
+    /// Unconditionally take over an existing broadcast byte ring — the same
+    /// operation as
+    /// [`force_attach_shm_producer`](Self::force_attach_shm_producer):
+    /// the producer is the only role, and consumers keep no shared state
+    /// (see the element ring's
+    /// [`recover_shm`](crate::broadcast::RingBuffer::recover_shm)).
+    ///
+    /// # Safety
+    ///
+    /// See [`force_attach_shm_producer`](Self::force_attach_shm_producer).
+    pub unsafe fn recover_shm(
+        fd: BorrowedFd<'_>,
+    ) -> io::Result<crate::broadcast_bytes::BytesProducer> {
+        // SAFETY: forwarded caller contract.
+        unsafe { Self::force_attach_shm_producer(fd) }
+    }
+}
+
+impl<C> crate::broadcast_bytes::BytesRingBuffer<C>
+where
+    C: CrossProcess + SelfTimed + Send,
+{
+    /// Attach a **new consumer** over a **read-only** (`PROT_READ`) mapping:
+    /// no lease, no shared writes, unbounded membership — see the element
+    /// ring's
+    /// [`attach_shm_consumer`](crate::broadcast::RingBuffer::attach_shm_consumer)
+    /// for the full contract (including closed-ring attaches succeeding).
+    /// The join point is the tail at attach time — always a record boundary.
+    ///
+    /// # Safety
+    ///
+    /// Trust model.
+    pub unsafe fn attach_shm_consumer(
+        fd: BorrowedFd<'_>,
+    ) -> io::Result<crate::broadcast_bytes::BytesConsumer<C>> {
+        let opened = open_bcast_bytes(fd, true)?;
+        // SAFETY: region validated by the open; forwarded caller contract.
+        Ok(unsafe {
+            crate::broadcast_bytes::BytesConsumer::from_shm(opened.region, opened.capacity)
+        })
     }
 }
 

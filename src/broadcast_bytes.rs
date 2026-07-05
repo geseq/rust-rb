@@ -158,7 +158,7 @@
 
 use std::cell::UnsafeCell;
 use std::ptr::NonNull;
-use std::sync::atomic::{fence, AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{fence, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::cache_padded::CachePadded;
@@ -177,12 +177,14 @@ type Word = UnsafeCell<u64>;
 const HEADER: usize = 4;
 /// Record alignment: every record (and padding) start is 8-aligned, so
 /// headers are naturally aligned lanes and capacity multiples are record
-/// boundaries on every lap.
-const ALIGN: usize = 8;
+/// boundaries on every lap. (`pub(crate)`: the shm attach validates the
+/// region's tail against it.)
+pub(crate) const ALIGN: usize = 8;
 /// Header value marking a padding record that runs to the end of the buffer.
 const PADDING: u32 = u32::MAX;
 /// Smallest legal capacity: one 8-byte record (an empty message).
-const MIN_CAPACITY: usize = 8;
+/// (`pub(crate)`: shared with the shm constructors so they cannot drift.)
+pub(crate) const MIN_CAPACITY: usize = 8;
 
 #[inline(always)]
 const fn align_up(n: usize) -> usize {
@@ -440,9 +442,13 @@ unsafe fn copy_out_lanes(src: *const u8, dst: *mut u8, len: usize) {
 /// plus, co-located in the same padded slot, the `closed` flag (written once
 /// by `BytesProducer::drop`, read only on consumer would-block paths — the
 /// line consumers already poll).
+///
+/// `closed` is a whole word (0 = open, nonzero = closed), not a bool, so the
+/// shm header can host the very same field at a fixed offset with one atomic
+/// type on both backings.
 struct TailSide {
     tail: AtomicU64,
-    closed: AtomicBool,
+    closed: AtomicU64,
 }
 
 /// The state all handles share, kept alive by an `Arc`. The three counters
@@ -522,16 +528,26 @@ impl<C: SelfTimed + Send> BytesRingBuffer<C> {
             latest: CachePadded::new(AtomicU64::new(0)),
             tail_side: CachePadded::new(TailSide {
                 tail: AtomicU64::new(0),
-                closed: AtomicBool::new(false),
+                closed: AtomicU64::new(0),
             }),
         });
 
         let consumer = subscribe_from(&shared);
+        let tail_intent = NonNull::from(&*shared.tail_intent);
+        let latest = NonNull::from(&*shared.latest);
+        let tail = NonNull::from(&shared.tail_side.tail);
+        let closed = NonNull::from(&shared.tail_side.closed);
         let producer = BytesProducer {
             base: base_of(&shared),
             mask: shared.mask,
             next: 0,
-            shared,
+            #[cfg(all(feature = "shm", target_os = "linux", target_has_atomic = "64"))]
+            intent_floor: 0,
+            tail_intent,
+            latest,
+            tail,
+            closed,
+            anchor: ProducerAnchor::Heap(shared),
         };
         (producer, consumer)
     }
@@ -552,14 +568,61 @@ fn subscribe_from<C: SelfTimed>(shared: &Arc<Shared>) -> BytesConsumer<C> {
     // the tail is always a record boundary. A consumer subscribed to a
     // closed ring is born drained and pops Closed.
     let pos = shared.tail_side.tail.load(Ordering::Acquire);
+    let tail_intent = NonNull::from(&*shared.tail_intent);
+    let latest = NonNull::from(&*shared.latest);
+    let tail = NonNull::from(&shared.tail_side.tail);
+    let closed = NonNull::from(&shared.tail_side.closed);
     BytesConsumer {
         base: base_of(&shared),
         mask: shared.mask,
         pos,
         tail_cache: pos,
         wait: C::default(),
-        shared,
+        tail_intent,
+        latest,
+        tail,
+        closed,
+        anchor: ConsumerAnchor::Heap(shared),
     }
+}
+
+/// Where the producing handle's shared state lives — the anchor seam,
+/// mirroring `crate::broadcast` (and `crate::spmc`'s registry seam): every
+/// hot atomic is reached through the handle's cached raw pointers (identical
+/// for both variants); the anchor is consulted only on cold paths
+/// (subscribe, teardown).
+enum ProducerAnchor {
+    /// In-process ring: the shared state lives on the heap in an `Arc`.
+    Heap(Arc<Shared>),
+    /// Cross-process ring: the state lives in a mapped shared region; the
+    /// anchor holds the producer role lease. Boxed so enabling the feature
+    /// does not grow heap handles.
+    #[cfg(all(feature = "shm", target_os = "linux", target_has_atomic = "64"))]
+    Shm(Box<crate::shm::BcastProducerAnchor>),
+}
+
+impl ProducerAnchor {
+    /// Whether teardown may write the ring-wide closed word (see
+    /// `crate::broadcast`'s twin for the rationale).
+    #[inline]
+    fn teardown_allowed(&self) -> bool {
+        match self {
+            ProducerAnchor::Heap(_) => true,
+            #[cfg(all(feature = "shm", target_os = "linux", target_has_atomic = "64"))]
+            ProducerAnchor::Shm(anchor) => anchor.owned_by_current_process() && anchor.owns_lease(),
+        }
+    }
+}
+
+/// The consuming handle's side of the anchor seam: purely a keep-alive. A
+/// lossy consumer is a pure reader — dropping it releases no lease and
+/// writes nothing, so the shm variant is nothing but the mapping `Arc`
+/// (mapped **read-only**: any accidental store in the consumer path would be
+/// a deterministic SIGSEGV, which is the enforcement).
+enum ConsumerAnchor {
+    Heap(Arc<Shared>),
+    #[cfg(all(feature = "shm", target_os = "linux", target_has_atomic = "64"))]
+    Shm(Arc<crate::shm::ShmRegion>),
 }
 
 /// The producing half of a [`BytesRingBuffer`]. `Send` but not `Clone`:
@@ -576,19 +639,34 @@ fn subscribe_from<C: SelfTimed>(shared: &Arc<Shared>) -> BytesConsumer<C> {
 /// with no notify — consumer strategies are [`SelfTimed`] by construction,
 /// so a parked reader re-checks and wakes itself.
 pub struct BytesProducer {
-    /// Base of the byte buffer (cached; stable for the `Arc`'s lifetime).
+    /// Base of the byte buffer (cached; stable for the anchor's lifetime).
     base: NonNull<u8>,
     /// `capacity - 1` (cached).
     mask: u64,
     /// Next byte position to write (producer-private; equals the published
     /// tail between pushes).
     next: u64,
-    /// Keeps the ring's memory alive.
-    shared: Arc<Shared>,
+    /// The shm intent floor: a recovered producer must never declare an
+    /// intent below a dead predecessor's frontier — the bytes the
+    /// predecessor destroyed mid-push sit just under that frontier, and a
+    /// regressed declaration would re-admit them to the consumers' window
+    /// check. Heap rings (and shm rings with no crash to heal) carry 0, so
+    /// the push-path `max` folds to a no-op.
+    #[cfg(all(feature = "shm", target_os = "linux", target_has_atomic = "64"))]
+    intent_floor: u64,
+    /// The three counters plus the closed word (cached raw pointers; heap:
+    /// into the `Arc`, shm: into the mapped region — the hot push path is
+    /// identical).
+    tail_intent: NonNull<AtomicU64>,
+    latest: NonNull<AtomicU64>,
+    tail: NonNull<AtomicU64>,
+    closed: NonNull<AtomicU64>,
+    /// Keeps the ring's memory alive (heap `Arc` or shm mapping + lease).
+    anchor: ProducerAnchor,
 }
 
 // SAFETY: the producer only touches producer-private state plus atomics; the
-// cached pointer references the `Arc<Shared>` it keeps alive.
+// cached pointers reference state the anchor keeps alive.
 unsafe impl Send for BytesProducer {}
 
 impl Drop for BytesProducer {
@@ -596,8 +674,14 @@ impl Drop for BytesProducer {
         // Flag only, no notify: consumers use SelfTimed strategies (enforced
         // at construction), whose waits re-check the closed flag without a
         // peer wake — the producer keeps zero consumer knowledge even at
-        // teardown.
-        self.shared.tail_side.closed.store(true, Ordering::Release);
+        // teardown. Guarded for shm (heap: constant true): only a graceful
+        // drop by the live lease holder closes the ring — a fork-inherited
+        // copy or superseded zombie must not end the successor's session.
+        if self.anchor.teardown_allowed() {
+            // SAFETY: `closed` points into shared state the anchor keeps
+            // alive.
+            unsafe { self.closed.as_ref() }.store(1, Ordering::Release);
+        }
     }
 }
 
@@ -638,10 +722,20 @@ impl BytesProducer {
         };
         let new_tail = self.next + total;
 
+        // The shm crash-recovery floor (see the field docs): declarations
+        // are monotonic across producer sessions. Heap: floor is 0 and the
+        // `max` folds away; compiled out entirely without the `shm` feature.
+        #[cfg(all(feature = "shm", target_os = "linux", target_has_atomic = "64"))]
+        let declared = new_tail.max(self.intent_floor);
+        #[cfg(not(all(feature = "shm", target_os = "linux", target_has_atomic = "64")))]
+        let declared = new_tail;
+
         // 1. Declare intent: "I will destroy everything below new_tail".
         //    Readers of any byte this push will touch now fail their window
         //    check.
-        self.shared.tail_intent.store(new_tail, Ordering::Release);
+        // SAFETY: `tail_intent` points into shared state the anchor keeps
+        // alive.
+        unsafe { self.tail_intent.as_ref() }.store(declared, Ordering::Release);
         // 2. The load-bearing fence: the byte stores below must not be
         //    hoisted above the intent store (and pair with the readers'
         //    post-copy acquire fence).
@@ -672,11 +766,10 @@ impl BytesProducer {
         // 3. Publish the jump target, then the frontier. `latest` first, so
         //    any consumer that sees the new tail also sees a coherent
         //    latest; `tail` is the only line consumers spin on.
-        self.shared.latest.store(self.next + pad, Ordering::Release);
-        self.shared
-            .tail_side
-            .tail
-            .store(new_tail, Ordering::Release);
+        // SAFETY: `latest`/`tail` point into shared state the anchor keeps
+        // alive.
+        unsafe { self.latest.as_ref() }.store(self.next + pad, Ordering::Release);
+        unsafe { self.tail.as_ref() }.store(new_tail, Ordering::Release);
         self.next = new_tail;
     }
 
@@ -688,8 +781,22 @@ impl BytesProducer {
     /// strategy — by design); name it, e.g.
     /// `tx.subscribe::<rust_rb::YieldWait>()`, or subscribe from an existing
     /// consumer.
+    ///
+    /// On a shared-memory ring the subscriber shares this producer's
+    /// **read-write** mapping (same process, same pages) — the read-only
+    /// enforcement story belongs to
+    /// [`attach_shm_consumer`](BytesRingBuffer::attach_shm_consumer), which
+    /// maps the region afresh with `PROT_READ`.
     pub fn subscribe<C: SelfTimed + Send>(&self) -> BytesConsumer<C> {
-        subscribe_from(&self.shared)
+        match &self.anchor {
+            ProducerAnchor::Heap(shared) => subscribe_from(shared),
+            #[cfg(all(feature = "shm", target_os = "linux", target_has_atomic = "64"))]
+            // SAFETY: the anchor's region was validated for this capacity
+            // when this handle was constructed.
+            ProducerAnchor::Shm(anchor) => unsafe {
+                BytesConsumer::from_shm(Arc::clone(anchor.region()), (self.mask + 1) as usize)
+            },
+        }
     }
 
     /// Total framed bytes published so far (headers and wrap padding
@@ -723,7 +830,7 @@ impl BytesProducer {
 /// Dropping a consumer is a no-op for everyone else: there is no registry
 /// slot to release and nobody gates on this reader.
 pub struct BytesConsumer<C: WaitStrategy = YieldWait> {
-    /// Base of the byte buffer (cached; stable for the `Arc`'s lifetime).
+    /// Base of the byte buffer (cached; stable for the anchor's lifetime).
     base: NonNull<u8>,
     /// `capacity - 1` (cached).
     mask: u64,
@@ -735,12 +842,19 @@ pub struct BytesConsumer<C: WaitStrategy = YieldWait> {
     /// This consumer's own wait strategy instance ([`SelfTimed`] by
     /// construction — waiting is purely local, no notify ever arrives).
     wait: C,
-    /// Keeps the ring's memory alive.
-    shared: Arc<Shared>,
+    /// The three counters plus the closed word (cached raw pointers;
+    /// **loads only** — the whole consumer path is write-free, which is what
+    /// lets the shm variant hold a read-only mapping).
+    tail_intent: NonNull<AtomicU64>,
+    latest: NonNull<AtomicU64>,
+    tail: NonNull<AtomicU64>,
+    closed: NonNull<AtomicU64>,
+    /// Keeps the ring's memory alive (heap `Arc` or shm mapping).
+    anchor: ConsumerAnchor,
 }
 
 // SAFETY: the consumer only touches consumer-private state plus atomics; the
-// cached pointer references the `Arc<Shared>` it keeps alive.
+// cached pointers reference state the anchor keeps alive.
 unsafe impl<C: WaitStrategy + Send> Send for BytesConsumer<C> {}
 
 impl<C: WaitStrategy> BytesConsumer<C> {
@@ -820,21 +934,30 @@ impl<C: WaitStrategy> BytesConsumer<C> {
     /// [`PopError::Lagged`].
     #[inline]
     pub fn lag(&self) -> u64 {
-        self.shared
-            .tail_side
-            .tail
+        // SAFETY: `tail` points into shared state the anchor keeps alive.
+        unsafe { self.tail.as_ref() }
             .load(Ordering::Acquire)
             .saturating_sub(self.pos)
     }
 
     /// Subscribe a further consumer with the same wait strategy; its join
     /// point is the current tail. Never fails (see
-    /// [`BytesProducer::subscribe`]).
+    /// [`BytesProducer::subscribe`]). On a shared-memory ring the sibling
+    /// shares this consumer's mapping (read-only if this one attached
+    /// read-only).
     pub fn subscribe(&self) -> BytesConsumer<C>
     where
         C: SelfTimed + Send,
     {
-        subscribe_from(&self.shared)
+        match &self.anchor {
+            ConsumerAnchor::Heap(shared) => subscribe_from(shared),
+            #[cfg(all(feature = "shm", target_os = "linux", target_has_atomic = "64"))]
+            // SAFETY: the region was validated for this capacity when this
+            // handle was constructed.
+            ConsumerAnchor::Shm(region) => unsafe {
+                BytesConsumer::from_shm(Arc::clone(region), (self.mask + 1) as usize)
+            },
+        }
     }
 
     /// The ring's capacity in bytes (the requested minimum rounded up to a
@@ -859,7 +982,8 @@ impl<C: WaitStrategy> BytesConsumer<C> {
     /// Unconditionally reload the cached tail (`Acquire`) and return it.
     #[inline(always)]
     fn refresh(&mut self) -> u64 {
-        self.tail_cache = self.shared.tail_side.tail.load(Ordering::Acquire);
+        // SAFETY: `tail` points into shared state the anchor keeps alive.
+        self.tail_cache = unsafe { self.tail.as_ref() }.load(Ordering::Acquire);
         self.tail_cache
     }
 
@@ -880,7 +1004,8 @@ impl<C: WaitStrategy> BytesConsumer<C> {
     /// report [`PopError::Closed`] only if genuinely drained.
     #[inline]
     fn check_closed(&mut self) -> Result<(), PopError> {
-        if self.shared.tail_side.closed.load(Ordering::Acquire) {
+        // SAFETY: `closed` points into shared state the anchor keeps alive.
+        if unsafe { self.closed.as_ref() }.load(Ordering::Acquire) != 0 {
             self.refresh();
             if self.tail_cache == self.pos {
                 return Err(PopError::Closed);
@@ -903,12 +1028,12 @@ impl<C: WaitStrategy> BytesConsumer<C> {
             if self.available() {
                 return Ok(());
             }
-            let tail_side = &*self.shared.tail_side;
+            // SAFETY: the pointers reference shared state the anchor keeps
+            // alive.
+            let (tail, closed) = unsafe { (self.tail.as_ref(), self.closed.as_ref()) };
             let pos = self.pos;
-            self.wait.wait(|| {
-                tail_side.tail.load(Ordering::Acquire) > pos
-                    || tail_side.closed.load(Ordering::Acquire)
-            });
+            self.wait
+                .wait(|| tail.load(Ordering::Acquire) > pos || closed.load(Ordering::Acquire) != 0);
         }
     }
 
@@ -936,7 +1061,9 @@ impl<C: WaitStrategy> BytesConsumer<C> {
             // is the strict end of the window — it also covers any padding
             // lane already read). The Acquire keeps the header load below
             // from hoisting above the check.
-            let intent = self.shared.tail_intent.load(Ordering::Acquire);
+            // SAFETY: `tail_intent` points into shared state the anchor
+            // keeps alive.
+            let intent = unsafe { self.tail_intent.as_ref() }.load(Ordering::Acquire);
             if intent.wrapping_sub(pos) > capacity {
                 return Err(self.reposition());
             }
@@ -950,7 +1077,8 @@ impl<C: WaitStrategy> BytesConsumer<C> {
                 // the header load before the re-load (fence + relaxed
                 // re-load is the sound shape).
                 fence(Ordering::Acquire);
-                let intent = self.shared.tail_intent.load(Ordering::Relaxed);
+                // SAFETY: as for the pre-validation load above.
+                let intent = unsafe { self.tail_intent.as_ref() }.load(Ordering::Relaxed);
                 if intent.wrapping_sub(pos) > capacity {
                     return Err(self.reposition());
                 }
@@ -993,7 +1121,8 @@ impl<C: WaitStrategy> BytesConsumer<C> {
             // `intent > pos + capacity` before writing a byte, and the
             // fence pairing guarantees we see it here.
             fence(Ordering::Acquire);
-            let intent = self.shared.tail_intent.load(Ordering::Relaxed);
+            // SAFETY: as for the pre-validation load above.
+            let intent = unsafe { self.tail_intent.as_ref() }.load(Ordering::Relaxed);
             if intent.wrapping_sub(pos) > capacity {
                 return Err(self.reposition());
             }
@@ -1018,11 +1147,98 @@ impl<C: WaitStrategy> BytesConsumer<C> {
         // Refresh the tail first (the next pop's availability check), then
         // take the jump target.
         self.refresh();
-        let latest = self.shared.latest.load(Ordering::Acquire);
+        // SAFETY: `latest` points into shared state the anchor keeps alive.
+        let latest = unsafe { self.latest.as_ref() }.load(Ordering::Acquire);
         let new_pos = latest.max(self.pos);
         let missed_bytes = new_pos - self.pos;
         self.pos = new_pos;
         PopError::Lagged { missed_bytes }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared-memory plumbing (crate-internal; the public constructors live in
+// `crate::shm`). The handles built here are the ordinary `BytesProducer`/
+// `BytesConsumer` types over region pointers — the hot paths are
+// byte-identical to the heap ring's; only the anchor differs (plus the
+// producer's crash-recovery intent floor). Consumers hold a READ-ONLY
+// mapping: the entire consumer path is loads plus private state, so an
+// accidental store regression is a deterministic SIGSEGV.
+// ---------------------------------------------------------------------------
+
+#[cfg(all(feature = "shm", target_os = "linux", target_has_atomic = "64"))]
+impl BytesProducer {
+    /// Build a producer over a validated shm region. Seeds `next` from the
+    /// live tail (publishing resumes exactly after the last committed
+    /// record; a predecessor's partial record was never covered by a tail
+    /// store, so its space is reused) and takes the caller-computed
+    /// `intent_floor` — `max(tail_intent, tail)` as sampled by the attach,
+    /// which keeps declared frontiers monotonic across producer sessions.
+    ///
+    /// # Safety
+    ///
+    /// The anchor's region must be a validated broadcast byte ring of
+    /// exactly this `capacity` (`create`/`open` in `crate::shm`), the anchor
+    /// must hold the producer lease, and `intent_floor` must be at least the
+    /// region's current `tail_intent`.
+    pub(crate) unsafe fn from_shm(
+        anchor: Box<crate::shm::BcastProducerAnchor>,
+        capacity: usize,
+        intent_floor: u64,
+    ) -> Self {
+        let region = anchor.region();
+        let tail_intent = NonNull::from(region.bcast_intent());
+        let latest = NonNull::from(region.bcast_latest());
+        let tail = NonNull::from(region.bcast_tail());
+        let closed = NonNull::from(region.bcast_closed());
+        let base = region.bcast_bytes_buffer();
+        // SAFETY: `tail` references the live mapping (per contract).
+        let next = unsafe { tail.as_ref() }.load(Ordering::Acquire);
+        BytesProducer {
+            base,
+            mask: capacity as u64 - 1,
+            next,
+            intent_floor,
+            tail_intent,
+            latest,
+            tail,
+            closed,
+            anchor: ProducerAnchor::Shm(anchor),
+        }
+    }
+}
+
+#[cfg(all(feature = "shm", target_os = "linux", target_has_atomic = "64"))]
+impl<C: WaitStrategy> BytesConsumer<C> {
+    /// Build a consumer over a (typically read-only) mapping of a validated
+    /// shm region: pure reader state — no lease, no registration, nothing
+    /// written, ever. The join point is the tail at this call (always a
+    /// record boundary).
+    ///
+    /// # Safety
+    ///
+    /// The region must be a validated broadcast byte ring of exactly this
+    /// `capacity`.
+    pub(crate) unsafe fn from_shm(region: Arc<crate::shm::ShmRegion>, capacity: usize) -> Self {
+        let tail_intent = NonNull::from(region.bcast_intent());
+        let latest = NonNull::from(region.bcast_latest());
+        let tail = NonNull::from(region.bcast_tail());
+        let closed = NonNull::from(region.bcast_closed());
+        let base = region.bcast_bytes_buffer();
+        // SAFETY: `tail` references the live mapping (per contract).
+        let pos = unsafe { tail.as_ref() }.load(Ordering::Acquire);
+        BytesConsumer {
+            base,
+            mask: capacity as u64 - 1,
+            pos,
+            tail_cache: pos,
+            wait: C::default(),
+            tail_intent,
+            latest,
+            tail,
+            closed,
+            anchor: ConsumerAnchor::Shm(region),
+        }
     }
 }
 

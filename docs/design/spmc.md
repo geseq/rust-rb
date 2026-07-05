@@ -239,7 +239,7 @@ element ring's local check avoids).
 ### 2.8 shm variant
 
 - Header [A-6.3]: new kinds `KIND_SPMC_BYTES=3, KIND_SPMC_ELEMS=4,
-  KIND_BCAST_BYTES=5, KIND_BCAST_ELEMS=6` (VERSION stays 1 — old binaries
+  KIND_BCAST_ELEMS=5, KIND_BCAST_BYTES=6` (VERSION stays 1 — old binaries
   reject unknown kinds); `max_consumers: u32` at offset 36 (current gap);
   `closed` in the write-cursor's padded slot; consumer table at offset 384,
   **one 128-byte slot per consumer**: `{ lease: u64, control: u64
