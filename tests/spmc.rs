@@ -250,6 +250,54 @@ fn subscribe_mid_stream_threaded() {
     late_thread.join().unwrap();
 }
 
+/// Regression for the [M-F2] registration order: the joiner must set its
+/// bitmap bit *before* its `SeqCst` fence. The producer's rescan observes
+/// consumers only through the bitmap, so a bit set after the fence lets a
+/// scan miss the joiner while the joiner reads a stale write cursor — the
+/// producer then laps a consumer it never saw and overwrites the element it
+/// is reading (a data race Miri catches; same shape as the byte ring).
+///
+/// Chained handoff keeps exactly one freshly subscribed consumer live at a
+/// time on a tiny ring, so every generation re-runs the subscribe-vs-rescan
+/// window against a producer lapping at full speed.
+#[test]
+fn subscribe_churn_under_running_producer() {
+    let messages: u64 = if cfg!(miri) { 2_000 } else { 100_000 };
+    let (mut tx, rx) = make::<PauseWait, PauseWait>(64);
+
+    let producer = std::thread::spawn(move || {
+        for i in 0..messages {
+            tx.push(i);
+        }
+    });
+
+    let mut cur = rx;
+    'churn: loop {
+        // The producer may finish (and close the ring) at any point.
+        let Ok(mut next) = cur.subscribe() else {
+            break 'churn;
+        };
+        drop(cur);
+        // A few pops per generation: the post-join suffix must be gap-free
+        // even when the producer runs between the subscribe and the first
+        // pop.
+        let mut prev = None;
+        for _ in 0..3 {
+            match next.pop() {
+                Ok(v) => {
+                    if let Some(p) = prev {
+                        assert_eq!(v, p + 1, "post-join suffix must be gap-free");
+                    }
+                    prev = Some(v);
+                }
+                Err(Closed) => break 'churn,
+            }
+        }
+        cur = next;
+    }
+    producer.join().unwrap();
+}
+
 // -----------------------------------------------------------------------------
 // 5. DETACH: DROPPED CONSUMERS STOP GATING; FREE-RUN WITH ZERO CONSUMERS
 // -----------------------------------------------------------------------------

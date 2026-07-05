@@ -95,6 +95,10 @@
 //! - [`spmc`] — the single-producer / **multi**-consumer gating broadcast
 //!   ring ([`spmc::RingBuffer`] and its handles): every consumer observes
 //!   every message; a slow consumer gates the producer.
+//! - [`spmc_bytes`] — the gating multi-consumer ring for **variable-size
+//!   byte messages** ([`spmc_bytes::BytesRingBuffer`] and its handles): the
+//!   SPSC byte framing with every consumer parsing frames independently;
+//!   the producer gates on the slowest consumer's byte cursor.
 //! - [`broadcast`] — the single-producer / multi-consumer **lossy** broadcast
 //!   ring ([`broadcast::RingBuffer`] and its handles): the producer never
 //!   blocks and never reads consumer state; a slow consumer loses messages
@@ -148,6 +152,7 @@ pub mod guide;
 #[cfg_attr(docsrs, doc(cfg(feature = "shm")))]
 pub mod shm;
 pub mod spmc;
+pub mod spmc_bytes;
 pub mod spsc;
 pub mod spsc_bytes;
 pub mod wait;

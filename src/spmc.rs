@@ -366,19 +366,29 @@ where
     // SAFETY: chunks live until `Shared::drop`, and we hold the `Arc`.
     let chunk_ref = unsafe { chunk.as_ref() };
 
-    // 2. Pair with the producer's pre-scan fence [M-F2].
+    // 2. Activate the slot for the producer's rescans (cold RMW). This MUST
+    //    precede the fence below: the rescan observes consumers only through
+    //    the bitmap, so the bit — not the slot store — is the registration
+    //    the [M-F2] dichotomy is about. Set after the fence, a scan could
+    //    miss the bit *while* the re-read below returns a stale cursor, and
+    //    the producer would lap a consumer it never saw. The slot already
+    //    holds the provisional cursor (a lower bound of the join point), so
+    //    a scan that sees the bit this early only gates more.
+    chunk_ref
+        .bitmap
+        .fetch_or(1u64 << slot_idx, Ordering::AcqRel);
+
+    // 3. Pair with the producer's pre-scan fence [M-F2]: either that scan's
+    //    bitmap load sees the bit set above, or this fence follows the
+    //    scan's in the SC order and the re-read below returns a write cursor
+    //    at least as fresh as the scan's wrap point.
     fence(Ordering::SeqCst);
 
-    // 3. The join point: re-read the write cursor and publish it as this
+    // 4. The join point: re-read the write cursor and publish it as this
     //    consumer's cursor. Only messages published after `joined` are seen.
     let joined = shared.write_side.write_cursor.load(Ordering::Acquire);
     let published = guard_sentinel(joined);
     chunk_ref.slots[slot_idx].store(published, Ordering::Release);
-
-    // 4. Activate the slot for the producer's rescans (cold RMW).
-    chunk_ref
-        .bitmap
-        .fetch_or(1u64 << slot_idx, Ordering::AcqRel);
 
     let buf = NonNull::new(shared.buffer.as_ptr().cast_mut()).expect("buffer is non-null");
     let mask = shared.mask;
