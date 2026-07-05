@@ -113,7 +113,6 @@
 //!   read-cursor publish, and a reproducible benchmarking recipe.
 //! - [Shared memory / IPC](guide::shm_ipc) — running a ring across two
 //!   processes, the trust model, and crash recovery.
-//! - [Migrating from `cpp-fastchan`](guide::migration).
 //!
 //! # Feature flags
 //!

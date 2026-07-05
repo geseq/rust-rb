@@ -3,8 +3,7 @@
 //! The API reference tells you *what* each item is; these guides tell you *how
 //! to choose and use them*. Start with [`configuration`] and [`api_usage`], reach
 //! for [`semantics`] when behaviour surprises you, [`performance`] when you are
-//! tuning, [`shm_ipc`] for cross-process rings, and [`migration`] if you are
-//! coming from `cpp-fastchan`.
+//! tuning, and [`shm_ipc`] for cross-process rings.
 //!
 //! These modules carry no code — they exist only to host documentation.
 
@@ -33,7 +32,3 @@ pub mod performance {}
 #[cfg_attr(docsrs, doc(cfg(feature = "shm")))]
 #[doc = include_str!("../docs/guide/shm_ipc.md")]
 pub mod shm_ipc {}
-
-/// **Migrating from `cpp-fastchan`** — name and behaviour mapping.
-#[doc = include_str!("../docs/guide/migration.md")]
-pub mod migration {}

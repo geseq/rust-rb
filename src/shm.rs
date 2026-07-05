@@ -21,11 +21,17 @@
 //! 40   producer_lease u64 (atomic) opaque token of the producer holder, 0 = free
 //! 48   consumer_lease u64 (atomic) opaque token of the consumer holder, 0 = free
 //! 56   generation u64 (atomic) seqlock: odd while (re)initializing
-//! 264  starving  usize (atomic) producer out-of-space signal (read slot)
 //! 128  write_cursor  usize (atomic, own 128-byte slot)
 //! 256  read_cursor   usize (atomic, own 128-byte slot)
+//! 264  starving  usize (atomic) producer out-of-space signal (in read slot)
 //! 384  buffer        capacity * unit_size bytes
 //! ```
+//!
+//! All multi-byte fields use the host's **native** byte order, and a region is
+//! **same-host only**: the producer and consumer are two processes on one
+//! machine, so they share endianness (and `arch_bits` rejects a mismatched
+//! `usize` width on top of that). This is a live IPC layout, not a portable
+//! on-disk or on-wire format — do not persist a region and map it elsewhere.
 //!
 //! # Trust model
 //!
@@ -122,6 +128,41 @@ const BUFFER_OFFSET: usize = 384;
 /// the region's contents — see the module's trust model). Types with
 /// validity invariants (`bool`, `char`, most `enum`s, anything with niches)
 /// must not be implemented unless the peer is trusted to uphold them.
+///
+/// # Examples
+///
+/// Integers, floats, and arrays of them are ready to use:
+///
+/// ```
+/// use std::os::fd::AsFd;
+/// use rust_rb::{memfd, RingBuffer};
+/// # fn main() -> std::io::Result<()> {
+/// let fd = memfd("shmitem-doc")?;
+/// // SAFETY: fresh private memfd, only cooperating handles touch it.
+/// let (mut tx, mut rx) = unsafe { RingBuffer::<[u64; 4]>::create_shm(fd.as_fd(), 64)? };
+/// tx.push([1, 2, 3, 4]);
+/// assert_eq!(rx.pop(), [1, 2, 3, 4]);
+/// # Ok(())
+/// # }
+/// ```
+///
+/// A `#[repr(C)]` plain-old-data struct can opt in — but only if it is valid
+/// for *every* bit pattern a peer might write (so no `bool`, `char`, `enum`,
+/// or reference fields):
+///
+/// ```
+/// use rust_rb::ShmItem;
+///
+/// #[derive(Clone, Copy)]
+/// #[repr(C)]
+/// struct Tick {
+///     price: u64,
+///     qty: u64,
+/// }
+///
+/// // SAFETY: two plain `u64`s; every bit pattern is a valid `Tick`.
+/// unsafe impl ShmItem for Tick {}
+/// ```
 pub unsafe trait ShmItem: Copy {}
 
 macro_rules! shm_item {
@@ -1066,5 +1107,58 @@ where
     pub unsafe fn recover_shm_with(fd: BorrowedFd<'_>) -> io::Result<ElemPair<T, P, C>> {
         // SAFETY: forwarded caller contract; region validated by open().
         unsafe { recover_pair(Self::open(fd)?, Producer::from_core, Consumer::from_core) }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::fd::AsFd;
+
+    use super::*;
+
+    /// Build a valid element ring in a fresh memfd, then let both handles drop
+    /// (releasing their leases). The initialized region persists in the fd.
+    fn fresh_region_fd() -> OwnedFd {
+        let fd = memfd("rb-seqlock-unit").unwrap();
+        // SAFETY: fresh private memfd, cooperating handles only.
+        let (_tx, _rx) = unsafe { RingBuffer::<u64>::create_shm(fd.as_fd(), 64) }.unwrap();
+        fd
+    }
+
+    /// The seqlock guard: a region observed mid-(re)initialization — generation
+    /// odd — must be rejected on attach rather than read as a half-written
+    /// chimera of old and new header fields.
+    #[test]
+    fn odd_generation_is_rejected_as_initializing() {
+        let fd = fresh_region_fd();
+
+        // Force the seqlock generation odd, as if a writer were mid-init.
+        let header = ShmRegion::map(fd.as_fd(), BUFFER_OFFSET).unwrap();
+        // SAFETY: OFF_GENERATION is 8-aligned and inside the header mapping;
+        // the store lands in the shared pages and outlives this mapping.
+        let g = unsafe { header.atomic::<AtomicU64>(OFF_GENERATION) };
+        g.store(g.load(Ordering::Acquire) | 1, Ordering::Release);
+        drop(header);
+
+        // SAFETY: cooperating handle; the region is otherwise valid.
+        // `.err()` drops the `Ok` value so we don't require `Consumer: Debug`.
+        let err = unsafe { RingBuffer::<u64>::attach_shm_consumer(fd.as_fd()) }
+            .err()
+            .expect("odd generation must be rejected");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("being initialized"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// The same region, with its (even) generation intact, attaches fine —
+    /// proof the rejection above is the generation guard, not a bad fd.
+    #[test]
+    fn even_generation_attaches() {
+        let fd = fresh_region_fd();
+        // SAFETY: cooperating handle; region is valid and idle.
+        let rx = unsafe { RingBuffer::<u64>::attach_shm_consumer(fd.as_fd()) };
+        assert!(rx.is_ok(), "a valid even-generation ring must attach");
     }
 }

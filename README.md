@@ -170,6 +170,9 @@ drop(rx);
 // let mut rx = unsafe { BytesRingBuffer::attach_shm_consumer(fd.as_fd())? };
 ```
 
+See [`examples/ipc_pair.rs`](examples/ipc_pair.rs) for a complete, runnable
+parent/child version — `cargo run --example ipc_pair --features shm`.
+
 - Works with any mappable fd (`memfd` helper included, or `shm_open`).
 - The region carries a validated header (magic/version/ring kind/element
   size/architecture/capacity, cursor sanity) — accidents are rejected;

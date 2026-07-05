@@ -169,6 +169,44 @@ fn crash_child_entry() {
     std::process::exit(0);
 }
 
+/// At-least-once consumer recovery: a consumer that dies while holding an
+/// in-flight `Msg` (popped but not yet dropped, so its read-cursor advance was
+/// never published) has that message DELIVERED AGAIN after recovery — the
+/// documented at-least-once counterpart to the no-loss test above.
+#[test]
+fn consumer_death_holding_msg_redelivers_at_least_once() {
+    let fd = memfd("rb-at-least-once").unwrap();
+    // SAFETY: fresh private memfd, cooperating handles only.
+    let (mut tx, mut rx) = unsafe { BytesRingBuffer::create_shm(fd.as_fd(), 4096) }.unwrap();
+    tx.push(b"first");
+    tx.push(b"second");
+
+    // Consume "first" but "die" before releasing it: a `Msg` advances the read
+    // cursor on drop, so forgetting it leaves the cursor un-advanced.
+    let held = rx.pop();
+    assert_eq!(&*held, b"first");
+    std::mem::forget(held);
+    // Both endpoints are now gone; leak the handles so no `Drop` publishes or
+    // releases on their behalf (as a crash would not).
+    std::mem::forget(tx);
+    std::mem::forget(rx);
+
+    // Recover both roles. The read cursor never moved past "first", so recovery
+    // redelivers it (at-least-once), followed by "second".
+    // SAFETY: cooperating handles; the previous holders are gone (forgotten).
+    let (_tx2, mut rx2) = unsafe { BytesRingBuffer::recover_shm(fd.as_fd()) }.unwrap();
+    assert_eq!(
+        &*rx2.pop(),
+        b"first",
+        "the in-flight message is redelivered"
+    );
+    assert_eq!(&*rx2.pop(), b"second");
+    assert!(
+        rx2.try_pop().is_none(),
+        "nothing beyond the redelivery window"
+    );
+}
+
 /// Recovery is an unconditional takeover, and the guarded lease release
 /// means the *old* handles' drops cannot revoke the new holder's leases.
 #[test]
