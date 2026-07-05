@@ -1,9 +1,9 @@
 # SPMC design: `spmc::RingBuffer` (gating) and `broadcast::RingBuffer` (lossy)
 
-_Status: REVISED after adversarial audits #1 (memory model) and #2 (performance);
-API/lifecycle audit in flight — sections marked **[PENDING-AUDIT-3]**. Tracked
-as `rust-rb-owp`. **[DECIDED]** = settled in the 2026-07-05 grilling session;
-**[OPEN]** = final grill round. Audit finding refs: M-Fn (memory), P-Fn (perf)._
+_Status: REVISED after all three adversarial audits — #1 memory model (M-Fn),
+#2 performance (P-Fn), #3 API/lifecycle (A-n). Tracked as `rust-rb-owp`.
+**[DECIDED]** = settled in the 2026-07-05 grilling session; §7 lists the
+final owner decisions before implementation._
 
 ## 1. Scope
 
@@ -47,11 +47,22 @@ branch.
 
 ```
 CachePadded write_cursor           AtomicUsize  (written: producer only)
+             + closed: AtomicBool  (same padded slot — the line consumers
+                                    already poll; written ONCE by producer
+                                    Drop, read only on would-block paths) [A-1.1]
+             + dropped_through     AtomicUsize  (written: producer only,
+                                    advanced BEFORE each overwrite-drop;
+                                    teardown's lower bound) [A-2.1]
 CachePadded active_bitmap          AtomicU64    (written: subscribe/detach, cold)   [P-F2]
 CachePadded consumer_slots[MAX]    AtomicUsize× (each written by exactly ONE consumer)
              DETACHED = usize::MAX sentinel (correctness backstop under the bitmap)
 buffer      [Slot<T>; capacity]                 (written: producer only)
 ```
+
+Audit-3 refs: A-n. `dropped_through` is **shared, not producer-local**: the
+teardown walk must read it (a producer-local field is unreachable from
+`Shared::Drop`, and the naive `[write_cursor - cap, write_cursor)` window
+double-drops after a panicking overwrite-drop or a forgotten `WriteSlot`).
 
 Single-writer everywhere; every cross-thread word `CachePadded` (128 B).
 `MAX_CONSUMERS`: constructor parameter, **default 8** (not 64 — the shm
@@ -108,7 +119,17 @@ deferral, ≤ capacity/8 max 64 — same producer-visible bound as SPSC
   differs from SPSC's: **no `DerefMut`** (concurrent `&T` readers on the
   same slot), **advance-only drop** (never `drop_in_place` — the value stays
   live for other consumers) [M-F7].
-- `pop()`/`try_pop()` where `T: Clone`: clone out + advance.
+- `pop()`/`try_pop()` where `T: Clone`: clone out, **then** advance
+  (normative order — a panicking clone leaves the element unconsumed)
+  [A-5].
+- **Closed contract** [A-1.1]: `pop() -> Result<T, Closed>` — `Err` only
+  when the producer is dropped AND this consumer has drained all published
+  messages; `try_pop() -> Result<Option<T>, Closed>` (`Ok(None)` =
+  empty-but-alive). The `closed` flag is read only inside the would-block
+  loop (zero hot-path cost); producer `Drop` = flag store **then notify**
+  (flag-then-notify closes the missed-wakeup window). shm caveat: a
+  *crashed* producer never sets the flag — `Closed` covers graceful drop;
+  crash detection stays lease/watchdog territory.
 - `mem::forget(PopRef)` = **redelivery** (cursor never advanced; next pop
   re-reads the same seq — mirrors SPSC) [M-F6]. New consequence to document:
   the un-advanced cursor also gates the producer globally, so
@@ -131,13 +152,30 @@ deferral, ≤ capacity/8 max 64 — same producer-visible bound as SPSC
   **The join point is the re-read**: delivery contract = "messages published
   after `w'`".
 - Detach (consumer `Drop`): `slot.store(DETACHED, Release)`;
-  `active_bitmap.fetch_and(!bit)`. Mandatory (a dropped-attached consumer
-  gates forever). Mid-scan detach is safe: a DETACHED slot imposes no
-  constraint — the departing consumer's borrows are dead by lifetime rules
-  before Drop runs [M-F3]. Re-subscribe of the same slot goes through the
-  full choreography (no stale low re-init possible).
-- Registry full ⇒ `subscribe()` errors **[PENDING-AUDIT-3: error type +
-  subscribe-during-teardown race]**.
+  `active_bitmap.fetch_and(!bit)`; **then notify the producer wait** [A-1.3:
+  the missing dual — a producer parked on min-movement stalls forever when
+  its last gating consumer detaches silently]. Mid-scan detach is safe: a
+  DETACHED slot imposes no constraint — the departing consumer's borrows are
+  dead by lifetime rules before Drop runs [M-F3]. Re-subscribe goes through
+  the full choreography (no stale low re-init possible).
+- `subscribe()` exists **only as a method on a live handle**
+  (`Producer::subscribe`/`Consumer::subscribe`), which clones the `Arc`
+  *before* the registry CAS — makes the subscribe-vs-teardown race
+  structurally unreachable [A-2.2]. Returns
+  `Result<Consumer, SubscribeError>`, `enum SubscribeError { Closed, Full }`
+  [A-1.4].
+- Zero consumers: `push`/`try_push` **succeed** (free-run +
+  drop-on-overwrite; an error would race every subscribe and joiners can't
+  see pre-join messages anyway — unlike tokio there's no retention
+  contract). `Producer::consumer_count()` via the registry scan [A-1.3].
+- Ownership graph [A-2.3]: `Arc<SpmcShared>`; handles =
+  `Producer { arc, next_seq, cached_min, cached_cursor[] }`,
+  `Consumer { arc, slot_idx, read_cursor, cached_write }`. A registry slot
+  is exclusively owned by its consumer from CAS-acquire to DETACHED-store,
+  and the DETACHED store happens in `Consumer::Drop` before the `Arc`
+  release — a slot never outlives its refcount. Teardown = last `Arc` drop →
+  `Shared::Drop` walks `[dropped_through, write_cursor)`; no borrow can be
+  live (every `PopRef` borrows a `Consumer`, which holds the `Arc`).
 
 ### 2.5 `T: Send`, producer-drops-on-overwrite **[DECIDED]**
 
@@ -149,12 +187,15 @@ deferral, ≤ capacity/8 max 64 — same producer-visible bound as SPSC
   abandoned `claim` double-drops — the unwound `push`'s occupant is still
   inside the naive teardown window]. Push-retry and re-claim consult the
   watermark and skip the drop. Subsumes the first-lap check (starts at 0).
-- Teardown (last handle): drop
-  `[max(next_seq - capacity, dropped_through_boundary), next_seq)` via
-  `SlotCleanup` **[PENDING-AUDIT-3: ownership graph, who is "last" with
-  dynamic membership]**.
-- Panic in the old value's drop: propagates out of `push`/`claim`; the
-  watermark keeps state consistent; document in the semantics guide.
+- Teardown (last `Arc` drop): `Shared::Drop` walks
+  `[dropped_through, write_cursor)` via `SlotCleanup` — `dropped_through`
+  (shared, §2.1) is the lower bound, making the double-drop via panicking
+  overwrite-drop or forgotten `WriteSlot` unreachable [A-2.1]. Panic in a
+  teardown drop: `Box<[T]>` policy — propagate the first panic, remaining
+  window elements leak (stated, not silent) [A-5].
+- Panic in the old value's drop during push/claim: propagates; the watermark
+  keeps state consistent; producer handle remains usable; consumers
+  unaffected. Document in the semantics guide.
 - shm: `T: ShmItem` ⇒ no Drop ⇒ this machinery compiles away.
 
 ### 2.6 Wait strategies
@@ -182,15 +223,30 @@ element ring's local check avoids).
 
 ### 2.8 shm variant
 
-- Header: consumer-cursor table (MAX fixed at create) + per-slot leases +
-  `active_bitmap`. New header kinds + version bump
-  **[PENDING-AUDIT-3: exact geometry]**.
-- Crash story: dead attached consumer gates the producer until
-  `force_detach_consumer(slot)` (unsafe; caller asserts death). The
-  **zombie problem** — a force-detached-but-alive consumer keeps
-  Release-storing its cursor into the slot — needs a mechanism (slot epoch /
-  per-flush lease check / documented cooperative-only)
-  **[PENDING-AUDIT-3: the hard one]**.
+- Header [A-6.3]: new kinds `KIND_SPMC_BYTES=3, KIND_SPMC_ELEMS=4,
+  KIND_BCAST_BYTES=5, KIND_BCAST_ELEMS=6` (VERSION stays 1 — old binaries
+  reject unknown kinds); `max_consumers: u32` at offset 36 (current gap);
+  `closed` in the write-cursor's padded slot; consumer table at offset 384,
+  **one 128-byte slot per consumer**: `{ lease: u64, control: u64
+  (epoch|state), cursor: usize }` co-resident (producer scan touches one
+  line per consumer; that line already carries the consumer's flush).
+  Buffer at `384 + 128·max_consumers`.
+- **Zombie consumer — slot retirement + epoch [A-4.1, adopted]**: the
+  control word is `{u32 epoch | u32 state}`, separate from the cursor word.
+  `subscribe` CASes state=ACTIVE at the current epoch;
+  `force_detach_consumer(slot)` (unsafe; caller asserts death) bumps the
+  epoch and sets RETIRED — **a retired slot is never re-issued until
+  `recover_shm`** (full quiesce). The producer's min-scan reads the control
+  word in the same pass and skips non-ACTIVE slots regardless of cursor
+  content. A live zombie's stores land on a retired word nobody reads: the
+  blast radius of a wrong death assertion degrades from "ring corrupted /
+  innocent re-subscriber clobbered" to "one slot burned + the zombie's own
+  reads lose gating protection" (documented: `force_detach` revokes the
+  victim's read validity — same trust register as `force_attach`).
+  Rejected alternatives, for the record: packed `gen|cursor` in one word
+  (32-bit cursors wrap in seconds on byte rings); per-flush lease check
+  (TOCTOU — only a CAS-per-flush closes it, abandoning single-writer for
+  every well-behaved consumer).
 - Recovered producer must rebuild `cached_min` by a scan — never trust a
   default [M-F17].
 - Only `CrossProcess` strategies.
@@ -243,9 +299,9 @@ consumer at position s (hot path):
   which is the 1.15 ns path. Slot seqs become validate-only (one fetch, no
   spin residency).
 - `tail` is therefore **load-bearing and per-push** (also required by
-  subscribe/lag [M-F14]; per-push makes `Lagged(n)` exact for free
-  **[PENDING-AUDIT-3: final contract]**). Release-stored after the slot
-  publish; holds ≤ highest published seq.
+  subscribe/lag [M-F14]; per-push makes `Lagged(n)` exact for free — the
+  contract adopted in §3.2 [A-3.1]). Release-stored after the slot publish;
+  holds ≤ highest published seq.
 - ABA: sound — slot series `2s+1, 2s+2, 2(s+cap)+1, …` is strictly
   increasing; exact-match accept is generation-unique; u64 wraps in ~29
   years at 10 G msg/s [M-F13].
@@ -255,15 +311,28 @@ consumer at position s (hot path):
   **≈ SPSC caught-up profile**; throughput independence vs k is the bench
   gate, now achievable because spinners share the tail line only.
 
-### 3.2 Loss semantics **[OPEN — final grill]**
+### 3.2 Loss semantics [A-3, resolved — confirm in final grill]
 
-Lap ⇒ `Err(Lagged { missed })` (exact — per-push tail). Reposition:
-**jump-to-oldest-retained + slack** (slack bounds the lag-storm where a slow
-reader re-laps immediately; proposal: capacity/8)
-**[PENDING-AUDIT-3: storm bound + position-after-error]**; `skip_to_latest()`
-as the explicit market-data alternative. Proposed naming:
-`pop() -> Result<T, Lagged>`, `try_pop() -> Result<Option<T>, Lagged>`
-**[OPEN]**.
+- Lap ⇒ `Err(Lagged { missed: u64 })`, **exact** as of detection (per-push
+  tail makes it free; the every-k question is dead).
+- Reposition [A-3.2]: `new_pos = tail − capacity + SLACK`,
+  **SLACK = capacity/8** (same constant family as adaptive publish).
+  Guarantees: `capacity − capacity/8` messages immediately readable; the
+  producer must advance ≥ capacity/8 before the consumer can lag again —
+  `Lagged` frequency bounded to one per capacity/8 pushes, and cumulative
+  `missed` across successive errors is gap-free and overlap-free
+  (`missed = new_pos − old_pos`). Kills the lag-storm livelock of naive
+  jump-to-oldest.
+- `skip_to_latest()` (`pos = tail`) as the explicit market-data method.
+- API + closed contract unified [A-1.2]:
+  `pop() -> Result<T, PopError>`, `try_pop() -> Result<Option<T>, PopError>`,
+  `enum PopError { Lagged { missed: u64 }, Closed }`. `Closed` only after
+  remaining published slots are drained (slot seqs stay stable after
+  producer death). **Keep `pop` naming** — the changed contract is carried
+  by the `Result`, per crate convention [A-6.2].
+- Lossy pop is **panic-free at the API layer** (`T: Copy`/NoUninit, no user
+  code runs; torn bytes discarded as `MaybeUninit`). Lossy `drain`: deferred
+  from v1 (per-message validation erodes the batching win) [A-5].
 
 ### 3.3 The strict copy **[DECIDED, extended by audits]**
 
@@ -288,10 +357,14 @@ per-push tail). No registry, no leases, unbounded count, no-op Drop.
 
 ### 3.5 Wait strategies
 
-Producer never waits (no P strategy — signature question
-**[PENDING-AUDIT-3]**). Consumers: **spin-only, forced** — a parked consumer
-would need producer notifies, violating the zero-consumer-knowledge design.
-Spinning targets the shared `tail` line (§3.1).
+Producer never waits ⇒ **no `P` type parameter**:
+`broadcast::RingBuffer<T, C = PauseWait>` — a phantom `P` on a producer that
+structurally cannot wait is a type-level lie; the crate's precedent is
+types-encode-truths (handles aren't `Clone`) [A-6.1]. Consumers:
+**spin-only, forced** — a parked consumer would need producer notifies,
+violating the zero-consumer-knowledge design. Spinning targets the shared
+`tail` line (§3.1). Consumer would-block loop also checks `closed` [A-1.2]
+(one header flag, producer-Drop-written).
 
 ### 3.6 Bytes variant — **Agrona three-counter design** [M-F15 resolved the fork]
 
@@ -374,6 +447,18 @@ Lossy: shares `CachePadded`, rounding, shm region scaffolding only.
   traffic" claim.
 - **Adversarial audits** per implementation PR, as for the SPSC rounds.
 
+## 5b. Documentation restructure this forces [A-6.4]
+
+`docs/guide/semantics.md` statements change meaning per machine: producer
+`len`/`is_full` ("one publish window" → "min over N windows" / meaningless
+under lossy free-run); `mem::forget` (SPSC: benign self-redelivery; gating:
+redelivery **plus global stall of every other consumer**; lossy: no guards,
+inapplicable); "exactly one producer and one consumer — enforced by types"
+(false for both new machines); drain at-most-once (becomes per-consumer);
+wrap-around (gains the lossy u64 seq story). Split into `semantics.md`
+(shared invariants) + per-machine contract pages, each carrying the
+closed/forget/counters/panic table. Lands with PR-1/PR-2 docs.
+
 ## 6. Implementation phasing
 
 1. **PR-1** `spmc` element heap — with the P-F1/2/3 triple (bitmap,
@@ -386,13 +471,20 @@ Lossy: shares `CachePadded`, rounding, shm region scaffolding only.
 4. **PR-4** shm — gating consumer table + zombie answer; broadcast
    read-only lease-free attach + PROT_READ suite; churn bench.
 
-## 7. Open questions (final grill)
+## 7. Open questions (final grill round)
 
-1. `MAX_CONSUMERS` default (proposal: 8; hard cap 64 = bitmap word).
-2. Lossy reposition: oldest+slack (slack = capacity/8?) default +
-   `skip_to_latest()` — confirm. `Lagged` exact (free with per-push tail).
-3. Lossy naming: `pop() -> Result<T, Lagged>` vs `recv`-family.
-4. v1 spin-only end-to-end (gating producer side + all lossy) — confirm.
-5. Channel-closed semantics — **[PENDING-AUDIT-3]** proposal to review.
-6. Gating-shm zombie consumer mechanism — **[PENDING-AUDIT-3]** options to
-   decide.
+All audit findings have adopted resolutions in the text above; these are the
+decisions that remain the owner's:
+
+1. **`MAX_CONSUMERS` default** — proposal: 8 (hard cap 64 = the bitmap
+   word; shm header pays 128 B/slot).
+2. **Confirm the closed-contract API shape** — gating `pop()` becomes
+   `Result<T, Closed>` (SPSC `pop()` stays `-> T`); lossy
+   `Result<T, PopError{Lagged, Closed}>`. Necessary (blocking-forever is
+   unshippable) but it does diverge the two rings' signatures from SPSC's.
+3. **Confirm lossy reposition** — oldest + capacity/8 slack default,
+   `skip_to_latest()` opt-in, `pop` naming kept.
+4. **Confirm v1 spin-only** end-to-end (gating producer side + all lossy).
+5. **Confirm the zombie answer** — slot retirement + epoch control word;
+   retired slots unavailable until `recover_shm`; `force_detach` documented
+   as revoking the victim's read validity.
