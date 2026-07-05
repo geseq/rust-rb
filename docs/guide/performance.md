@@ -10,9 +10,10 @@ explains the one observable quirk the fast path introduces.
 
 If numbers below look surprising, remember the single most important caveat:
 **absolute latency and throughput vary enormously by core pair and by machine.**
-Every figure quoted here was measured on a specific NVIDIA Grace (Neoverse V2)
-core pair; treat them as *shapes to expect*, never as targets to hit on
-different hardware.
+The SPSC figures quoted here were measured on a specific NVIDIA Grace
+(Neoverse V2) core pair; the multi-consumer figures (section 6) on a GB10 DGX
+Spark (Cortex-X925) — each section names its box. Treat them as *shapes to
+expect*, never as targets to hit on different hardware.
 
 ## 1. Core pinning dominates everything else
 
@@ -222,3 +223,46 @@ Above all: **reproduce on your own hardware.** The Grace numbers here exist to
 show you the *shape* of a good result — sub-2 ns/op on the fixed ring, rate
 rising with payload size on the byte ring — not a bar to clear. A different core
 pair, on the same chip, can differ by more than 2x.
+
+## 6. Multi-consumer rings
+
+The multi-consumer numbers were measured on a **different machine** from
+everything above: a GB10 DGX Spark (Cortex-X925 cores, pinned), where the
+SPSC yield-strategy baseline is 2.36 ns/op — *not* the NVIDIA Grace
+(Neoverse V2) box the SPSC figures elsewhere in this guide come from. Do not
+mix the two sets. The benches are `examples/bench_spmc.rs` and
+`examples/bench_broadcast.rs`; as always, read the second (warm) pass.
+
+What held, on that box:
+
+- **Gating N=1 parity.** A [`spmc`](crate::spmc) ring with a single consumer
+  runs at 0.99–1.06× the SPSC ring across wait strategies — you do not pay
+  for the multi-consumer machinery until you use it.
+- **Straggler isolation.** With several fast consumers plus one rate-limited
+  one, the producer tracked the straggler (46.17 ns/op against the
+  straggler's 45.98) instead of degrading below it — the selective
+  cursor-refresh design doing its job.
+- **Lossy lap accounting.** A permanently lagging broadcast consumer costs
+  the producer ~7.6 ns/push, with exact loss accounting throughout
+  (accepted + missed = pushed).
+- **Copy strategy (A/B, resolved).** The broadcast rings' word-wise atomic
+  ("strict") payload copy is permanent: the volatile-copy alternative
+  measured **2.6× slower on pop at 64 B payloads and collapsed at 256 B**,
+  so the strict copy won in both directions.
+
+What did not (known, tracked, correctness unaffected):
+
+- **Gating caught-up N-scaling is not flat**: with all consumers caught up
+  and spinning, producer cost rose +24% at N=2 and +114% at N=4
+  (`rust-rb-vio` in the issue tracker).
+- **Lossy caught-up coupling**: caught-up *spinning* broadcast consumers
+  couple the producer — 4.5 ns/push alone, 25.3 with one spinning reader,
+  65.5 with four — while a lagging reader decouples it back to 8.7
+  (`rust-rb-6l0`). The coupling is specific to the caught-up *tight-spinning*
+  regime (the failing bench polled with raw `try_pop` loops); whether
+  gentler consumer strategies dampen it is one of the open questions on the
+  issue.
+
+Both findings are performance-shape issues only: accounting stayed exact, no
+torn reads were accepted, and nothing was lost under keep-up in any of the
+failing configurations.

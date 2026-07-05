@@ -1,11 +1,13 @@
-//! High-performance **single-producer / single-consumer** ring buffers.
+//! High-performance **single-producer** ring buffers: SPSC queues and
+//! single-producer / multi-consumer broadcasts (lossless and lossy).
 //!
-//! A Rust port of the SPSC queue from
+//! The SPSC core is a Rust port of the queue from
 //! [`cpp-fastchan`](https://github.com/geseq/cpp-fastchan), preserving the
 //! design choices that make it fast — monotonic masked indices, per-side
 //! caching of the other side's cursor, cache-line padding to avoid false
 //! sharing, and compile-time-selectable wait strategies — and adding adaptive
-//! read-cursor publishing and zero-copy in-place access on top.
+//! read-cursor publishing and zero-copy in-place access on top. The
+//! multi-consumer rings generalize the same engine.
 //!
 //! # Quick start
 //!
@@ -73,18 +75,29 @@
 //!
 //! # Which ring do I want?
 //!
-//! - **One fixed `T`** (a struct, an `i64`, a `[u8; N]`) → [`RingBuffer<T>`]. It
-//!   stores `T` by value with no per-message framing overhead.
-//! - **Variable-length byte payloads** (serialized messages, wire frames) →
-//!   [`BytesRingBuffer`]. Each record is length-framed inside one contiguous
-//!   ring.
-//! - **Two processes sharing one ring** (`shm` feature, Linux) → the
-//!   [`create_shm`](RingBuffer::create_shm)/[`attach_shm_producer`](RingBuffer::attach_shm_producer)
-//!   constructors on either ring. See the [shared-memory guide](guide::shm_ipc).
+//! Three questions: is the payload **one fixed `T`** (a struct, an `i64`, a
+//! `[u8; N]` — stored by value, no framing) **or variable-length bytes**
+//! (serialized messages, wire frames — length-framed in one contiguous
+//! ring)? Is there **one consumer or many**? And with many: should a slow
+//! consumer **gate the producer (lossless)** or **lose messages and get an
+//! exact count (lossy)**?
 //!
-//! Both rings are **single-producer / single-consumer**: the [`Producer`] and
-//! [`Consumer`] halves are `Send` but not `Clone`, so the SPSC contract is
-//! enforced at compile time.
+//! | Payload | One consumer | Many — lossless (gating) | Many — lossy |
+//! | --- | --- | --- | --- |
+//! | Fixed `T` | [`RingBuffer<T>`] | [`spmc::RingBuffer`] | [`broadcast::RingBuffer`] |
+//! | Byte messages | [`BytesRingBuffer`] | [`spmc_bytes::BytesRingBuffer`] | [`broadcast_bytes::BytesRingBuffer`] |
+//!
+//! All six can span **two processes** (`shm` feature, Linux) through their
+//! `create_shm`/`attach_shm_*` constructors; see the
+//! [shared-memory guide](guide::shm_ipc). The
+//! [API guide](guide::api_usage) has a worked snippet per ring.
+//!
+//! Every ring is **single-producer**: each producer half is `Send` but not
+//! `Clone`, so that side of the contract is enforced at compile time. The two
+//! SPSC rings also enforce the **single consumer** the same way; the four
+//! multi-consumer rings instead let consumers `subscribe` dynamically. The
+//! [semantics guide](guide::semantics) carries the full per-machine contract
+//! matrix.
 //!
 //! # Module map
 //!
@@ -110,8 +123,10 @@
 //!   exact **bytes**
 //!   ([`Lagged`](broadcast_bytes::PopError::Lagged)`.missed_bytes`).
 //! - [`wait`] — the [`WaitStrategy`] trait and the [`PauseWait`], [`YieldWait`],
-//!   [`NoOpWait`], and [`CvWait`] implementations selected per side as type
-//!   parameters `P` (producer) and `C` (consumer).
+//!   [`NoOpWait`], [`SleepWait`], [`BackoffWait`], and [`CvWait`]
+//!   implementations selected per side as type parameters `P` (producer) and
+//!   `C` (consumer) — plus the [`CrossProcess`] (shm) and [`SelfTimed`]
+//!   (multi-consumer) marker traits that constrain the choice.
 //! - [`shm`] — shared-memory backing for cross-process rings (Linux, behind the
 //!   `shm` feature).
 //!
@@ -120,16 +135,21 @@
 //! The [`guide`] module holds task-oriented walkthroughs that go beyond the
 //! item-by-item reference:
 //!
-//! - [Configuration](guide::configuration) — choosing a capacity and a wait
-//!   strategy.
-//! - [API usage](guide::api_usage) — which method to reach for, per use case.
+//! - [Configuration](guide::configuration) — choosing a capacity, a wait
+//!   strategy (including the `SelfTimed` constraint on the multi-consumer
+//!   rings), and the broadcast reposition slack.
+//! - [API usage](guide::api_usage) — which ring, then which method, per use
+//!   case; worked snippets for all six rings.
 //! - [Semantics & gotchas](guide::semantics) — the behaviours that surprise
-//!   people (transient `len`/`is_full` over-count, `mem::forget` re-delivery,
-//!   the single-P/single-C contract).
+//!   people (transient `len`/`is_full` over-count, `mem::forget` re-delivery)
+//!   and the per-machine contract matrix (counters / forget / closed / panic
+//!   sites across SPSC, gating, and lossy).
 //! - [Performance tuning](guide::performance) — core pinning, the adaptive
-//!   read-cursor publish, and a reproducible benchmarking recipe.
-//! - [Shared memory / IPC](guide::shm_ipc) — running a ring across two
-//!   processes, the trust model, and crash recovery.
+//!   read-cursor publish, a reproducible benchmarking recipe, and the honest
+//!   multi-consumer numbers.
+//! - [Shared memory / IPC](guide::shm_ipc) — running a ring across processes,
+//!   the trust model, crash recovery, the gating consumer table, and the
+//!   lossy rings' read-only consumers.
 //!
 //! # Feature flags
 //!
@@ -140,8 +160,12 @@
 //! [`YieldWait`]: wait::YieldWait
 //! [`PauseWait`]: wait::PauseWait
 //! [`NoOpWait`]: wait::NoOpWait
+//! [`SleepWait`]: wait::SleepWait
+//! [`BackoffWait`]: wait::BackoffWait
 //! [`CvWait`]: wait::CvWait
 //! [`WaitStrategy`]: wait::WaitStrategy
+//! [`CrossProcess`]: wait::CrossProcess
+//! [`SelfTimed`]: wait::SelfTimed
 //! [`RingBuffer<T>`]: RingBuffer
 
 #![deny(unsafe_op_in_unsafe_fn)]

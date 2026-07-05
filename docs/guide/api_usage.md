@@ -1,13 +1,124 @@
-# API usage — which method for which job
+# API usage — which ring, then which method
 
-`rust-rb` gives you two rings — an **element ring** ([`RingBuffer<T>`](crate::RingBuffer),
-split into a [`Producer<T>`](crate::Producer) / [`Consumer<T>`](crate::Consumer)) and a
+`rust-rb` gives you **six rings**. This guide first helps you pick one, then
+walks the per-method decisions for the single-consumer (SPSC) pair — an
+**element ring** ([`RingBuffer<T>`](crate::RingBuffer), split into a
+[`Producer<T>`](crate::Producer) / [`Consumer<T>`](crate::Consumer)) and a
 **byte ring** ([`BytesRingBuffer`](crate::BytesRingBuffer), split into a
 [`BytesProducer`](crate::BytesProducer) / [`BytesConsumer`](crate::BytesConsumer)). Each
 side exposes several methods that do "the same thing" but differ in *blocking*,
-*copying*, and *batching*. This guide is a decision table plus a worked snippet
-per choice. For the sharp behavioural edges those methods expose, see the
-[semantics guide](crate::guide::semantics).
+*copying*, and *batching*. For the sharp behavioural edges those methods
+expose, see the [semantics guide](crate::guide::semantics).
+
+## Which ring do I want?
+
+Three questions pick the ring: is the payload **one fixed type `T` or
+variable-length bytes**? Is there **one consumer or many**? And with many —
+when a consumer falls behind, should it **block the producer (lossless,
+gating)** or **lose messages and know exactly how many (lossy)**?
+
+| Payload | One consumer | Many — lossless (slow reader gates the producer) | Many — lossy (slow reader loses messages) |
+| --- | --- | --- | --- |
+| Fixed `T` | [`spsc::RingBuffer`](crate::RingBuffer) | [`spmc::RingBuffer`](crate::spmc::RingBuffer) | [`broadcast::RingBuffer`](crate::broadcast::RingBuffer) |
+| Byte messages | [`spsc_bytes::BytesRingBuffer`](crate::BytesRingBuffer) | [`spmc_bytes::BytesRingBuffer`](crate::spmc_bytes::BytesRingBuffer) | [`broadcast_bytes::BytesRingBuffer`](crate::broadcast_bytes::BytesRingBuffer) |
+
+The gating/lossy split is a real fork, not a mode flag: **gating** means every
+consumer observes every message and the producer waits for the slowest one
+(backpressure, never loss); **lossy** means the producer never blocks and
+never reads consumer state, and a consumer that gets lapped is told exactly
+what it missed ([`Lagged`](crate::broadcast::PopError::Lagged), an exact
+message count on the element ring, an exact byte count on the byte ring).
+Every ring is single-producer, and all six can also run across two processes
+via the `shm` feature — see the [shared-memory guide](crate::guide::shm_ipc).
+
+### Gating multicast: `spmc::RingBuffer`
+
+Lossless fan-out of a fixed `T`. Consumers subscribe dynamically from either
+handle; dropping the producer closes the ring, and each consumer drains what
+was published before seeing [`Closed`](crate::spmc::Closed):
+
+```rust
+use rust_rb::spmc::{Closed, RingBuffer};
+
+let (mut tx, mut rx) = RingBuffer::new(8);
+let mut rx2 = tx.subscribe().unwrap(); // dynamic membership
+
+tx.push(1u64);
+assert_eq!(rx.pop(), Ok(1));  // every consumer
+assert_eq!(rx2.pop(), Ok(1)); // sees every message
+
+drop(tx); // producer drop closes the ring
+assert_eq!(rx.pop(), Err(Closed));
+```
+
+Consumers read in place ([`pop_ref`](crate::spmc::Consumer::pop_ref) borrows
+`&T`) or by clone ([`pop`](crate::spmc::Consumer::pop), `T: Clone`); a
+consumer that stops consuming eventually blocks the producer — that is the
+gating contract.
+
+### Gating multicast, byte messages: `spmc_bytes::BytesRingBuffer`
+
+The same contract for variable-length byte messages, with the SPSC byte
+ring's framing (each consumer parses frames independently):
+
+```rust
+use rust_rb::spmc_bytes::BytesRingBuffer;
+
+let (mut tx, mut rx) = BytesRingBuffer::new(64);
+let mut rx2 = tx.subscribe().unwrap();
+
+tx.push(b"tick");
+assert_eq!(&*rx.pop().unwrap(), b"tick");
+assert_eq!(&*rx2.pop().unwrap(), b"tick");
+```
+
+### Lossy broadcast: `broadcast::RingBuffer`
+
+The producer free-runs; a lapped consumer is repositioned to
+`tail - capacity + slack` and told exactly how many messages it missed:
+
+```rust
+use rust_rb::broadcast::{PopError, RingBuffer};
+
+let (mut tx, mut rx) = RingBuffer::<u64>::with_slack(8, 2);
+for i in 0..20 {
+    tx.push(i); // never blocks — the reader cannot gate it
+}
+// The idle reader was lapped: exact loss count, repositioned to
+// tail - capacity + slack = 20 - 8 + 2 = 14 …
+assert_eq!(rx.pop(), Err(PopError::Lagged { missed: 14 }));
+// … and it resumes there with gap-free accounting.
+assert_eq!(rx.pop(), Ok(14));
+```
+
+Element types need the [`NoUninit`](crate::NoUninit) bound (no padding bytes:
+payloads are copied word-wise atomically), and consumer wait strategies must
+be [`SelfTimed`](crate::SelfTimed) — see the
+[configuration guide](crate::guide::configuration).
+
+### Lossy broadcast, byte messages: `broadcast_bytes::BytesRingBuffer`
+
+The same free-running producer for variable-length messages; a lapped
+consumer jumps to the most recent record and reports the loss in exact
+**bytes** ([`missed_bytes`](crate::broadcast_bytes::PopError::Lagged)):
+
+```rust
+use rust_rb::broadcast_bytes::{BytesRingBuffer, PopError};
+
+let (mut tx, mut rx) = BytesRingBuffer::new(64);
+let mut rx2 = rx.subscribe(); // never fails
+
+tx.push(b"tick");
+assert_eq!(rx.pop().unwrap(), b"tick");
+assert_eq!(rx2.pop().unwrap(), b"tick");
+
+drop(tx); // producer drop closes the ring
+assert_eq!(rx.pop(), Err(PopError::Closed));
+```
+
+The method tables and snippets below cover the SPSC pair; the four
+multi-consumer modules carry their own full API walkthroughs in their module
+docs.
 
 ## Element ring `RingBuffer<T>`
 
