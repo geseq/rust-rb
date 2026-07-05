@@ -103,6 +103,12 @@
 //!   ring ([`broadcast::RingBuffer`] and its handles): the producer never
 //!   blocks and never reads consumer state; a slow consumer loses messages
 //!   and gets an exact [`Lagged`](broadcast::PopError::Lagged) count.
+//! - [`broadcast_bytes`] — the lossy broadcast ring for **variable-size byte
+//!   messages** ([`broadcast_bytes::BytesRingBuffer`] and its handles): the
+//!   Agrona three-counter protocol with out-of-band validation; a lapped
+//!   consumer repositions to the latest record and reports the loss in
+//!   exact **bytes**
+//!   ([`Lagged`](broadcast_bytes::PopError::Lagged)`.missed_bytes`).
 //! - [`wait`] — the [`WaitStrategy`] trait and the [`PauseWait`], [`YieldWait`],
 //!   [`NoOpWait`], and [`CvWait`] implementations selected per side as type
 //!   parameters `P` (producer) and `C` (consumer).
@@ -146,6 +152,8 @@ mod cursor;
 
 #[cfg(target_has_atomic = "64")]
 pub mod broadcast;
+#[cfg(target_has_atomic = "64")]
+pub mod broadcast_bytes;
 pub mod guide;
 
 #[cfg(all(feature = "shm", target_os = "linux", target_has_atomic = "64"))]
