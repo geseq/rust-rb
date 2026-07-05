@@ -94,3 +94,35 @@ bd close <id>         # Complete work
 - NEVER say "ready to push when you are" - YOU must push
 - If push fails, resolve and retry until it succeeds
 <!-- END BEADS INTEGRATION -->
+
+## Code Review Lessons
+
+When reviewing this codebase (particularly `shm.rs`), avoid these false positives:
+
+### 1. Alignment Validation Is Sufficient
+**What NOT to flag:** "Missing alignment check in `check_elem_type`"
+**Why:** The alignment is guaranteed by:
+- `open_region` validates `OFF_UNIT_SIZE == size_of::<T>()` (same size)
+- `check_elem_type` rejects `align_of::<T>() > 128`
+- Buffer base is 384 (3×128) + page-aligned mmap = 128-aligned
+- Size is always a multiple of alignment, so equal sizes + base alignment ensures correct alignment
+
+### 2. Lease Tokens Are Intentionally Non-Crypto
+**What NOT to flag:** "Weak lease token generation - should use `getrandom`"
+**Why:** By design:
+- Trust model explicitly states tokens have "no liveness meaning"
+- Region is writable by any process holding the fd - tokens catch "accidents, not adversaries"
+- An attacker with the fd can overwrite the lease word directly - crypto-random buys nothing
+- `RandomState` provides sufficient (~2⁻⁶⁴) accidental collision resistance
+
+### 3. Shared Memory is Native-Endian
+**What NOT to flag:** "Endianness not documented/should be little-endian"
+**Why:** The format is **native-endian** (same-host processes share endianness), guarded by `arch_bits`. A one-line doc clarification is useful but the format is correct as-is.
+
+### 4. Design Sketches Are Not Bugs
+**What NOT to flag:** "Missing drain-only recovery mode"
+**Why:** This was a design sketch in the spec, not a requirement. `recover_shm` (both roles) is the implemented feature.
+
+---
+
+**Key principle:** Read the trust model and validation chain before flagging "gaps."
