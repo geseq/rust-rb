@@ -92,6 +92,9 @@
 //!   [`Consumer`]).
 //! - [`spsc_bytes`] — the variable-size byte ring ([`BytesRingBuffer`] and its
 //!   handles).
+//! - [`spmc`] — the single-producer / **multi**-consumer gating broadcast
+//!   ring ([`spmc::RingBuffer`] and its handles): every consumer observes
+//!   every message; a slow consumer gates the producer.
 //! - [`wait`] — the [`WaitStrategy`] trait and the [`PauseWait`], [`YieldWait`],
 //!   [`NoOpWait`], and [`CvWait`] implementations selected per side as type
 //!   parameters `P` (producer) and `C` (consumer).
@@ -138,6 +141,7 @@ pub mod guide;
 #[cfg(all(feature = "shm", target_os = "linux", target_has_atomic = "64"))]
 #[cfg_attr(docsrs, doc(cfg(feature = "shm")))]
 pub mod shm;
+pub mod spmc;
 pub mod spsc;
 pub mod spsc_bytes;
 pub mod wait;
@@ -148,7 +152,8 @@ pub use spsc::{Consumer, Producer, RingBuffer};
 pub use spsc_bytes::{BytesConsumer, BytesProducer, BytesRingBuffer};
 #[doc(inline)]
 pub use wait::{
-    BackoffWait, CrossProcess, CvWait, NoOpWait, PauseWait, SleepWait, WaitStrategy, YieldWait,
+    BackoffWait, CrossProcess, CvWait, NoOpWait, PauseWait, SelfTimed, SleepWait, WaitStrategy,
+    YieldWait,
 };
 
 #[cfg(all(feature = "shm", target_os = "linux", target_has_atomic = "64"))]

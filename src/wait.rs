@@ -28,6 +28,32 @@ use std::time::Duration;
 /// each process constructs its own instance.
 pub unsafe trait CrossProcess: WaitStrategy {}
 
+/// Marker for wait strategies that make progress **without ever needing a
+/// peer notify**: pure spins, yields, and timed sleeps.
+///
+/// The multi-consumer rings ([`crate::spmc`]) require this on both sides:
+/// with N waiters, a notify-dependent strategy needs per-waiter wake state
+/// ([`CvWait`]'s single shared flag can skip a parked waiter, adding its
+/// full timeout to the wake latency), and the gating producer's publish
+/// path must never pay a lock/signal per consumer flush. The SPSC rings
+/// accept any [`WaitStrategy`], including [`CvWait`].
+///
+/// ```compile_fail
+/// // CvWait is not SelfTimed: the multi-consumer ring rejects it.
+/// use rust_rb::{spmc, CvWait};
+/// let _ = spmc::RingBuffer::<u64, CvWait, CvWait>::with_wait_strategies(8);
+/// ```
+pub trait SelfTimed: WaitStrategy {}
+
+impl SelfTimed for NoOpWait {}
+impl SelfTimed for PauseWait {}
+impl SelfTimed for YieldWait {}
+impl<const NANOS: u64> SelfTimed for SleepWait<NANOS> {}
+impl<const S: u32, const Y: u32, const MIN: u64, const MAX: u64> SelfTimed
+    for BackoffWait<S, Y, MIN, MAX>
+{
+}
+
 // SAFETY: pure spinning; no shared state, notify is a no-op.
 unsafe impl CrossProcess for NoOpWait {}
 // SAFETY: pure spinning with a CPU hint; no shared state.
