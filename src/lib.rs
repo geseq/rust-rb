@@ -147,7 +147,9 @@ pub use spsc::{Consumer, Producer, RingBuffer};
 #[doc(inline)]
 pub use spsc_bytes::{BytesConsumer, BytesProducer, BytesRingBuffer};
 #[doc(inline)]
-pub use wait::{CrossProcess, CvWait, NoOpWait, PauseWait, WaitStrategy, YieldWait};
+pub use wait::{
+    BackoffWait, CrossProcess, CvWait, NoOpWait, PauseWait, SleepWait, WaitStrategy, YieldWait,
+};
 
 #[cfg(all(feature = "shm", target_os = "linux", target_has_atomic = "64"))]
 #[cfg_attr(docsrs, doc(cfg(feature = "shm")))]

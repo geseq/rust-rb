@@ -34,6 +34,13 @@ unsafe impl CrossProcess for NoOpWait {}
 unsafe impl CrossProcess for PauseWait {}
 // SAFETY: spinning with a scheduler yield; no shared state.
 unsafe impl CrossProcess for YieldWait {}
+// SAFETY: self-timed sleeping; progress needs no peer notify.
+unsafe impl<const NANOS: u64> CrossProcess for SleepWait<NANOS> {}
+// SAFETY: spins/yields/sleeps re-checking the predicate locally; no notify.
+unsafe impl<const S: u32, const Y: u32, const MIN: u64, const MAX: u64> CrossProcess
+    for BackoffWait<S, Y, MIN, MAX>
+{
+}
 
 /// Behaviour shared by every wait strategy.
 ///
@@ -97,6 +104,88 @@ pub struct NoOpWait;
 impl WaitStrategy for NoOpWait {
     #[inline(always)]
     fn wait<P: FnMut() -> bool>(&self, _pred: P) {}
+}
+
+/// Sleep a fixed `NANOS` nanoseconds each turn (`parkNanos` shape).
+///
+/// The lowest-CPU *self-timed* tier: no notify from the peer is ever needed
+/// (unlike [`CvWait`]), so it works across processes. The effective
+/// granularity is the OS timer — tens of microseconds on Linux with default
+/// timerslack — so treat `NANOS` as a floor, not a promise.
+///
+/// ```
+/// use rust_rb::{RingBuffer, SleepWait, YieldWait};
+///
+/// // Producer sleeps 50µs between full-ring re-checks; consumer yields.
+/// let (mut tx, mut rx) =
+///     RingBuffer::<u64, SleepWait<50_000>, YieldWait>::with_wait_strategies(16);
+/// tx.push(7);
+/// assert_eq!(rx.pop(), 7);
+/// ```
+#[derive(Default)]
+pub struct SleepWait<const NANOS: u64 = 100_000>;
+
+impl<const NANOS: u64> WaitStrategy for SleepWait<NANOS> {
+    #[inline]
+    fn wait<P: FnMut() -> bool>(&self, _pred: P) {
+        std::thread::sleep(Duration::from_nanos(NANOS));
+    }
+}
+
+/// Escalating backoff: spin `SPINS` turns, yield `YIELDS` turns, then sleep
+/// with exponential doubling from `MIN_SLEEP_NANOS` to `MAX_SLEEP_NANOS`
+/// (the Aeron `BackoffIdleStrategy` shape).
+///
+/// Runs one full escalation episode *internally*, consulting `pred` every
+/// turn and returning as soon as it holds — so each blocking call starts a
+/// fresh episode and no cross-call state is needed. Latency-friendly when
+/// waits are usually short but must not burn a core when they are long.
+///
+/// ```
+/// use rust_rb::{BackoffWait, RingBuffer};
+///
+/// let (mut tx, mut rx) =
+///     RingBuffer::<u64, BackoffWait, BackoffWait>::with_wait_strategies(16);
+/// tx.push(1);
+/// assert_eq!(rx.pop(), 1);
+/// ```
+#[derive(Default)]
+pub struct BackoffWait<
+    const SPINS: u32 = 100,
+    const YIELDS: u32 = 100,
+    const MIN_SLEEP_NANOS: u64 = 1_000,
+    const MAX_SLEEP_NANOS: u64 = 1_000_000,
+>;
+
+impl<
+        const SPINS: u32,
+        const YIELDS: u32,
+        const MIN_SLEEP_NANOS: u64,
+        const MAX_SLEEP_NANOS: u64,
+    > WaitStrategy for BackoffWait<SPINS, YIELDS, MIN_SLEEP_NANOS, MAX_SLEEP_NANOS>
+{
+    fn wait<P: FnMut() -> bool>(&self, mut pred: P) {
+        for _ in 0..SPINS {
+            if pred() {
+                return;
+            }
+            core::hint::spin_loop();
+        }
+        for _ in 0..YIELDS {
+            if pred() {
+                return;
+            }
+            std::thread::yield_now();
+        }
+        let mut ns = MIN_SLEEP_NANOS.max(1);
+        loop {
+            if pred() {
+                return;
+            }
+            std::thread::sleep(Duration::from_nanos(ns));
+            ns = ns.saturating_mul(2).min(MAX_SLEEP_NANOS);
+        }
+    }
 }
 
 /// Park on a condition variable with a timed re-check (nominally 100 ns;

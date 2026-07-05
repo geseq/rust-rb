@@ -3,7 +3,7 @@
 //! every wait-strategy combination and both blocking and non-blocking APIs.
 
 use rust_rb::spsc::{Consumer, Producer, RingBuffer};
-use rust_rb::wait::{CvWait, NoOpWait, PauseWait, WaitStrategy, YieldWait};
+use rust_rb::wait::{BackoffWait, CvWait, NoOpWait, PauseWait, SleepWait, WaitStrategy, YieldWait};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -170,6 +170,23 @@ fn cv_combinations() {
     exercise::<CvWait, YieldWait>();
     exercise::<CvWait, PauseWait>();
     exercise::<CvWait, NoOpWait>();
+}
+
+#[test]
+fn sleep_combinations() {
+    // Short sleeps (1µs nominal) so the blocking multithreaded runs stay fast.
+    exercise::<SleepWait<1_000>, PauseWait>();
+    exercise::<PauseWait, SleepWait<1_000>>();
+    exercise::<SleepWait<1_000>, SleepWait<1_000>>();
+}
+
+#[test]
+fn backoff_combinations() {
+    exercise::<BackoffWait, BackoffWait>();
+    exercise::<BackoffWait, PauseWait>();
+    exercise::<PauseWait, BackoffWait>();
+    // Degenerate tier counts: escalate straight to sleeping.
+    exercise::<BackoffWait<0, 0, 1_000, 8_000>, BackoffWait<0, 0, 1_000, 8_000>>();
 }
 
 #[test]
