@@ -14,17 +14,37 @@
 //! ```text
 //! 0    magic     u64      "rust_rb1"
 //! 8    version   u32
-//! 12   kind      u32      1 = byte ring, 2 = element ring
+//! 12   kind      u32      1 = byte ring, 2 = element ring,
+//!                         3 = SPMC byte ring, 4 = SPMC element ring
 //! 16   capacity  u64      cursor units (power of two)
 //! 24   unit_size u64      bytes per cursor unit (1, or size_of::<T>())
 //! 32   arch_bits u32      usize width; cross-arch attach is rejected
+//! 36   max_consumers u32  SPMC kinds only: consumer-table slots (>= 1)
 //! 40   producer_lease u64 (atomic) opaque token of the producer holder, 0 = free
 //! 48   consumer_lease u64 (atomic) opaque token of the consumer holder, 0 = free
+//!                         (SPSC kinds only; SPMC leases are per table slot)
 //! 56   generation u64 (atomic) seqlock: odd while (re)initializing
 //! 128  write_cursor  usize (atomic, own 128-byte slot)
-//! 256  read_cursor   usize (atomic, own 128-byte slot)
-//! 264  starving  usize (atomic) producer out-of-space signal (in read slot)
+//! 136  closed    usize (atomic) SPMC kinds: graceful-close flag (in the
+//!                         write-cursor slot — the line consumers poll)
+//! 144  aux       usize (atomic) SPMC kinds: starving flag (byte ring) /
+//!                         dropped_through (element ring; unused, `ShmItem`
+//!                         has no drop) — same padded slot
+//! 256  read_cursor   usize (atomic, own 128-byte slot; SPSC kinds only)
+//! 264  starving  usize (atomic) producer out-of-space signal (in read slot;
+//!                         SPSC kinds only)
+//! SPSC kinds:
 //! 384  buffer        capacity * unit_size bytes
+//! SPMC kinds:
+//! 384  consumer table: max_consumers slots of 128 bytes, each
+//!        +0  lease   u64  (atomic) opaque token of the slot holder, 0 = free
+//!        +8  control u64  (atomic) high u32 epoch | low u32 state
+//!                         (0 = FREE, 1 = ACTIVE, 2 = RETIRED)
+//!        +16 cursor  usize (atomic) the consumer's published read cursor
+//!            (usize::MAX = detached sentinel)
+//!      (one line per consumer: the producer's scan reads control + cursor
+//!       from the line the consumer's flush already owns)
+//! 384 + 128 * max_consumers  buffer  capacity * unit_size bytes
 //! ```
 //!
 //! All multi-byte fields use the host's **native** byte order, and a region is
@@ -85,12 +105,16 @@ use std::sync::Arc;
 use crate::cursor::{consumer_core_from_raw, producer_core_from_raw, AnchorKind, SlotCleanup};
 use crate::spsc::{Consumer, Producer, RingBuffer};
 use crate::spsc_bytes::{BytesConsumer, BytesProducer, BytesRingBuffer};
-use crate::wait::CrossProcess;
+use crate::wait::{CrossProcess, SelfTimed};
 
 const MAGIC: u64 = u64::from_le_bytes(*b"rust_rb1");
+/// VERSION stays 1 across the SPMC kinds' addition: old binaries reject
+/// unknown `kind` values, which is exactly the compatibility story needed.
 const VERSION: u32 = 1;
 const KIND_BYTES: u32 = 1;
 const KIND_ELEMS: u32 = 2;
+const KIND_SPMC_BYTES: u32 = 3;
+const KIND_SPMC_ELEMS: u32 = 4;
 
 const OFF_MAGIC: usize = 0;
 const OFF_VERSION: usize = 8;
@@ -98,6 +122,9 @@ const OFF_KIND: usize = 12;
 const OFF_CAPACITY: usize = 16;
 const OFF_UNIT_SIZE: usize = 24;
 const OFF_ARCH_BITS: usize = 32;
+/// SPMC kinds only: the consumer-table size, fixed at create (a mapped
+/// layout cannot grow). Fills the 4-byte gap after `arch_bits`.
+const OFF_MAX_CONSUMERS: usize = 36;
 const OFF_PRODUCER_LEASE: usize = 40;
 const OFF_CONSUMER_LEASE: usize = 48;
 /// Seqlock-style initialization generation: odd while `create_shm` is
@@ -112,10 +139,76 @@ const OFF_GENERATION: usize = 56;
 /// the flush/poll traffic, so the flag adds no new line.
 const OFF_STARVING: usize = OFF_READ_CURSOR + 8;
 const OFF_WRITE_CURSOR: usize = 128;
+/// SPMC kinds: the graceful-close flag, co-resident in the write-cursor's
+/// 128-byte slot (the line consumers already poll; written once by the
+/// producer's graceful drop — a crashed producer never sets it).
+const OFF_SPMC_CLOSED: usize = OFF_WRITE_CURSOR + 8;
+/// SPMC kinds: the ring's auxiliary write-side word, also in the
+/// write-cursor slot — the producer-starving flag for the byte ring, the
+/// `dropped_through` watermark position for the element ring (never used:
+/// `ShmItem` types have no drop, so the watermark machinery compiles away).
+const OFF_SPMC_AUX: usize = OFF_WRITE_CURSOR + 16;
 const OFF_READ_CURSOR: usize = 256;
 /// Buffer start: past the cursor slots, 128-byte aligned (mappings are
 /// page-aligned, so every offset here is honored in memory).
 const BUFFER_OFFSET: usize = 384;
+
+// --- SPMC consumer table geometry (kinds 3/4) --------------------------------
+
+/// The consumer table starts where the SPSC buffer would (the header shape
+/// up to here is shared across kinds).
+const SPMC_TABLE_OFFSET: usize = BUFFER_OFFSET;
+/// One 128-byte slot per consumer: lease, control, and cursor co-resident on
+/// one line — the producer's scan touches one line per consumer, and that
+/// line already carries the consumer's flush traffic.
+const SPMC_SLOT_STRIDE: usize = 128;
+const SLOT_LEASE: usize = 0;
+const SLOT_CONTROL: usize = 8;
+const SLOT_CURSOR: usize = 16;
+
+/// Consumer-cursor detached sentinel — the same `usize::MAX` the heap
+/// registries use (`crate::spmc::DETACHED`): a claimed-but-not-yet-joined or
+/// freed slot imposes no gating constraint.
+const SLOT_DETACHED: usize = usize::MAX;
+
+/// Control-word states (low u32; high u32 is the retirement epoch [A-4.1]).
+const STATE_FREE: u32 = 0;
+const STATE_ACTIVE: u32 = 1;
+const STATE_RETIRED: u32 = 2;
+
+#[inline(always)]
+const fn control_word(epoch: u32, state: u32) -> u64 {
+    ((epoch as u64) << 32) | state as u64
+}
+
+#[inline(always)]
+const fn control_epoch(control: u64) -> u32 {
+    (control >> 32) as u32
+}
+
+#[inline(always)]
+const fn control_state(control: u64) -> u32 {
+    control as u32
+}
+
+/// Whether a consumer-table control word is in the ACTIVE state — the only
+/// state whose cursor gates the producer (used by the rings' rescan walks).
+#[inline(always)]
+pub(crate) const fn control_is_active(control: u64) -> bool {
+    control_state(control) == STATE_ACTIVE
+}
+
+/// The cursor-sentinel guard, mirrored from the heap registries: a published
+/// cursor must never equal [`SLOT_DETACHED`] (exact-wraparound collision);
+/// one unit less only gates the producer more.
+#[inline(always)]
+const fn slot_guard(cursor: usize) -> usize {
+    if cursor == SLOT_DETACHED {
+        cursor.wrapping_sub(1)
+    } else {
+        cursor
+    }
+}
 
 /// Marker for element types that may cross a process boundary through a
 /// shared-memory ring.
@@ -638,6 +731,65 @@ impl ShmRegion {
         debug_assert!(BUFFER_OFFSET % std::mem::align_of::<B>() == 0);
         NonNull::new(self.at(BUFFER_OFFSET).cast()).expect("mapping is non-null")
     }
+
+    // --- SPMC accessors (meaningful only over regions of the SPMC kinds;
+    //     offsets are validated header geometry, inside any mapping that
+    //     passed `open_spmc_region`/`create_spmc_region`) ---
+
+    /// The producer's published write cursor.
+    pub(crate) fn spmc_write_cursor(&self) -> &AtomicUsize {
+        // SAFETY: OFF_WRITE_CURSOR is 8-aligned and inside the mapping.
+        unsafe { self.atomic(OFF_WRITE_CURSOR) }
+    }
+
+    /// The graceful-close word (0 = open).
+    pub(crate) fn spmc_closed(&self) -> &AtomicUsize {
+        // SAFETY: OFF_SPMC_CLOSED is 8-aligned and inside the mapping.
+        unsafe { self.atomic(OFF_SPMC_CLOSED) }
+    }
+
+    /// The auxiliary write-side word (byte ring: starving flag; element
+    /// ring: reserved).
+    pub(crate) fn spmc_aux(&self) -> &AtomicUsize {
+        // SAFETY: OFF_SPMC_AUX is 8-aligned and inside the mapping.
+        unsafe { self.atomic(OFF_SPMC_AUX) }
+    }
+
+    /// Byte offset of a consumer-table slot field.
+    #[inline]
+    fn slot_off(slot: usize, field: usize) -> usize {
+        SPMC_TABLE_OFFSET + slot * SPMC_SLOT_STRIDE + field
+    }
+
+    /// A consumer slot's lease word. `slot` must be below the region's
+    /// `max_consumers` (upheld by every caller; the table is inside the
+    /// validated mapping exactly up to there).
+    pub(crate) fn slot_lease(&self, slot: usize) -> &AtomicU64 {
+        // SAFETY: 8-aligned (stride 128, field 0) and inside the mapping for
+        // any valid slot index.
+        unsafe { self.atomic(Self::slot_off(slot, SLOT_LEASE)) }
+    }
+
+    /// A consumer slot's control word (`epoch | state`).
+    pub(crate) fn slot_control(&self, slot: usize) -> &AtomicU64 {
+        // SAFETY: 8-aligned (stride 128, field 8) and inside the mapping for
+        // any valid slot index.
+        unsafe { self.atomic(Self::slot_off(slot, SLOT_CONTROL)) }
+    }
+
+    /// A consumer slot's published read cursor.
+    pub(crate) fn slot_cursor(&self, slot: usize) -> &AtomicUsize {
+        // SAFETY: 8-aligned (stride 128, field 16) and inside the mapping
+        // for any valid slot index.
+        unsafe { self.atomic(Self::slot_off(slot, SLOT_CURSOR)) }
+    }
+
+    /// Base of an SPMC region's buffer: past the consumer table, 128-byte
+    /// aligned (element alignment above 128 is rejected at construction).
+    pub(crate) fn spmc_buffer(&self, max_consumers: usize) -> NonNull<u8> {
+        NonNull::new(self.at(SPMC_TABLE_OFFSET + max_consumers * SPMC_SLOT_STRIDE))
+            .expect("mapping is non-null")
+    }
 }
 
 /// Build one producer handle core over a validated region.
@@ -1107,6 +1259,1053 @@ where
     pub unsafe fn recover_shm_with(fd: BorrowedFd<'_>) -> io::Result<ElemPair<T, P, C>> {
         // SAFETY: forwarded caller contract; region validated by open().
         unsafe { recover_pair(Self::open(fd)?, Producer::from_core, Consumer::from_core) }
+    }
+}
+
+// =============================================================================
+// GATING SPMC rings (kinds 3/4): consumer table, slot leases, retirement.
+// =============================================================================
+//
+// The producer role reuses the SPSC lease at `OFF_PRODUCER_LEASE` verbatim.
+// Consumers hold *per-slot* leases inside the consumer table instead of the
+// single `OFF_CONSUMER_LEASE`: membership is dynamic, so exclusivity is per
+// slot, not per role. The zombie answer [A-4.1] is slot retirement: the
+// control word carries `{epoch | state}`, `force_detach_consumer` bumps the
+// epoch and sets RETIRED, and a retired slot is never re-issued until
+// `recover_shm` resets the whole table. A live "zombie" (a wrong death
+// assertion) keeps flushing into a slot no scan reads — the blast radius is
+// one burned slot plus the zombie's own reads losing gating protection
+// (`force_detach` revokes the victim's read validity — the same trust
+// register as `force_attach`).
+
+/// Region length for an SPMC ring: header + consumer table + buffer.
+fn spmc_region_len(capacity: usize, unit_size: usize, max_consumers: usize) -> io::Result<usize> {
+    let err = || io::Error::new(io::ErrorKind::InvalidInput, "capacity overflows region");
+    let table = max_consumers
+        .checked_mul(SPMC_SLOT_STRIDE)
+        .ok_or_else(err)?;
+    let len = capacity
+        .checked_mul(unit_size)
+        .and_then(|b| b.checked_add(SPMC_TABLE_OFFSET))
+        .and_then(|b| b.checked_add(table))
+        .ok_or_else(err)?;
+    // Same off_t clamp as `region_len` (32-bit sign-flip guard).
+    if len as u64 > libc::off_t::MAX as u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "region length exceeds the platform file-offset limit",
+        ));
+    }
+    Ok(len)
+}
+
+/// Initialize a fresh SPMC region: size the fd, map it, write the header and
+/// a fully-FREE consumer table, take the producer lease. The seqlock write
+/// protocol is identical to `create_region`'s.
+fn create_spmc_region(
+    fd: BorrowedFd<'_>,
+    kind: u32,
+    capacity: usize,
+    unit_size: usize,
+    max_consumers: usize,
+) -> io::Result<(Arc<ShmRegion>, u64)> {
+    if max_consumers == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "max_consumers must be at least 1",
+        ));
+    }
+    let len = spmc_region_len(capacity, unit_size, max_consumers)?;
+    // SAFETY: valid fd for the borrow; `spmc_region_len` confirmed `len`
+    // fits off_t.
+    if unsafe { libc::ftruncate(fd.as_raw_fd(), len as libc::off_t) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let region = ShmRegion::map(fd, len)?;
+
+    // SAFETY: all header offsets are naturally aligned and inside the
+    // mapping (see `create_region` for the seqlock/atomics rationale).
+    let producer_token = unsafe {
+        // Seqlock open: odd generation before touching anything.
+        let generation = region.atomic::<AtomicU64>(OFF_GENERATION);
+        let g = generation.load(Ordering::Relaxed);
+        generation.store(g | 1, Ordering::SeqCst);
+        region
+            .atomic::<AtomicU64>(OFF_MAGIC)
+            .store(0, Ordering::SeqCst);
+        region
+            .atomic::<AtomicU32>(OFF_VERSION)
+            .store(VERSION, Ordering::Relaxed);
+        region
+            .atomic::<AtomicU32>(OFF_KIND)
+            .store(kind, Ordering::Relaxed);
+        region
+            .atomic::<AtomicU64>(OFF_CAPACITY)
+            .store(capacity as u64, Ordering::Relaxed);
+        region
+            .atomic::<AtomicU64>(OFF_UNIT_SIZE)
+            .store(unit_size as u64, Ordering::Relaxed);
+        region
+            .atomic::<AtomicU32>(OFF_ARCH_BITS)
+            .store(usize::BITS, Ordering::Relaxed);
+        region
+            .atomic::<AtomicU32>(OFF_MAX_CONSUMERS)
+            .store(max_consumers as u32, Ordering::Relaxed);
+        let pt = lease_token();
+        region
+            .atomic::<AtomicU64>(OFF_PRODUCER_LEASE)
+            .store(pt, Ordering::Relaxed);
+        // The SPSC consumer lease is unused by SPMC kinds; keep it
+        // deterministically zero.
+        region
+            .atomic::<AtomicU64>(OFF_CONSUMER_LEASE)
+            .store(0, Ordering::Relaxed);
+        region
+            .atomic::<AtomicUsize>(OFF_WRITE_CURSOR)
+            .store(0, Ordering::Relaxed);
+        region
+            .atomic::<AtomicUsize>(OFF_SPMC_CLOSED)
+            .store(0, Ordering::Relaxed);
+        region
+            .atomic::<AtomicUsize>(OFF_SPMC_AUX)
+            .store(0, Ordering::Relaxed);
+        // Table + buffer: zero wholesale (leases 0, controls FREE@0; also
+        // pre-faults every page and matches the zeroed-buffer guarantee),
+        // then set every cursor to the detached sentinel. Still pre-publish:
+        // a racing validator sees the odd generation and discards.
+        std::ptr::write_bytes(region.at(SPMC_TABLE_OFFSET), 0, len - SPMC_TABLE_OFFSET);
+        for slot in 0..max_consumers {
+            region
+                .slot_cursor(slot)
+                .store(SLOT_DETACHED, Ordering::Relaxed);
+        }
+        // Publish the magic last with Release, then close the seqlock.
+        region
+            .atomic::<AtomicU64>(OFF_MAGIC)
+            .store(MAGIC, Ordering::Release);
+        generation.store((g | 1).wrapping_add(1), Ordering::Release);
+        pt
+    };
+    Ok((Arc::new(region), producer_token))
+}
+
+/// A validated SPMC region plus the header facts every constructor needs.
+struct SpmcOpened {
+    region: Arc<ShmRegion>,
+    capacity: usize,
+    max_consumers: usize,
+    generation: u64,
+}
+
+/// Map and validate an existing SPMC region (the SPMC face of
+/// `open_region`). There is no single-pair occupancy check here: the table
+/// holds N consumer cursors that are protocol-maintained lower bounds, and
+/// judging them against a live producer is inherently racy — per the trust
+/// model, validation catches accidents (wrong fd/kind/type/architecture),
+/// not adversaries. The write cursor's record alignment is still checked.
+fn open_spmc_region(
+    fd: BorrowedFd<'_>,
+    kind: u32,
+    unit_size: usize,
+    min_capacity: usize,
+    cursor_align: usize,
+) -> io::Result<SpmcOpened> {
+    let err = |m: &str| io::Error::new(io::ErrorKind::InvalidData, m.to_string());
+    let file_len = fd_len(fd)?;
+    if file_len < BUFFER_OFFSET as u64 {
+        return Err(err("region too small to hold a ring header"));
+    }
+    // Map just the header first to learn capacity and max_consumers.
+    let header = ShmRegion::map(fd, BUFFER_OFFSET)?;
+    // Seqlock read (see `open_region`).
+    // SAFETY: OFF_GENERATION is 8-aligned and inside the mapping.
+    let generation = unsafe { header.atomic::<AtomicU64>(OFF_GENERATION) }.load(Ordering::Acquire);
+    if generation & 1 == 1 {
+        return Err(err("ring is being initialized by another process"));
+    }
+    if header.read_magic() != MAGIC {
+        return Err(err("bad magic: not a rust-rb shm ring"));
+    }
+    if header.read_u32(OFF_VERSION) != VERSION {
+        return Err(err("unsupported ring version"));
+    }
+    if header.read_u32(OFF_KIND) != kind {
+        return Err(err("ring kind mismatch"));
+    }
+    if unit_size == 0 {
+        return Err(err("zero-sized elements are not supported in shm rings"));
+    }
+    if header.read_u64(OFF_UNIT_SIZE) != unit_size as u64 {
+        return Err(err("element size mismatch"));
+    }
+    if header.read_u32(OFF_ARCH_BITS) != usize::BITS {
+        return Err(err("architecture (usize width) mismatch"));
+    }
+    let capacity = header.read_u64(OFF_CAPACITY) as usize;
+    if capacity == 0 || !capacity.is_power_of_two() || capacity < min_capacity {
+        return Err(err("corrupt capacity"));
+    }
+    let max_consumers = header.read_u32(OFF_MAX_CONSUMERS) as usize;
+    if max_consumers == 0 {
+        return Err(err("corrupt max_consumers"));
+    }
+    drop(header);
+
+    let len = spmc_region_len(capacity, unit_size, max_consumers)
+        .map_err(|_| err("corrupt geometry: region length overflows"))?;
+    if file_len < len as u64 {
+        return Err(err("region smaller than its declared capacity"));
+    }
+    let region = ShmRegion::map(fd, len)?;
+
+    // Alignment holds for every individually-published cursor value.
+    if region.spmc_write_cursor().load(Ordering::Acquire) % cursor_align != 0 {
+        return Err(err("corrupt cursors: not record-aligned"));
+    }
+    // Seqlock re-check on the full mapping.
+    // SAFETY: OFF_GENERATION is 8-aligned and inside the mapping.
+    if unsafe { region.atomic::<AtomicU64>(OFF_GENERATION) }.load(Ordering::Acquire) != generation {
+        return Err(err("ring was re-initialized during validation"));
+    }
+    Ok(SpmcOpened {
+        region: Arc::new(region),
+        capacity,
+        max_consumers,
+        generation,
+    })
+}
+
+/// A freshly claimed consumer-table slot.
+pub(crate) struct SlotClaim {
+    pub(crate) slot: usize,
+    /// The epoch the slot was claimed at (its control word is `ACTIVE@epoch`
+    /// until detach or retirement).
+    pub(crate) epoch: u32,
+    /// The slot lease token this claimant wrote.
+    pub(crate) token: u64,
+    /// The join point: only messages published after this cursor are seen.
+    pub(crate) joined: usize,
+}
+
+/// The SPMC subscribe choreography over the consumer table — the shm mapping
+/// of the heap rings' [M-F2] protocol, with the control word playing the
+/// bitmap's role. Returns `None` when no FREE slot exists (table full;
+/// RETIRED slots stay unavailable until `recover_shm`).
+///
+/// Order (each step before the next):
+/// 1. CAS control `FREE@e -> ACTIVE@e` — the claim and the **registration
+///    event** in one RMW, strictly BEFORE the SeqCst fence: the producer's
+///    rescan observes consumers only through the control word, so this is
+///    the store the [M-F2] fence dichotomy is about (set after the fence, a
+///    scan could miss the slot *while* the re-read below returns a stale
+///    write cursor, and the producer would lap a consumer it never saw).
+/// 2. Store the provisional cursor (a lower bound of the join point). The
+///    window between 1 and 2 — control ACTIVE, cursor still the previous
+///    occupant's sentinel/value — is covered on the scan side: a sentinel
+///    read is skipped without caching (and by the fence dichotomy such a
+///    joiner's join point is past the scan's wrap point); a leftover real
+///    cursor is at most the write cursor at the previous detach, which the
+///    new join point cannot undercut — a valid lower bound either way.
+/// 3. `fence(SeqCst)` — pairs with the producer's pre-scan fence.
+/// 4. Re-read the write cursor: **the join point is the re-read**; publish
+///    it as the final cursor (Release).
+/// 5. Take the slot lease (opaque random token, exactly like the role
+///    leases; teardown and the flush guard check it).
+pub(crate) fn spmc_claim_slot(region: &ShmRegion, max_consumers: usize) -> Option<SlotClaim> {
+    let write_cursor = region.spmc_write_cursor();
+    'slots: for slot in 0..max_consumers {
+        let control = region.slot_control(slot);
+        let mut current = control.load(Ordering::Acquire);
+        loop {
+            if control_state(current) != STATE_FREE {
+                continue 'slots;
+            }
+            let epoch = control_epoch(current);
+            match control.compare_exchange(
+                current,
+                control_word(epoch, STATE_ACTIVE),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    let cursor = region.slot_cursor(slot);
+                    let provisional = slot_guard(write_cursor.load(Ordering::Acquire));
+                    cursor.store(provisional, Ordering::Release);
+                    std::sync::atomic::fence(Ordering::SeqCst);
+                    let joined = write_cursor.load(Ordering::Acquire);
+                    cursor.store(slot_guard(joined), Ordering::Release);
+                    let token = lease_token();
+                    region.slot_lease(slot).store(token, Ordering::Release);
+                    return Some(SlotClaim {
+                        slot,
+                        epoch,
+                        token,
+                        joined,
+                    });
+                }
+                // Lost a race (concurrent joiner or force-detach): re-examine
+                // this slot with the fresh value.
+                Err(fresh) => current = fresh,
+            }
+        }
+    }
+    None
+}
+
+/// Roll a just-made claim back (attach-time seqlock conflict): the graceful
+/// detach sequence minus the flush — sentinel, then availability, then the
+/// lease.
+fn spmc_release_claim(region: &ShmRegion, claim: &SlotClaim) {
+    region
+        .slot_cursor(claim.slot)
+        .store(SLOT_DETACHED, Ordering::Release);
+    let _ = region.slot_control(claim.slot).compare_exchange(
+        control_word(claim.epoch, STATE_ACTIVE),
+        control_word(claim.epoch, STATE_FREE),
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    );
+    let _ = region.slot_lease(claim.slot).compare_exchange(
+        claim.token,
+        0,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    );
+}
+
+/// Retire a consumer-table slot [A-4.1]: bump the epoch, set RETIRED. The
+/// slot is never re-issued until `recover_shm`; the (possibly live) previous
+/// holder's stores land on words nobody reads. The lease and cursor words
+/// are left as-is — they are dead until the table reset.
+fn spmc_force_detach(region: &ShmRegion, slot: usize) {
+    let control = region.slot_control(slot);
+    let mut current = control.load(Ordering::Acquire);
+    loop {
+        let next = control_word(control_epoch(current).wrapping_add(1), STATE_RETIRED);
+        match control.compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return,
+            Err(fresh) => current = fresh,
+        }
+    }
+}
+
+/// Reset the whole consumer table (recover): compute the at-least-once
+/// resume point — the slowest previously-registered cursor, ignoring
+/// implausible values (lag beyond one capacity: stale zombie leftovers the
+/// producer had already stopped honoring) — then free every slot with a
+/// bumped epoch, a zeroed lease, and the detached sentinel. Returns the
+/// resume cursor (the write cursor itself when no consumer had registered).
+fn spmc_reset_table(region: &ShmRegion, max_consumers: usize, capacity: usize) -> usize {
+    let write = region.spmc_write_cursor().load(Ordering::Acquire);
+    let mut max_lag = 0usize;
+    for slot in 0..max_consumers {
+        if control_state(region.slot_control(slot).load(Ordering::Acquire)) == STATE_FREE {
+            continue;
+        }
+        let cursor = region.slot_cursor(slot).load(Ordering::Acquire);
+        if cursor == SLOT_DETACHED {
+            continue;
+        }
+        let lag = write.wrapping_sub(cursor);
+        if lag <= capacity && lag > max_lag {
+            max_lag = lag;
+        }
+    }
+    for slot in 0..max_consumers {
+        // Detach order per slot: sentinel, lease, availability last.
+        region
+            .slot_cursor(slot)
+            .store(SLOT_DETACHED, Ordering::Release);
+        region.slot_lease(slot).store(0, Ordering::Release);
+        let control = region.slot_control(slot);
+        let current = control.load(Ordering::Acquire);
+        control.store(
+            control_word(control_epoch(current).wrapping_add(1), STATE_FREE),
+            Ordering::Release,
+        );
+    }
+    write.wrapping_sub(max_lag)
+}
+
+/// The shm anchor for a gating SPMC **producer**: keeps the mapping alive,
+/// holds the producer role lease (same offset and discipline as the SPSC
+/// rings), and exposes the consumer table to the producer's rescans. Only
+/// the consumer-side wait strategy is carried — the producer's own waits use
+/// fresh per-call instances of its (stateless, `CrossProcess`) strategy.
+pub(crate) struct SpmcProducerAnchor<C> {
+    region: Arc<ShmRegion>,
+    token: u64,
+    /// Fork guard, exactly as in [`ShmAnchor`].
+    owner_pid: libc::pid_t,
+    max_consumers: usize,
+    pub(crate) consumer_wait: C,
+}
+
+impl<C: Default> SpmcProducerAnchor<C> {
+    fn new(region: Arc<ShmRegion>, token: u64, max_consumers: usize) -> Self {
+        Self {
+            region,
+            token,
+            // SAFETY: getpid is always safe.
+            owner_pid: unsafe { libc::getpid() },
+            max_consumers,
+            consumer_wait: C::default(),
+        }
+    }
+}
+
+impl<C> SpmcProducerAnchor<C> {
+    pub(crate) fn region(&self) -> &Arc<ShmRegion> {
+        &self.region
+    }
+
+    pub(crate) fn max_consumers(&self) -> usize {
+        self.max_consumers
+    }
+
+    #[inline(always)]
+    pub(crate) fn slot_control(&self, slot: usize) -> &AtomicU64 {
+        self.region.slot_control(slot)
+    }
+
+    #[inline(always)]
+    pub(crate) fn slot_cursor(&self, slot: usize) -> &AtomicUsize {
+        self.region.slot_cursor(slot)
+    }
+
+    /// Number of ACTIVE table slots (snapshot).
+    pub(crate) fn active_count(&self) -> usize {
+        (0..self.max_consumers)
+            .filter(|&slot| control_is_active(self.slot_control(slot).load(Ordering::Relaxed)))
+            .count()
+    }
+
+    /// Whether the producer lease still holds this handle's token (see
+    /// [`ShmAnchor::owns_lease`]).
+    pub(crate) fn owns_lease(&self) -> bool {
+        // SAFETY: the lease offset is 8-aligned and inside the mapping.
+        let lease: &AtomicU64 = unsafe { self.region.atomic(OFF_PRODUCER_LEASE) };
+        lease.load(Ordering::Acquire) == self.token
+    }
+
+    /// Fork guard (see [`ShmAnchor::owned_by_current_process`]).
+    pub(crate) fn owned_by_current_process(&self) -> bool {
+        // SAFETY: getpid is always safe.
+        (unsafe { libc::getpid() }) == self.owner_pid
+    }
+}
+
+impl<C> Drop for SpmcProducerAnchor<C> {
+    fn drop(&mut self) {
+        // Guarded lease release, exactly as [`ShmAnchor`]'s: pid guard
+        // against fork copies, token CAS against force-takeovers.
+        if !self.owned_by_current_process() {
+            return;
+        }
+        // SAFETY: the lease offset is 8-aligned and inside the mapping.
+        let lease: &AtomicU64 = unsafe { self.region.atomic(OFF_PRODUCER_LEASE) };
+        let _ = lease.compare_exchange(self.token, 0, Ordering::AcqRel, Ordering::Acquire);
+    }
+}
+
+/// The shm anchor for a gating SPMC **consumer**: the mapping, this handle's
+/// table slot coordinates (slot index, claim epoch, slot lease token), the
+/// fork-guard pid, and the per-handle wait strategies.
+pub(crate) struct SpmcConsumerAnchor<P, C> {
+    region: Arc<ShmRegion>,
+    slot: usize,
+    epoch: u32,
+    token: u64,
+    owner_pid: libc::pid_t,
+    max_consumers: usize,
+    pub(crate) producer_wait: P,
+    pub(crate) consumer_wait: C,
+}
+
+impl<P: Default, C: Default> SpmcConsumerAnchor<P, C> {
+    pub(crate) fn new(region: Arc<ShmRegion>, claim: SlotClaim, max_consumers: usize) -> Self {
+        Self {
+            region,
+            slot: claim.slot,
+            epoch: claim.epoch,
+            token: claim.token,
+            // SAFETY: getpid is always safe.
+            owner_pid: unsafe { libc::getpid() },
+            max_consumers,
+            producer_wait: P::default(),
+            consumer_wait: C::default(),
+        }
+    }
+}
+
+impl<P, C> SpmcConsumerAnchor<P, C> {
+    pub(crate) fn region(&self) -> &Arc<ShmRegion> {
+        &self.region
+    }
+
+    pub(crate) fn slot(&self) -> usize {
+        self.slot
+    }
+
+    pub(crate) fn max_consumers(&self) -> usize {
+        self.max_consumers
+    }
+
+    /// Whether the slot lease still holds this handle's token. One Acquire
+    /// load of the slot's own line (which this consumer's flush traffic
+    /// already owns) — the hot-flush zombie guard. Note a force-detached
+    /// zombie still owns its lease: its stores keep landing on the RETIRED
+    /// slot, which no scan reads [A-4.1]; only `recover_shm`'s table reset
+    /// (which zeroes leases) silences it here.
+    #[inline]
+    pub(crate) fn owns_slot(&self) -> bool {
+        self.region.slot_lease(self.slot).load(Ordering::Acquire) == self.token
+    }
+
+    /// Fork guard (see [`ShmAnchor::owned_by_current_process`]).
+    pub(crate) fn owned_by_current_process(&self) -> bool {
+        // SAFETY: getpid is always safe.
+        (unsafe { libc::getpid() }) == self.owner_pid
+    }
+
+    /// Graceful detach, called from the consumer's Drop after the flush and
+    /// the cursor-sentinel store: return the slot (CAS `ACTIVE@e -> FREE@e`
+    /// — epoch UNCHANGED, the slot is immediately reusable; the CAS fails
+    /// harmlessly on a force-retired slot, preserving retirement), release
+    /// the slot lease (guarded CAS), and wake a gated producer [A-1.3].
+    pub(crate) fn detach(&self)
+    where
+        P: crate::wait::WaitStrategy,
+    {
+        let _ = self.region.slot_control(self.slot).compare_exchange(
+            control_word(self.epoch, STATE_ACTIVE),
+            control_word(self.epoch, STATE_FREE),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        let _ = self.region.slot_lease(self.slot).compare_exchange(
+            self.token,
+            0,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        self.producer_wait.notify();
+    }
+}
+
+/// Claim (or force-take) the producer role over a validated SPMC region and
+/// reset the closed word — a (re)attached producer re-opens the ring (only
+/// the producer ever writes that word, and we now hold its lease).
+fn spmc_attach_producer_anchor<C: Default>(
+    opened: &SpmcOpened,
+    force: bool,
+) -> io::Result<Box<SpmcProducerAnchor<C>>> {
+    let region = Arc::clone(&opened.region);
+    let token = if force {
+        force_claim_lease(&region, Role::Producer)
+    } else {
+        claim_lease(&region, Role::Producer, opened.generation)?
+    };
+    region.spmc_closed().store(0, Ordering::Release);
+    Ok(Box::new(SpmcProducerAnchor::new(
+        region,
+        token,
+        opened.max_consumers,
+    )))
+}
+
+/// Claim a consumer-table slot over a validated SPMC region: refuse closed
+/// rings (mirroring the heap `SubscribeError::Closed`), map a full table to
+/// `AddrInUse` (the role-conflict error), and re-check the seqlock
+/// generation after the claim exactly as `claim_lease` does. Returns the
+/// anchor plus the join point (returned directly from the claim — the slot
+/// word holds only its sentinel-guarded image).
+fn spmc_attach_consumer_anchor<P: Default, C: Default>(
+    opened: &SpmcOpened,
+) -> io::Result<(Box<SpmcConsumerAnchor<P, C>>, usize)> {
+    let region = Arc::clone(&opened.region);
+    if region.spmc_closed().load(Ordering::Acquire) != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "ring closed: producer dropped (attach a new producer to reopen)",
+        ));
+    }
+    let claim = spmc_claim_slot(&region, opened.max_consumers).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::AddrInUse,
+            "consumer table is full (max_consumers is fixed at creation; \
+             retired slots free only via recover_shm)",
+        )
+    })?;
+    // SAFETY: OFF_GENERATION is 8-aligned and inside the mapping.
+    let gen_now = unsafe { region.atomic::<AtomicU64>(OFF_GENERATION) }.load(Ordering::Acquire);
+    if gen_now != opened.generation {
+        spmc_release_claim(&region, &claim);
+        return Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            "ring was re-initialized during attach",
+        ));
+    }
+    let joined = claim.joined;
+    Ok((
+        Box::new(SpmcConsumerAnchor::new(region, claim, opened.max_consumers)),
+        joined,
+    ))
+}
+
+/// Both halves of a shm-backed gating SPMC element ring.
+pub type SpmcElemPair<T, P, C> = (
+    crate::spmc::Producer<T, P, C>,
+    crate::spmc::Consumer<T, P, C>,
+);
+/// Both halves of a shm-backed gating SPMC byte ring.
+pub type SpmcBytesPair<P, C> = (
+    crate::spmc_bytes::BytesProducer<P, C>,
+    crate::spmc_bytes::BytesConsumer<P, C>,
+);
+
+impl<T: ShmItem + Send + Sync> crate::spmc::RingBuffer<T> {
+    /// Initialize `fd` as a fresh shm-backed gating SPMC element ring with a
+    /// `max_consumers`-slot consumer table and return the producer plus one
+    /// initial consumer (attach or [`subscribe`](crate::spmc::Producer::subscribe)
+    /// more, up to the table size), with default
+    /// ([`YieldWait`](crate::wait::YieldWait)) wait strategies.
+    ///
+    /// Unlike heap membership (unbounded), `max_consumers` is fixed at
+    /// creation — a mapped layout cannot grow. That constraint is physical,
+    /// not a design choice.
+    ///
+    /// ```
+    /// use std::os::fd::AsFd;
+    /// use rust_rb::{memfd, spmc};
+    /// # fn main() -> std::io::Result<()> {
+    /// let fd = memfd("spmc-doc")?;
+    /// // SAFETY: fresh private memfd, only cooperating handles touch it.
+    /// let (mut tx, mut rx) =
+    ///     unsafe { spmc::RingBuffer::<u64>::create_shm(fd.as_fd(), 64, 8)? };
+    /// tx.push(7);
+    /// assert_eq!(rx.pop(), Ok(7));
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Safety
+    ///
+    /// See [the module's trust model](self): the region must only ever be
+    /// accessed by cooperating rust-rb handles.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `min_capacity == 0`.
+    #[allow(clippy::type_complexity)]
+    pub unsafe fn create_shm(
+        fd: BorrowedFd<'_>,
+        min_capacity: usize,
+        max_consumers: usize,
+    ) -> io::Result<(crate::spmc::Producer<T>, crate::spmc::Consumer<T>)> {
+        // SAFETY: forwarded caller contract.
+        unsafe {
+            crate::spmc::RingBuffer::<T, _, _>::create_shm_with(fd, min_capacity, max_consumers)
+        }
+    }
+
+    /// Unconditionally take over an existing SPMC ring: force-take the
+    /// producer role, **reset the whole consumer table** (leases zeroed,
+    /// every slot FREE at a bumped epoch — retired slots become issuable
+    /// again), and return a fresh pair. The returned consumer resumes at the
+    /// slowest previously-registered cursor, so recovery is at-least-once:
+    /// everything published but not consumed by every dead consumer is
+    /// delivered again.
+    ///
+    /// # Safety
+    ///
+    /// Trust model, plus: the takeover is unconditional — the caller asserts
+    /// **every** previous holder (producer and all consumers) is gone. A
+    /// still-live consumer would be silently unregistered (its flushes are
+    /// suppressed by the slot-lease guard, but its reads lose all gating
+    /// protection); a still-live producer would corrupt the ring.
+    #[allow(clippy::type_complexity)]
+    pub unsafe fn recover_shm(
+        fd: BorrowedFd<'_>,
+    ) -> io::Result<(crate::spmc::Producer<T>, crate::spmc::Consumer<T>)> {
+        // SAFETY: forwarded caller contract.
+        unsafe { crate::spmc::RingBuffer::<T, _, _>::recover_shm_with(fd) }
+    }
+}
+
+impl<T, P, C> crate::spmc::RingBuffer<T, P, C>
+where
+    T: ShmItem + Send + Sync,
+    P: CrossProcess + SelfTimed + Send + Sync,
+    C: CrossProcess + SelfTimed + Send + Sync,
+{
+    fn open(fd: BorrowedFd<'_>) -> io::Result<SpmcOpened> {
+        // Same attach-side type re-validation as the SPSC element ring.
+        check_elem_type::<T>()?;
+        // Capacity floor 2 = the heap SPMC constructor's floor (an
+        // audience-less producer's gating default needs it); element cursors
+        // are always decodable, so no alignment constraint.
+        open_spmc_region(fd, KIND_SPMC_ELEMS, std::mem::size_of::<T>(), 2, 1)
+    }
+
+    /// [`create_shm`](crate::spmc::RingBuffer::create_shm) with explicit
+    /// [`CrossProcess`] + [`SelfTimed`] wait strategies (both bounds on both
+    /// sides: the strategy must survive a process boundary *and* never need
+    /// a peer notify — the spin family).
+    ///
+    /// # Safety
+    ///
+    /// See [the module's trust model](self).
+    pub unsafe fn create_shm_with(
+        fd: BorrowedFd<'_>,
+        min_capacity: usize,
+        max_consumers: usize,
+    ) -> io::Result<SpmcElemPair<T, P, C>> {
+        check_elem_type::<T>()?;
+        let capacity = crate::cursor::round_capacity(min_capacity, 2);
+        let (region, producer_token) = create_spmc_region(
+            fd,
+            KIND_SPMC_ELEMS,
+            capacity,
+            std::mem::size_of::<T>(),
+            max_consumers,
+        )?;
+        let claim = spmc_claim_slot(&region, max_consumers).expect("fresh table has free slots");
+        let joined = claim.joined;
+        let producer_anchor = Box::new(SpmcProducerAnchor::new(
+            Arc::clone(&region),
+            producer_token,
+            max_consumers,
+        ));
+        let consumer_anchor = Box::new(SpmcConsumerAnchor::new(region, claim, max_consumers));
+        // SAFETY: freshly initialized region matches this ring's layout.
+        unsafe {
+            Ok((
+                crate::spmc::Producer::from_shm(producer_anchor, capacity),
+                crate::spmc::Consumer::from_shm(consumer_anchor, capacity, joined),
+            ))
+        }
+    }
+
+    /// Attach to an existing SPMC element ring as the producer. Fails with
+    /// `AddrInUse` while the producer lease is held; resets the graceful
+    /// `closed` flag (the ring is open again). The gating caches are rebuilt
+    /// from the live consumer table on the first push — never from defaults.
+    ///
+    /// # Safety
+    ///
+    /// Trust model, plus single-producer, plus `T` must be the exact type
+    /// the ring was created with (only its size is validated).
+    pub unsafe fn attach_shm_producer(
+        fd: BorrowedFd<'_>,
+    ) -> io::Result<crate::spmc::Producer<T, P, C>> {
+        let opened = Self::open(fd)?;
+        let anchor = spmc_attach_producer_anchor::<C>(&opened, false)?;
+        // SAFETY: region validated by open(); forwarded caller contract.
+        Ok(unsafe { crate::spmc::Producer::from_shm(anchor, opened.capacity) })
+    }
+
+    /// Unconditionally take over the producer role (single-side crash
+    /// recovery while consumers keep running; see
+    /// [`BytesRingBuffer::force_attach_shm_producer`] for the lease story).
+    ///
+    /// # Safety
+    ///
+    /// Trust model, plus: unconditional takeover — the caller asserts the
+    /// previous producer is gone, plus the `T` caveat of
+    /// [`attach_shm_producer`](Self::attach_shm_producer).
+    pub unsafe fn force_attach_shm_producer(
+        fd: BorrowedFd<'_>,
+    ) -> io::Result<crate::spmc::Producer<T, P, C>> {
+        let opened = Self::open(fd)?;
+        let anchor = spmc_attach_producer_anchor::<C>(&opened, true)?;
+        // SAFETY: region validated by open(); forwarded caller contract.
+        Ok(unsafe { crate::spmc::Producer::from_shm(anchor, opened.capacity) })
+    }
+
+    /// Attach a **new consumer**: claims a FREE consumer-table slot (the
+    /// shm face of `subscribe`; the join point is the producer's published
+    /// cursor at claim time). Fails with `AddrInUse` when the table is full
+    /// and `BrokenPipe` when the ring is closed.
+    ///
+    /// # Safety
+    ///
+    /// Trust model, plus the `T` caveat of
+    /// [`attach_shm_producer`](Self::attach_shm_producer).
+    pub unsafe fn attach_shm_consumer(
+        fd: BorrowedFd<'_>,
+    ) -> io::Result<crate::spmc::Consumer<T, P, C>> {
+        let opened = Self::open(fd)?;
+        let (anchor, joined) = spmc_attach_consumer_anchor::<P, C>(&opened)?;
+        // SAFETY: region validated by open(); the claim choreography just
+        // ran (its final store published `joined` into the slot).
+        Ok(unsafe { crate::spmc::Consumer::from_shm(anchor, opened.capacity, joined) })
+    }
+
+    /// Retire consumer-table slot `slot` [A-4.1]: bump its epoch and mark it
+    /// RETIRED. The producer's next rescan stops honoring the slot's cursor
+    /// (un-gating a producer blocked on a dead consumer); the slot is
+    /// **never re-issued** until [`recover_shm`](crate::spmc::RingBuffer::recover_shm)
+    /// resets the table.
+    ///
+    /// # Safety
+    ///
+    /// The caller asserts the slot's holder is **dead**. This is the same
+    /// trust register as `force_attach`: if the holder is actually alive,
+    /// the ring itself stays consistent (the zombie's flushes land on the
+    /// retired slot, which nothing reads), but the zombie's **reads lose all
+    /// gating protection** — the producer may overwrite data it still
+    /// borrows. `force_detach_consumer` revokes the victim's read validity.
+    pub unsafe fn force_detach_consumer(fd: BorrowedFd<'_>, slot: usize) -> io::Result<()> {
+        let opened = Self::open(fd)?;
+        if slot >= opened.max_consumers {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "slot index out of range for this ring's consumer table",
+            ));
+        }
+        spmc_force_detach(&opened.region, slot);
+        Ok(())
+    }
+
+    /// [`recover_shm`](crate::spmc::RingBuffer::recover_shm) with explicit
+    /// wait strategies.
+    ///
+    /// # Safety
+    ///
+    /// See [`recover_shm`](crate::spmc::RingBuffer::recover_shm), plus the
+    /// `T` caveat of [`attach_shm_producer`](Self::attach_shm_producer).
+    pub unsafe fn recover_shm_with(fd: BorrowedFd<'_>) -> io::Result<SpmcElemPair<T, P, C>> {
+        let opened = Self::open(fd)?;
+        let producer_anchor = spmc_attach_producer_anchor::<C>(&opened, true)?;
+        let resume = spmc_reset_table(&opened.region, opened.max_consumers, opened.capacity);
+        let claim = spmc_claim_slot(&opened.region, opened.max_consumers)
+            .expect("freshly reset table has free slots");
+        // Move the fresh slot back to the resume point (a lower cursor only
+        // gates the producer more — and the producer is us, not yet pushing).
+        opened
+            .region
+            .slot_cursor(claim.slot)
+            .store(slot_guard(resume), Ordering::Release);
+        let consumer_anchor = Box::new(SpmcConsumerAnchor::new(
+            Arc::clone(&opened.region),
+            claim,
+            opened.max_consumers,
+        ));
+        // SAFETY: region validated by open(); forwarded caller contract.
+        unsafe {
+            Ok((
+                crate::spmc::Producer::from_shm(producer_anchor, opened.capacity),
+                crate::spmc::Consumer::from_shm(consumer_anchor, opened.capacity, resume),
+            ))
+        }
+    }
+}
+
+impl crate::spmc_bytes::BytesRingBuffer {
+    /// Initialize `fd` as a fresh shm-backed gating SPMC **byte** ring (see
+    /// [`spmc::RingBuffer::create_shm`](crate::spmc::RingBuffer::create_shm);
+    /// capacity is in bytes, minimum 8).
+    ///
+    /// # Safety
+    ///
+    /// See [the module's trust model](self).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `min_capacity == 0`.
+    #[allow(clippy::type_complexity)]
+    pub unsafe fn create_shm(
+        fd: BorrowedFd<'_>,
+        min_capacity: usize,
+        max_consumers: usize,
+    ) -> io::Result<(
+        crate::spmc_bytes::BytesProducer,
+        crate::spmc_bytes::BytesConsumer,
+    )> {
+        // SAFETY: forwarded caller contract.
+        unsafe {
+            crate::spmc_bytes::BytesRingBuffer::<_, _>::create_shm_with(
+                fd,
+                min_capacity,
+                max_consumers,
+            )
+        }
+    }
+
+    /// Unconditionally take over an existing SPMC byte ring (see
+    /// [`spmc::RingBuffer::recover_shm`](crate::spmc::RingBuffer::recover_shm):
+    /// full table reset; at-least-once resume from the slowest
+    /// previously-registered cursor, which is always a record boundary).
+    ///
+    /// # Safety
+    ///
+    /// See [`spmc::RingBuffer::recover_shm`](crate::spmc::RingBuffer::recover_shm).
+    #[allow(clippy::type_complexity)]
+    pub unsafe fn recover_shm(
+        fd: BorrowedFd<'_>,
+    ) -> io::Result<(
+        crate::spmc_bytes::BytesProducer,
+        crate::spmc_bytes::BytesConsumer,
+    )> {
+        // SAFETY: forwarded caller contract.
+        unsafe { crate::spmc_bytes::BytesRingBuffer::<_, _>::recover_shm_with(fd) }
+    }
+}
+
+impl<P, C> crate::spmc_bytes::BytesRingBuffer<P, C>
+where
+    P: CrossProcess + SelfTimed + Send + Sync,
+    C: CrossProcess + SelfTimed + Send + Sync,
+{
+    fn open(fd: BorrowedFd<'_>) -> io::Result<SpmcOpened> {
+        open_spmc_region(
+            fd,
+            KIND_SPMC_BYTES,
+            1,
+            BYTES_MIN_CAPACITY,
+            BYTES_CURSOR_ALIGN,
+        )
+    }
+
+    /// [`create_shm`](crate::spmc_bytes::BytesRingBuffer::create_shm) with
+    /// explicit [`CrossProcess`] + [`SelfTimed`] wait strategies.
+    ///
+    /// # Safety
+    ///
+    /// See [the module's trust model](self).
+    pub unsafe fn create_shm_with(
+        fd: BorrowedFd<'_>,
+        min_capacity: usize,
+        max_consumers: usize,
+    ) -> io::Result<SpmcBytesPair<P, C>> {
+        let capacity = crate::cursor::round_capacity(min_capacity, BYTES_MIN_CAPACITY);
+        let (region, producer_token) =
+            create_spmc_region(fd, KIND_SPMC_BYTES, capacity, 1, max_consumers)?;
+        let claim = spmc_claim_slot(&region, max_consumers).expect("fresh table has free slots");
+        let joined = claim.joined;
+        let producer_anchor = Box::new(SpmcProducerAnchor::new(
+            Arc::clone(&region),
+            producer_token,
+            max_consumers,
+        ));
+        let consumer_anchor = Box::new(SpmcConsumerAnchor::new(region, claim, max_consumers));
+        // SAFETY: freshly initialized region matches this ring's layout.
+        unsafe {
+            Ok((
+                crate::spmc_bytes::BytesProducer::from_shm(producer_anchor, capacity),
+                crate::spmc_bytes::BytesConsumer::from_shm(consumer_anchor, capacity, joined),
+            ))
+        }
+    }
+
+    /// Attach to an existing SPMC byte ring as the producer (see
+    /// [`spmc::RingBuffer::attach_shm_producer`](crate::spmc::RingBuffer::attach_shm_producer)).
+    /// Also resets the starving flag a departed predecessor may have left
+    /// set, exactly as the SPSC engine's producer attach does.
+    ///
+    /// # Safety
+    ///
+    /// Trust model, plus single-producer.
+    pub unsafe fn attach_shm_producer(
+        fd: BorrowedFd<'_>,
+    ) -> io::Result<crate::spmc_bytes::BytesProducer<P, C>> {
+        let opened = Self::open(fd)?;
+        let anchor = spmc_attach_producer_anchor::<C>(&opened, false)?;
+        // A newly-attached producer is not starving (only the producer
+        // writes this flag, and we now hold its lease).
+        opened.region.spmc_aux().store(0, Ordering::Release);
+        // SAFETY: region validated by open(); forwarded caller contract.
+        Ok(unsafe { crate::spmc_bytes::BytesProducer::from_shm(anchor, opened.capacity) })
+    }
+
+    /// Unconditionally take over the producer role (see
+    /// [`force_attach_shm_producer`](crate::spmc::RingBuffer::force_attach_shm_producer)
+    /// on the element ring).
+    ///
+    /// # Safety
+    ///
+    /// Trust model, plus: unconditional takeover — the caller asserts the
+    /// previous producer is gone.
+    pub unsafe fn force_attach_shm_producer(
+        fd: BorrowedFd<'_>,
+    ) -> io::Result<crate::spmc_bytes::BytesProducer<P, C>> {
+        let opened = Self::open(fd)?;
+        let anchor = spmc_attach_producer_anchor::<C>(&opened, true)?;
+        opened.region.spmc_aux().store(0, Ordering::Release);
+        // SAFETY: region validated by open(); forwarded caller contract.
+        Ok(unsafe { crate::spmc_bytes::BytesProducer::from_shm(anchor, opened.capacity) })
+    }
+
+    /// Attach a new consumer (see
+    /// [`spmc::RingBuffer::attach_shm_consumer`](crate::spmc::RingBuffer::attach_shm_consumer);
+    /// the join point is always a record boundary).
+    ///
+    /// # Safety
+    ///
+    /// Trust model.
+    pub unsafe fn attach_shm_consumer(
+        fd: BorrowedFd<'_>,
+    ) -> io::Result<crate::spmc_bytes::BytesConsumer<P, C>> {
+        let opened = Self::open(fd)?;
+        let (anchor, joined) = spmc_attach_consumer_anchor::<P, C>(&opened)?;
+        // SAFETY: region validated by open(); the claim choreography just
+        // ran (its final store published `joined` into the slot).
+        Ok(unsafe { crate::spmc_bytes::BytesConsumer::from_shm(anchor, opened.capacity, joined) })
+    }
+
+    /// Retire consumer-table slot `slot` (see
+    /// [`spmc::RingBuffer::force_detach_consumer`](crate::spmc::RingBuffer::force_detach_consumer)).
+    ///
+    /// # Safety
+    ///
+    /// The caller asserts the slot's holder is dead; a live holder's reads
+    /// lose all gating protection (revoked read validity).
+    pub unsafe fn force_detach_consumer(fd: BorrowedFd<'_>, slot: usize) -> io::Result<()> {
+        let opened = Self::open(fd)?;
+        if slot >= opened.max_consumers {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "slot index out of range for this ring's consumer table",
+            ));
+        }
+        spmc_force_detach(&opened.region, slot);
+        Ok(())
+    }
+
+    /// [`recover_shm`](crate::spmc_bytes::BytesRingBuffer::recover_shm) with
+    /// explicit wait strategies.
+    ///
+    /// # Safety
+    ///
+    /// See [`recover_shm`](crate::spmc_bytes::BytesRingBuffer::recover_shm).
+    pub unsafe fn recover_shm_with(fd: BorrowedFd<'_>) -> io::Result<SpmcBytesPair<P, C>> {
+        let opened = Self::open(fd)?;
+        let producer_anchor = spmc_attach_producer_anchor::<C>(&opened, true)?;
+        opened.region.spmc_aux().store(0, Ordering::Release);
+        let resume = spmc_reset_table(&opened.region, opened.max_consumers, opened.capacity);
+        let claim = spmc_claim_slot(&opened.region, opened.max_consumers)
+            .expect("freshly reset table has free slots");
+        opened
+            .region
+            .slot_cursor(claim.slot)
+            .store(slot_guard(resume), Ordering::Release);
+        let consumer_anchor = Box::new(SpmcConsumerAnchor::new(
+            Arc::clone(&opened.region),
+            claim,
+            opened.max_consumers,
+        ));
+        // SAFETY: region validated by open(); forwarded caller contract.
+        unsafe {
+            Ok((
+                crate::spmc_bytes::BytesProducer::from_shm(producer_anchor, opened.capacity),
+                crate::spmc_bytes::BytesConsumer::from_shm(
+                    consumer_anchor,
+                    opened.capacity,
+                    resume,
+                ),
+            ))
+        }
     }
 }
 
