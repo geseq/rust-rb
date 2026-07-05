@@ -5,7 +5,7 @@
 //! pages — catches any absolute-pointer assumption), and by a real
 //! subprocess that creates a ring, publishes, and exits without cleanup so
 //! the parent can crash-recover it.
-#![cfg(all(feature = "shm", target_os = "linux"))]
+#![cfg(all(feature = "shm", target_os = "linux", target_has_atomic = "64"))]
 
 use std::os::fd::{AsFd, AsRawFd};
 

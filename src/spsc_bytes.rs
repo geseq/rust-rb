@@ -192,7 +192,7 @@ where
     P: WaitStrategy,
     C: WaitStrategy,
 {
-    #[cfg(all(feature = "shm", target_os = "linux"))]
+    #[cfg(all(feature = "shm", target_os = "linux", target_has_atomic = "64"))]
     pub(crate) fn from_core(core: ProducerCore<Word, P, C>) -> Self {
         Self { core }
     }
@@ -444,7 +444,7 @@ where
     P: WaitStrategy,
     C: WaitStrategy,
 {
-    #[cfg(all(feature = "shm", target_os = "linux"))]
+    #[cfg(all(feature = "shm", target_os = "linux", target_has_atomic = "64"))]
     pub(crate) fn from_core(core: ConsumerCore<Word, P, C>) -> Self {
         Self { core }
     }
@@ -604,23 +604,19 @@ impl<P: WaitStrategy, C: WaitStrategy> Drop for Msg<'_, P, C> {
         // transiently not see.
         let c = &mut self.consumer.core;
         let capacity = c.capacity();
-        // Padding-aware watermark. A byte producer blocks whenever
-        // `free < pad + record`; from this side we know the producer's next
-        // write position (our cached view of its cursor), so we can bound the
-        // worst case it might need: a max-size record (capacity/2) plus, if
-        // that record cannot fit before the buffer end, the wrap padding to
-        // get past it. Any occupancy above `capacity - max_needed` could
-        // therefore be blocking a legal producer, and the release publishes
-        // immediately. (With a stale cursor cache the bound lags like every
-        // other cached-view decision: the batch clamp and catch-up flush
-        // still bound the wait.)
-        let half = capacity / 2;
-        let to_end = capacity - (c.write_cursor_cache & (capacity - 1));
-        let max_needed = half + if to_end < half { to_end } else { 0 };
+        // Immediate trigger: the producer says a space check failed against
+        // the freshest published cursor (exact starvation signal — padding,
+        // record size, and position are all accounted for by the producer
+        // itself). Under mere backpressure the flag stays clear and the
+        // batch clamp keeps publishes amortized; while the producer is
+        // actually starving, every release publishes. The flag is
+        // producer-owned — it clears it once space checks pass again — so
+        // under saturation it sits at 1 with no store churn.
+        let starving = c.producer_starving();
         c.advance(
             record_len(self.len),
             publish_batch(capacity, MAX_PUBLISH_BATCH_BYTES),
-            capacity - max_needed,
+            starving,
         );
     }
 }

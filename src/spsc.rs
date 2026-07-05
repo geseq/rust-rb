@@ -111,7 +111,7 @@ where
     P: WaitStrategy,
     C: WaitStrategy,
 {
-    #[cfg(all(feature = "shm", target_os = "linux"))]
+    #[cfg(all(feature = "shm", target_os = "linux", target_has_atomic = "64"))]
     pub(crate) fn from_core(core: ProducerCore<Slot<T>, P, C>) -> Self {
         Self { core }
     }
@@ -273,7 +273,7 @@ where
     P: WaitStrategy,
     C: WaitStrategy,
 {
-    #[cfg(all(feature = "shm", target_os = "linux"))]
+    #[cfg(all(feature = "shm", target_os = "linux", target_has_atomic = "64"))]
     pub(crate) fn from_core(core: ConsumerCore<Slot<T>, P, C>) -> Self {
         Self { core }
     }
@@ -342,10 +342,16 @@ where
     #[inline(always)]
     fn advance_one(&mut self) {
         let capacity = self.core.capacity();
-        // Watermark = mask: the immediate flush fires only when the queue was
-        // observed exactly full (a blocked element producer needs one slot).
+        // Immediate trigger: the queue was observed exactly full per this
+        // side's latest view (a blocked element producer needs one slot).
+        // Fires once per cursor-reload cycle — no per-element ping-pong.
+        let was_full = self
+            .core
+            .write_cursor_cache
+            .wrapping_sub(self.core.read_cursor)
+            > capacity - 1;
         self.core
-            .advance(1, publish_batch(capacity, MAX_PUBLISH_BATCH), capacity - 1);
+            .advance(1, publish_batch(capacity, MAX_PUBLISH_BATCH), was_full);
     }
 
     /// Number of elements currently queued. Exact on this side: uses the
