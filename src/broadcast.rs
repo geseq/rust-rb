@@ -105,10 +105,9 @@ use std::cell::UnsafeCell;
 use std::mem::{size_of, MaybeUninit};
 use std::ptr::NonNull;
 use std::sync::atomic::{fence, AtomicU64, Ordering};
-#[cfg(not(rust_rb_volatile_copy))]
-use std::sync::atomic::{AtomicU8, AtomicUsize};
 use std::sync::Arc;
 
+use crate::atomic_copy::{read_payload, write_payload};
 use crate::cache_padded::CachePadded;
 use crate::wait::{SelfTimed, WaitStrategy, YieldWait};
 
@@ -298,148 +297,10 @@ unsafe impl<T: Send> Sync for Shared<T> {}
 // SAFETY: as above; the owning handle may move between threads.
 unsafe impl<T: Send> Send for Shared<T> {}
 
-/// Copy `len` bytes from private memory into a slot payload using
-/// machine-word **atomic** `Relaxed` stores (tail bytes byte-wise). Plain
-/// stores would be UB against the reader's concurrent atomic copy and could
-/// be compiler-hoisted above the invalidation fence [M-F10] — the strict
-/// copy is mandatory on the producer side too.
-///
-/// # Safety
-///
-/// `src..src + len` must be readable (any alignment); `dst..dst + len` must
-/// be writable, `dst` word-aligned, and concurrently accessed only through
-/// atomics.
-#[cfg(not(rust_rb_volatile_copy))]
-#[inline(always)]
-unsafe fn copy_in_words(src: *const u8, dst: *mut u8, len: usize) {
-    debug_assert_eq!(
-        dst as usize % std::mem::align_of::<usize>(),
-        0,
-        "slot payload must be word-aligned (repr(C) guarantees it)"
-    );
-    let word = size_of::<usize>();
-    let mut off = 0;
-    while off + word <= len {
-        // SAFETY: `off + word <= len` keeps the read in range; the source is
-        // a private value of `T`, whose alignment may be below `usize`'s —
-        // hence `read_unaligned`.
-        let v = unsafe { src.add(off).cast::<usize>().read_unaligned() };
-        // SAFETY: in range and word-aligned (base asserted above, offsets
-        // are word multiples); a shared atomic reference over the slot's
-        // `UnsafeCell` storage is the sanctioned way to store while readers
-        // race.
-        unsafe { &*(dst.add(off).cast::<AtomicUsize>()) }.store(v, Ordering::Relaxed);
-        off += word;
-    }
-    while off < len {
-        // SAFETY: `off < len`.
-        let v = unsafe { *src.add(off) };
-        // SAFETY: in range; byte atomics have no alignment requirement.
-        unsafe { &*(dst.add(off).cast::<AtomicU8>()) }.store(v, Ordering::Relaxed);
-        off += 1;
-    }
-}
-
-/// Copy `len` bytes out of a slot payload into private memory using
-/// machine-word **atomic** `Relaxed` loads (tail bytes byte-wise). The bytes
-/// may be torn (a racing overwrite); the caller must treat the destination
-/// as `MaybeUninit` until the seqlock generation revalidates [M-F11].
-///
-/// # Safety
-///
-/// `src..src + len` must be readable, `src` word-aligned, initialized (the
-/// caller observed the slot published at least once), and concurrently
-/// accessed only through atomics; `dst..dst + len` must be writable (any
-/// alignment) and private to the caller.
-#[cfg(not(rust_rb_volatile_copy))]
-#[inline(always)]
-unsafe fn copy_out_words(src: *const u8, dst: *mut u8, len: usize) {
-    debug_assert_eq!(
-        src as usize % std::mem::align_of::<usize>(),
-        0,
-        "slot payload must be word-aligned (repr(C) guarantees it)"
-    );
-    let word = size_of::<usize>();
-    let mut off = 0;
-    while off + word <= len {
-        // SAFETY: in range and word-aligned, as in `copy_in_words`; every
-        // byte was initialized by a prior publish, so the atomic load reads
-        // initialized (if possibly torn) data.
-        let v = unsafe { &*(src.add(off).cast::<AtomicUsize>()) }.load(Ordering::Relaxed);
-        // SAFETY: `off + word <= len`; the destination is a private local,
-        // possibly under-aligned for `usize` — hence `write_unaligned`.
-        unsafe { dst.add(off).cast::<usize>().write_unaligned(v) };
-        off += word;
-    }
-    while off < len {
-        // SAFETY: in range; byte atomics have no alignment requirement.
-        let v = unsafe { &*(src.add(off).cast::<AtomicU8>()) }.load(Ordering::Relaxed);
-        // SAFETY: `off < len`.
-        unsafe { *dst.add(off) = v };
-        off += 1;
-    }
-}
-
-/// Store `value` into a slot payload with the strict word-wise atomic copy
-/// (or, under the private `rust_rb_volatile_copy` dev cfg, one volatile
-/// write — the A/B benchmark alternative; formally racy, kept off the
-/// default build).
-///
-/// # Safety
-///
-/// `dst` must be the payload of a live slot this producer owns for writing
-/// (readers may race through atomics; the seqlock brackets the write).
-#[inline(always)]
-unsafe fn write_payload<T: NoUninit>(dst: *mut MaybeUninit<T>, value: &T) {
-    #[cfg(not(rust_rb_volatile_copy))]
-    // SAFETY: `dst` is a valid slot payload, word-aligned by the `repr(C)`
-    // slot layout; `value` is a live `T` with every byte initialized
-    // (`NoUninit`); readers only race through atomics.
-    unsafe {
-        copy_in_words(
-            (value as *const T).cast::<u8>(),
-            dst.cast::<u8>(),
-            size_of::<T>(),
-        )
-    };
-    #[cfg(rust_rb_volatile_copy)]
-    // SAFETY: `dst` is a valid, suitably aligned slot payload; `T: Copy`.
-    // The concurrent volatile read on the consumer side makes this the
-    // classic (formally racy) seqlock shape — dev switch only.
-    unsafe {
-        dst.cast::<T>().write_volatile(*value)
-    };
-}
-
-/// Copy a slot payload into `out` with the strict word-wise atomic copy (or
-/// the volatile alternative under `rust_rb_volatile_copy`). The result may
-/// be torn: it stays `MaybeUninit` until the caller revalidates the
-/// generation.
-///
-/// # Safety
-///
-/// `src` must be the payload of a live slot observed published at least
-/// once (every byte initialized).
-#[inline(always)]
-unsafe fn read_payload<T: NoUninit>(src: *const MaybeUninit<T>, out: &mut MaybeUninit<T>) {
-    #[cfg(not(rust_rb_volatile_copy))]
-    // SAFETY: `src` is a valid slot payload, word-aligned by the `repr(C)`
-    // slot layout, initialized by a prior publish; `out` is a private local.
-    unsafe {
-        copy_out_words(
-            src.cast::<u8>(),
-            out.as_mut_ptr().cast::<u8>(),
-            size_of::<T>(),
-        )
-    };
-    #[cfg(rust_rb_volatile_copy)]
-    {
-        // SAFETY: `src` is a valid, suitably aligned slot payload; torn
-        // bytes land in a `MaybeUninit` and are never interpreted before
-        // validation. Dev switch only (see `write_payload`).
-        *out = unsafe { src.read_volatile() };
-    }
-}
+// The strict word-wise atomic payload copy ([M-F10]/[M-F11]) lives in
+// `crate::atomic_copy` (`write_payload`/`read_payload`), shared with the
+// composed `crate::anchored` ring; the `rust_rb_volatile_copy` dev cfg swaps
+// in whole-payload volatile copies there, exactly as before.
 
 /// Builder/namespace for constructing a lossy broadcast ring buffer.
 ///

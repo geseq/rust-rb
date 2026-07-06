@@ -29,14 +29,15 @@
 //!                         (SPSC kinds only; SPMC leases are per table slot;
 //!                         broadcast consumers are lease-free)
 //! 56   generation u64 (atomic) seqlock: odd while (re)initializing
-//! 128  write_cursor  usize (atomic, own 128-byte slot)
-//!                         broadcast kinds: the u64 `tail` (count of
+//! 128  write_cursor  (atomic, own 128-byte slot) SPSC kinds: usize.
+//!                         SPMC/broadcast/anchored kinds: **u64** (the
+//!                         multi-consumer engines' cursor domain — count of
 //!                         published messages / committed bytes) — the one
 //!                         line consumers spin on
-//! 136  closed    usize (atomic) SPMC + broadcast kinds: graceful-close flag
+//! 136  closed    u64 (atomic) SPMC + broadcast kinds: graceful-close flag
 //!                         (in the write-cursor slot — the line consumers
 //!                         poll)
-//! 144  aux       usize (atomic) SPMC kinds: starving word (byte ring) /
+//! 144  aux       u64 (atomic) SPMC kinds: starving word (byte ring) /
 //!                         dropped_through (element ring; unused, `ShmItem`
 //!                         has no drop) — same padded slot.
 //!                         Broadcast element kind: the u64 reposition slack
@@ -58,8 +59,10 @@
 //!        +0  lease   u64  (atomic) opaque token of the slot holder, 0 = free
 //!        +8  control u64  (atomic) high u32 epoch | low u32 state
 //!                         (0 = FREE, 1 = ACTIVE, 2 = RETIRED)
-//!        +16 cursor  usize (atomic) the consumer's published read cursor
-//!            (usize::MAX = detached sentinel)
+//!        +16 cursor  u64  (atomic) the consumer's published read cursor
+//!            (u64::MAX = detached sentinel; the shared gating engine's
+//!             cursor domain — `arch_bits` still rejects a cross-arch
+//!             attach on top)
 //!      (one line per consumer: the producer's scan reads control + cursor
 //!       from the line the consumer's flush already owns)
 //! 384 + 128 * max_consumers  buffer  capacity * unit_size bytes
@@ -71,8 +74,8 @@
 //! `max_consumers` holds `max_anchors`; the u64 tail at 128 is the unified
 //! cursor (both roles spin on it); closed at 136; the third tail-slot word
 //! at 144 is the element kind's slack / the byte kind's starving span; the
-//! stride word at 152 as for the broadcast kinds. Table slots are the SPMC
-//! shape with a **u64** cursor word:
+//! stride word at 152 as for the broadcast kinds. Table slots are exactly
+//! the SPMC shape (u64 cursor word):
 //! Anchored element kind (9):
 //! 384  anchor table   max_anchors slots of 128 bytes
 //!        {lease u64, control u64 (epoch|state), cursor u64}
@@ -294,26 +297,13 @@ pub(crate) const ANCH_BYTES_TABLE_OFFSET: usize = 512;
 /// its slack and the SPMC kinds for their aux word.
 const OFF_ANCH_STARVING: usize = OFF_WRITE_CURSOR + 16;
 
-/// Anchor-table cursor sentinel: the u64 face of [`SLOT_DETACHED`] (the
-/// anchored rings publish u64 cursors — `crate::anchored::DETACHED`).
-const ANCH_SLOT_DETACHED: u64 = u64::MAX;
-
-/// The u64 face of [`slot_guard`]: a published anchor cursor must never
-/// equal the sentinel; one unit less only gates the producer more.
-#[inline(always)]
-const fn anch_slot_guard(cursor: u64) -> u64 {
-    if cursor == ANCH_SLOT_DETACHED {
-        cursor.wrapping_sub(1)
-    } else {
-        cursor
-    }
-}
-
 // --- SPMC consumer table geometry (kinds 3/4) --------------------------------
 
 /// The consumer table starts where the SPSC buffer would (the header shape
-/// up to here is shared across kinds).
-const SPMC_TABLE_OFFSET: usize = BUFFER_OFFSET;
+/// up to here is shared across kinds). `pub(crate)`: the gating modules'
+/// in-process subscribe paths address their kind's table directly, exactly
+/// as the anchored modules do with their table offsets.
+pub(crate) const SPMC_TABLE_OFFSET: usize = BUFFER_OFFSET;
 /// One 128-byte slot per consumer: lease, control, and cursor co-resident on
 /// one line — the producer's scan touches one line per consumer, and that
 /// line already carries the consumer's flush traffic.
@@ -322,10 +312,10 @@ const SLOT_LEASE: usize = 0;
 const SLOT_CONTROL: usize = 8;
 const SLOT_CURSOR: usize = 16;
 
-/// Consumer-cursor detached sentinel — the same `usize::MAX` the heap
-/// registries use (`crate::spmc::DETACHED`): a claimed-but-not-yet-joined or
-/// freed slot imposes no gating constraint.
-const SLOT_DETACHED: usize = usize::MAX;
+/// Consumer-cursor detached sentinel — the same `u64::MAX` the heap
+/// registries use (`crate::registry::DETACHED`): a claimed-but-not-yet-joined
+/// or freed slot imposes no gating constraint.
+const SLOT_DETACHED: u64 = u64::MAX;
 
 /// Control-word states (low u32; high u32 is the retirement epoch [A-4.1]).
 const STATE_FREE: u32 = 0;
@@ -355,10 +345,10 @@ pub(crate) const fn control_is_active(control: u64) -> bool {
 }
 
 /// The cursor-sentinel guard, mirrored from the heap registries: a published
-/// cursor must never equal [`SLOT_DETACHED`] (exact-wraparound collision);
-/// one unit less only gates the producer more.
+/// cursor must never equal [`SLOT_DETACHED`]; one unit less only gates the
+/// producer more.
 #[inline(always)]
-const fn slot_guard(cursor: usize) -> usize {
+const fn slot_guard(cursor: u64) -> u64 {
     if cursor == SLOT_DETACHED {
         cursor.wrapping_sub(1)
     } else {
@@ -916,21 +906,22 @@ impl ShmRegion {
     //     offsets are validated header geometry, inside any mapping that
     //     passed `open_spmc_region`/`create_spmc_region`) ---
 
-    /// The producer's published write cursor.
-    pub(crate) fn spmc_write_cursor(&self) -> &AtomicUsize {
+    /// The producer's published write cursor (the SPMC kinds' u64 cursor
+    /// word — the same offset the broadcast/anchored kinds call `tail`).
+    pub(crate) fn spmc_write_cursor(&self) -> &AtomicU64 {
         // SAFETY: OFF_WRITE_CURSOR is 8-aligned and inside the mapping.
         unsafe { self.atomic(OFF_WRITE_CURSOR) }
     }
 
     /// The graceful-close word (0 = open).
-    pub(crate) fn spmc_closed(&self) -> &AtomicUsize {
+    pub(crate) fn spmc_closed(&self) -> &AtomicU64 {
         // SAFETY: OFF_SPMC_CLOSED is 8-aligned and inside the mapping.
         unsafe { self.atomic(OFF_SPMC_CLOSED) }
     }
 
     /// The auxiliary write-side word (byte ring: starving flag; element
     /// ring: reserved).
-    pub(crate) fn spmc_aux(&self) -> &AtomicUsize {
+    pub(crate) fn spmc_aux(&self) -> &AtomicU64 {
         // SAFETY: OFF_SPMC_AUX is 8-aligned and inside the mapping.
         unsafe { self.atomic(OFF_SPMC_AUX) }
     }
@@ -943,33 +934,15 @@ impl ShmRegion {
         unsafe { self.atomic::<AtomicU64>(OFF_GENERATION) }.load(Ordering::Acquire)
     }
 
-    /// Byte offset of a consumer-table slot field.
-    #[inline]
-    fn slot_off(slot: usize, field: usize) -> usize {
-        SPMC_TABLE_OFFSET + slot * SPMC_SLOT_STRIDE + field
-    }
-
-    /// A consumer slot's lease word. `slot` must be below the region's
-    /// `max_consumers` (upheld by every caller; the table is inside the
-    /// validated mapping exactly up to there).
-    pub(crate) fn slot_lease(&self, slot: usize) -> &AtomicU64 {
-        // SAFETY: 8-aligned (stride 128, field 0) and inside the mapping for
-        // any valid slot index.
-        unsafe { self.atomic(Self::slot_off(slot, SLOT_LEASE)) }
-    }
-
-    /// A consumer slot's control word (`epoch | state`).
-    pub(crate) fn slot_control(&self, slot: usize) -> &AtomicU64 {
-        // SAFETY: 8-aligned (stride 128, field 8) and inside the mapping for
-        // any valid slot index.
-        unsafe { self.atomic(Self::slot_off(slot, SLOT_CONTROL)) }
-    }
-
-    /// A consumer slot's published read cursor.
-    pub(crate) fn slot_cursor(&self, slot: usize) -> &AtomicUsize {
-        // SAFETY: 8-aligned (stride 128, field 16) and inside the mapping
-        // for any valid slot index.
-        unsafe { self.atomic(Self::slot_off(slot, SLOT_CURSOR)) }
+    /// A consumer slot's published read cursor (u64 — the shared gating
+    /// engine's cursor domain; the SPMC-kind shortcut for
+    /// [`anch_slot_cursor`](Self::anch_slot_cursor) at `SPMC_TABLE_OFFSET`).
+    /// `slot` must be below the region's `max_consumers` (upheld by every
+    /// caller; the table is inside the validated mapping exactly up to
+    /// there). The lease/control words are reached through the
+    /// table-offset-parameterized accessors below.
+    pub(crate) fn slot_cursor(&self, slot: usize) -> &AtomicU64 {
+        self.anch_slot_cursor(SPMC_TABLE_OFFSET, slot)
     }
 
     /// Base of an SPMC region's buffer: past the consumer table, 128-byte
@@ -1656,13 +1629,13 @@ fn create_spmc_region(
             .atomic::<AtomicU64>(OFF_CONSUMER_LEASE)
             .store(0, Ordering::Relaxed);
         region
-            .atomic::<AtomicUsize>(OFF_WRITE_CURSOR)
+            .atomic::<AtomicU64>(OFF_WRITE_CURSOR)
             .store(0, Ordering::Relaxed);
         region
-            .atomic::<AtomicUsize>(OFF_SPMC_CLOSED)
+            .atomic::<AtomicU64>(OFF_SPMC_CLOSED)
             .store(0, Ordering::Relaxed);
         region
-            .atomic::<AtomicUsize>(OFF_SPMC_AUX)
+            .atomic::<AtomicU64>(OFF_SPMC_AUX)
             .store(0, Ordering::Relaxed);
         // The stride word is a broadcast-kind field; keep it
         // deterministically zero on the SPMC kinds (a reused fd may carry a
@@ -1760,7 +1733,7 @@ fn open_spmc_region(
     let region = ShmRegion::map(fd, len)?;
 
     // Alignment holds for every individually-published cursor value.
-    if region.spmc_write_cursor().load(Ordering::Acquire) % cursor_align != 0 {
+    if region.spmc_write_cursor().load(Ordering::Acquire) % cursor_align as u64 != 0 {
         return Err(err("corrupt cursors: not record-aligned"));
     }
     // Seqlock re-check on the full mapping.
@@ -1776,380 +1749,12 @@ fn open_spmc_region(
     })
 }
 
-/// A freshly claimed consumer-table slot.
-pub(crate) struct SlotClaim {
-    pub(crate) slot: usize,
-    /// The epoch the slot was claimed at (its control word is `ACTIVE@epoch`
-    /// until detach or retirement).
-    pub(crate) epoch: u32,
-    /// The slot lease token this claimant wrote.
-    pub(crate) token: u64,
-    /// The join point: only messages published after this cursor are seen.
-    pub(crate) joined: usize,
-}
-
-/// The SPMC subscribe choreography over the consumer table — the shm mapping
-/// of the heap rings' [M-F2] protocol, with the control word playing the
-/// bitmap's role. Returns `None` when no FREE slot exists (table full;
-/// RETIRED slots stay unavailable until `recover_shm`).
-///
-/// Order (each step before the next):
-/// 1. CAS control `FREE@e -> ACTIVE@e+1` — the claim and the **registration
-///    event** in one RMW (the epoch bump gives every *occupancy* of a slot
-///    a distinct epoch, which is what lets `force_detach_consumer` prove it
-///    is retiring the occupancy the caller diagnosed dead and not a
-///    successor that re-claimed a gracefully freed slot), strictly BEFORE
-///    the SeqCst fence: the producer's
-///    rescan observes consumers only through the control word, so this is
-///    the store the [M-F2] fence dichotomy is about (set after the fence, a
-///    scan could miss the slot *while* the re-read below returns a stale
-///    write cursor, and the producer would lap a consumer it never saw).
-/// 2. Store the provisional cursor (a lower bound of the join point). The
-///    window between 1 and 2 — control ACTIVE, cursor still the previous
-///    occupant's sentinel/value — is covered on the scan side: a sentinel
-///    read is skipped without caching (and by the fence dichotomy such a
-///    joiner's join point is past the scan's wrap point); a leftover real
-///    cursor is at most the write cursor at the previous detach, which the
-///    new join point cannot undercut — a valid lower bound either way.
-/// 3. `fence(SeqCst)` — pairs with the producer's pre-scan fence.
-/// 4. Re-read the write cursor: **the join point is the re-read**; publish
-///    it as the final cursor (Release).
-/// 5. Take the slot lease (opaque random token, exactly like the role
-///    leases; teardown and the flush guard check it).
-pub(crate) fn spmc_claim_slot(region: &ShmRegion, max_consumers: usize) -> Option<SlotClaim> {
-    let write_cursor = region.spmc_write_cursor();
-    'slots: for slot in 0..max_consumers {
-        let control = region.slot_control(slot);
-        let mut current = control.load(Ordering::Acquire);
-        loop {
-            if control_state(current) != STATE_FREE {
-                continue 'slots;
-            }
-            // Bump the epoch on claim: each occupancy of the slot gets its
-            // own epoch (graceful detach keeps it, so FREE@e means "last
-            // occupied by epoch e").
-            let epoch = control_epoch(current).wrapping_add(1);
-            match control.compare_exchange(
-                current,
-                control_word(epoch, STATE_ACTIVE),
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    let cursor = region.slot_cursor(slot);
-                    let provisional = slot_guard(write_cursor.load(Ordering::Acquire));
-                    cursor.store(provisional, Ordering::Release);
-                    std::sync::atomic::fence(Ordering::SeqCst);
-                    let joined = write_cursor.load(Ordering::Acquire);
-                    cursor.store(slot_guard(joined), Ordering::Release);
-                    let token = lease_token();
-                    region.slot_lease(slot).store(token, Ordering::Release);
-                    return Some(SlotClaim {
-                        slot,
-                        epoch,
-                        token,
-                        joined,
-                    });
-                }
-                // Lost a race (concurrent joiner or force-detach): re-examine
-                // this slot with the fresh value.
-                Err(fresh) => current = fresh,
-            }
-        }
-    }
-    None
-}
-
-/// Roll a just-made claim back (attach-time seqlock conflict): the graceful
-/// detach sequence minus the flush — sentinel, then availability, then the
-/// lease — **but only while the region generation still equals
-/// `generation`, the one the claim was made under**. A generation change
-/// means a concurrent `create_shm`/`recover_shm` reset the whole table (and
-/// restarted epochs), so the words this claim wrote no longer belong to it:
-/// an unconditional rollback could store the sentinel over a *new* ring's
-/// freshly-claimed cursor and CAS its `ACTIVE@e` control (epochs restart, so
-/// `e` can collide) back to FREE. In that case the only safe move is to
-/// touch nothing — at worst our claim landed after the reset and leaks one
-/// slot in the new table until the next `recover_shm`, which is the safe
-/// direction (a leak, never a clobber). Under an unchanged generation the
-/// claimant still owns the ACTIVE slot exclusively (only `force_detach` can
-/// move it, and the epoch-conditional CAS below fails harmlessly on a
-/// retired slot), so the sentinel store and the CASes are sound.
-pub(crate) fn spmc_release_claim(region: &ShmRegion, claim: &SlotClaim, generation: u64) {
-    // SAFETY: OFF_GENERATION is 8-aligned and inside the mapping.
-    let gen_now = unsafe { region.atomic::<AtomicU64>(OFF_GENERATION) }.load(Ordering::Acquire);
-    if gen_now != generation {
-        return;
-    }
-    region
-        .slot_cursor(claim.slot)
-        .store(SLOT_DETACHED, Ordering::Release);
-    let _ = region.slot_control(claim.slot).compare_exchange(
-        control_word(claim.epoch, STATE_ACTIVE),
-        control_word(claim.epoch, STATE_FREE),
-        Ordering::AcqRel,
-        Ordering::Acquire,
-    );
-    let _ = region.slot_lease(claim.slot).compare_exchange(
-        claim.token,
-        0,
-        Ordering::AcqRel,
-        Ordering::Acquire,
-    );
-}
-
-/// Retire a consumer-table slot [A-4.1]: one compare-and-retire CAS
-/// `ACTIVE@epoch -> RETIRED@epoch+1`. The epoch is the caller's proof that
-/// it is retiring the *same occupancy it diagnosed dead* (each claim bumps
-/// the epoch, so a healthy consumer that re-claimed the slot after the dead
-/// one gracefully freed it holds a different epoch and the CAS fails instead
-/// of retiring the living). A retired slot is never re-issued until
-/// `recover_shm`; the (possibly live) previous holder's stores land on words
-/// nobody reads. The lease and cursor words are left as-is — they are dead
-/// until the table reset.
-fn spmc_force_detach(region: &ShmRegion, slot: usize, epoch: u32) -> io::Result<()> {
-    region
-        .slot_control(slot)
-        .compare_exchange(
-            control_word(epoch, STATE_ACTIVE),
-            control_word(epoch.wrapping_add(1), STATE_RETIRED),
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        )
-        .map(drop)
-        .map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "slot epoch mismatch — the slot no longer belongs to the \
-                 consumer you diagnosed (freed, re-claimed, or already \
-                 retired)",
-            )
-        })
-}
-
-/// Reset the whole consumer table (recover): compute the at-least-once
-/// resume point — the slowest previously-registered cursor, ignoring
-/// implausible values (lag beyond one capacity: stale zombie leftovers the
-/// producer had already stopped honoring) — then free every slot with a
-/// bumped epoch, a zeroed lease, and the detached sentinel. Returns the
-/// resume cursor (the write cursor itself when no consumer had registered).
-///
-/// The rewrite is armed with the region seqlock exactly like
-/// `create_spmc_region`'s (odd generation before the first table write,
-/// `+2` close after the last): the reset is a re-initialization event for
-/// the table, and without the bump a concurrent attach/subscribe whose claim
-/// interleaves the rewrite would pass its post-claim generation re-check and
-/// keep a slot the reset just freed out from under it.
-fn spmc_reset_table(region: &ShmRegion, max_consumers: usize, capacity: usize) -> usize {
-    // Seqlock open (see `create_region` for the ordering rationale).
-    // SAFETY: OFF_GENERATION is 8-aligned and inside the mapping.
-    let generation = unsafe { region.atomic::<AtomicU64>(OFF_GENERATION) };
-    let g = generation.load(Ordering::Relaxed);
-    generation.store(g | 1, Ordering::SeqCst);
-    let write = region.spmc_write_cursor().load(Ordering::Acquire);
-    let mut max_lag = 0usize;
-    for slot in 0..max_consumers {
-        if control_state(region.slot_control(slot).load(Ordering::Acquire)) == STATE_FREE {
-            continue;
-        }
-        let cursor = region.slot_cursor(slot).load(Ordering::Acquire);
-        if cursor == SLOT_DETACHED {
-            continue;
-        }
-        let lag = write.wrapping_sub(cursor);
-        if lag <= capacity && lag > max_lag {
-            max_lag = lag;
-        }
-    }
-    for slot in 0..max_consumers {
-        // Detach order per slot: sentinel, lease, availability last.
-        region
-            .slot_cursor(slot)
-            .store(SLOT_DETACHED, Ordering::Release);
-        region.slot_lease(slot).store(0, Ordering::Release);
-        let control = region.slot_control(slot);
-        let current = control.load(Ordering::Acquire);
-        control.store(
-            control_word(control_epoch(current).wrapping_add(1), STATE_FREE),
-            Ordering::Release,
-        );
-    }
-    // Seqlock close: even generation, strictly greater than before.
-    generation.store((g | 1).wrapping_add(1), Ordering::Release);
-    write.wrapping_sub(max_lag)
-}
-
-/// The shm anchor for a gating SPMC **producer**: keeps the mapping alive,
-/// holds the producer role lease (same offset and discipline as the SPSC
-/// rings), and exposes the consumer table to the producer's rescans. Only
-/// the consumer-side wait strategy is carried — the producer's own waits use
-/// fresh per-call instances of its (stateless, `CrossProcess`) strategy.
-pub(crate) struct SpmcProducerAnchor<C> {
-    region: Arc<ShmRegion>,
-    token: u64,
-    /// Fork guard, exactly as in [`ShmAnchor`].
-    owner_pid: libc::pid_t,
-    max_consumers: usize,
-    pub(crate) consumer_wait: C,
-}
-
-impl<C: Default> SpmcProducerAnchor<C> {
-    fn new(region: Arc<ShmRegion>, token: u64, max_consumers: usize) -> Self {
-        Self {
-            region,
-            token,
-            // SAFETY: getpid is always safe.
-            owner_pid: unsafe { libc::getpid() },
-            max_consumers,
-            consumer_wait: C::default(),
-        }
-    }
-}
-
-impl<C> SpmcProducerAnchor<C> {
-    pub(crate) fn region(&self) -> &Arc<ShmRegion> {
-        &self.region
-    }
-
-    pub(crate) fn max_consumers(&self) -> usize {
-        self.max_consumers
-    }
-
-    #[inline(always)]
-    pub(crate) fn slot_control(&self, slot: usize) -> &AtomicU64 {
-        self.region.slot_control(slot)
-    }
-
-    #[inline(always)]
-    pub(crate) fn slot_cursor(&self, slot: usize) -> &AtomicUsize {
-        self.region.slot_cursor(slot)
-    }
-
-    /// Number of ACTIVE table slots (snapshot).
-    pub(crate) fn active_count(&self) -> usize {
-        (0..self.max_consumers)
-            .filter(|&slot| control_is_active(self.slot_control(slot).load(Ordering::Relaxed)))
-            .count()
-    }
-
-    /// Whether the producer lease still holds this handle's token (see
-    /// [`ShmAnchor::owns_lease`]).
-    pub(crate) fn owns_lease(&self) -> bool {
-        // SAFETY: the lease offset is 8-aligned and inside the mapping.
-        let lease: &AtomicU64 = unsafe { self.region.atomic(OFF_PRODUCER_LEASE) };
-        lease.load(Ordering::Acquire) == self.token
-    }
-
-    /// Fork guard (see [`ShmAnchor::owned_by_current_process`]).
-    pub(crate) fn owned_by_current_process(&self) -> bool {
-        // SAFETY: getpid is always safe.
-        (unsafe { libc::getpid() }) == self.owner_pid
-    }
-}
-
-impl<C> Drop for SpmcProducerAnchor<C> {
-    fn drop(&mut self) {
-        // Guarded lease release, exactly as [`ShmAnchor`]'s: pid guard
-        // against fork copies, token CAS against force-takeovers.
-        if !self.owned_by_current_process() {
-            return;
-        }
-        // SAFETY: the lease offset is 8-aligned and inside the mapping.
-        let lease: &AtomicU64 = unsafe { self.region.atomic(OFF_PRODUCER_LEASE) };
-        let _ = lease.compare_exchange(self.token, 0, Ordering::AcqRel, Ordering::Acquire);
-    }
-}
-
-/// The shm anchor for a gating SPMC **consumer**: the mapping, this handle's
-/// table slot coordinates (slot index, claim epoch, slot lease token), the
-/// fork-guard pid, and the per-handle wait strategies.
-pub(crate) struct SpmcConsumerAnchor<P, C> {
-    region: Arc<ShmRegion>,
-    slot: usize,
-    epoch: u32,
-    token: u64,
-    owner_pid: libc::pid_t,
-    max_consumers: usize,
-    pub(crate) producer_wait: P,
-    pub(crate) consumer_wait: C,
-}
-
-impl<P: Default, C: Default> SpmcConsumerAnchor<P, C> {
-    pub(crate) fn new(region: Arc<ShmRegion>, claim: SlotClaim, max_consumers: usize) -> Self {
-        Self {
-            region,
-            slot: claim.slot,
-            epoch: claim.epoch,
-            token: claim.token,
-            // SAFETY: getpid is always safe.
-            owner_pid: unsafe { libc::getpid() },
-            max_consumers,
-            producer_wait: P::default(),
-            consumer_wait: C::default(),
-        }
-    }
-}
-
-impl<P, C> SpmcConsumerAnchor<P, C> {
-    pub(crate) fn region(&self) -> &Arc<ShmRegion> {
-        &self.region
-    }
-
-    pub(crate) fn slot(&self) -> usize {
-        self.slot
-    }
-
-    /// The epoch this handle's slot was claimed at — the occupancy proof
-    /// `force_detach_consumer` takes.
-    pub(crate) fn epoch(&self) -> u32 {
-        self.epoch
-    }
-
-    pub(crate) fn max_consumers(&self) -> usize {
-        self.max_consumers
-    }
-
-    /// Whether the slot lease still holds this handle's token. One Acquire
-    /// load of the slot's own line (which this consumer's flush traffic
-    /// already owns) — the hot-flush zombie guard. Note a force-detached
-    /// zombie still owns its lease: its stores keep landing on the RETIRED
-    /// slot, which no scan reads [A-4.1]; only `recover_shm`'s table reset
-    /// (which zeroes leases) silences it here.
-    #[inline]
-    pub(crate) fn owns_slot(&self) -> bool {
-        self.region.slot_lease(self.slot).load(Ordering::Acquire) == self.token
-    }
-
-    /// Fork guard (see [`ShmAnchor::owned_by_current_process`]).
-    pub(crate) fn owned_by_current_process(&self) -> bool {
-        // SAFETY: getpid is always safe.
-        (unsafe { libc::getpid() }) == self.owner_pid
-    }
-
-    /// Graceful detach, called from the consumer's Drop after the flush and
-    /// the cursor-sentinel store: return the slot (CAS `ACTIVE@e -> FREE@e`
-    /// — epoch UNCHANGED, the slot is immediately reusable; the CAS fails
-    /// harmlessly on a force-retired slot, preserving retirement), release
-    /// the slot lease (guarded CAS), and wake a gated producer [A-1.3].
-    pub(crate) fn detach(&self)
-    where
-        P: crate::wait::WaitStrategy,
-    {
-        let _ = self.region.slot_control(self.slot).compare_exchange(
-            control_word(self.epoch, STATE_ACTIVE),
-            control_word(self.epoch, STATE_FREE),
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
-        let _ = self.region.slot_lease(self.slot).compare_exchange(
-            self.token,
-            0,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
-        self.producer_wait.notify();
-    }
-}
+// The consumer-table claim/release/retire/reset choreography and the shm
+// producer/consumer backing types are shared with the anchored kinds — one
+// copy of each protocol, parameterized by the kind's table offset (see
+// `SlotClaim`, `claim_table_slot`, `release_table_claim`,
+// `force_detach_table_slot`, `reset_gate_table`, `GateShmProducer`, and
+// `GateShmConsumer` below). The SPMC kinds pass `SPMC_TABLE_OFFSET`.
 
 /// Claim (or force-take) the producer role over a validated SPMC region and
 /// reset the closed word — a (re)attached producer re-opens the ring (only
@@ -2157,7 +1762,7 @@ impl<P, C> SpmcConsumerAnchor<P, C> {
 fn spmc_attach_producer_anchor<C: Default>(
     opened: &SpmcOpened,
     force: bool,
-) -> io::Result<Box<SpmcProducerAnchor<C>>> {
+) -> io::Result<Box<GateShmProducer<C>>> {
     let region = Arc::clone(&opened.region);
     let token = if force {
         force_claim_lease(&region, Role::Producer)
@@ -2165,10 +1770,11 @@ fn spmc_attach_producer_anchor<C: Default>(
         claim_lease(&region, Role::Producer, opened.generation)?
     };
     region.spmc_closed().store(0, Ordering::Release);
-    Ok(Box::new(SpmcProducerAnchor::new(
+    Ok(Box::new(GateShmProducer::new(
         region,
         token,
         opened.max_consumers,
+        SPMC_TABLE_OFFSET,
     )))
 }
 
@@ -2180,7 +1786,7 @@ fn spmc_attach_producer_anchor<C: Default>(
 /// word holds only its sentinel-guarded image).
 fn spmc_attach_consumer_anchor<P: Default, C: Default>(
     opened: &SpmcOpened,
-) -> io::Result<(Box<SpmcConsumerAnchor<P, C>>, usize)> {
+) -> io::Result<(Box<GateShmConsumer<P, C>>, u64)> {
     let region = Arc::clone(&opened.region);
     if region.spmc_closed().load(Ordering::Acquire) != 0 {
         return Err(io::Error::new(
@@ -2188,19 +1794,20 @@ fn spmc_attach_consumer_anchor<P: Default, C: Default>(
             "ring closed: producer dropped (attach a new producer to reopen)",
         ));
     }
-    let claim = spmc_claim_slot(&region, opened.max_consumers).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::AddrInUse,
-            "consumer table is full (max_consumers is fixed at creation; \
-             retired slots free only via recover_shm)",
-        )
-    })?;
+    let claim =
+        claim_table_slot(&region, SPMC_TABLE_OFFSET, opened.max_consumers).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::AddrInUse,
+                "consumer table is full (max_consumers is fixed at creation; \
+                 retired slots free only via recover_shm)",
+            )
+        })?;
     // SAFETY: OFF_GENERATION is 8-aligned and inside the mapping.
     let gen_now = unsafe { region.atomic::<AtomicU64>(OFF_GENERATION) }.load(Ordering::Acquire);
     if gen_now != opened.generation {
-        // Conditional rollback: `spmc_release_claim` re-checks the
+        // Conditional rollback: `release_table_claim` re-checks the
         // generation and leaves a re-initialized table strictly alone.
-        spmc_release_claim(&region, &claim, opened.generation);
+        release_table_claim(&region, SPMC_TABLE_OFFSET, &claim, opened.generation);
         return Err(io::Error::new(
             io::ErrorKind::AddrInUse,
             "ring was re-initialized during attach",
@@ -2208,7 +1815,12 @@ fn spmc_attach_consumer_anchor<P: Default, C: Default>(
     }
     let joined = claim.joined;
     Ok((
-        Box::new(SpmcConsumerAnchor::new(region, claim, opened.max_consumers)),
+        Box::new(GateShmConsumer::new(
+            region,
+            claim,
+            opened.max_consumers,
+            SPMC_TABLE_OFFSET,
+        )),
         joined,
     ))
 }
@@ -2330,14 +1942,21 @@ where
             std::mem::size_of::<T>(),
             max_consumers,
         )?;
-        let claim = spmc_claim_slot(&region, max_consumers).expect("fresh table has free slots");
+        let claim = claim_table_slot(&region, SPMC_TABLE_OFFSET, max_consumers)
+            .expect("fresh table has free slots");
         let joined = claim.joined;
-        let producer_anchor = Box::new(SpmcProducerAnchor::new(
+        let producer_anchor = Box::new(GateShmProducer::new(
             Arc::clone(&region),
             producer_token,
             max_consumers,
+            SPMC_TABLE_OFFSET,
         ));
-        let consumer_anchor = Box::new(SpmcConsumerAnchor::new(region, claim, max_consumers));
+        let consumer_anchor = Box::new(GateShmConsumer::new(
+            region,
+            claim,
+            max_consumers,
+            SPMC_TABLE_OFFSET,
+        ));
         // SAFETY: freshly initialized region matches this ring's layout.
         unsafe {
             Ok((
@@ -2435,7 +2054,7 @@ where
                 "slot index out of range for this ring's consumer table",
             ));
         }
-        spmc_force_detach(&opened.region, slot, epoch)
+        force_detach_table_slot(&opened.region, SPMC_TABLE_OFFSET, slot, epoch)
     }
 
     /// [`recover_shm`](crate::spmc::RingBuffer::recover_shm) with explicit
@@ -2448,8 +2067,13 @@ where
     pub unsafe fn recover_shm_with(fd: BorrowedFd<'_>) -> io::Result<SpmcElemPair<T, P, C>> {
         let opened = Self::open(fd)?;
         let producer_anchor = spmc_attach_producer_anchor::<C>(&opened, true)?;
-        let resume = spmc_reset_table(&opened.region, opened.max_consumers, opened.capacity);
-        let claim = spmc_claim_slot(&opened.region, opened.max_consumers)
+        let resume = reset_gate_table(
+            &opened.region,
+            SPMC_TABLE_OFFSET,
+            opened.max_consumers,
+            opened.capacity as u64,
+        );
+        let claim = claim_table_slot(&opened.region, SPMC_TABLE_OFFSET, opened.max_consumers)
             .expect("freshly reset table has free slots");
         // Move the fresh slot back to the resume point (a lower cursor only
         // gates the producer more — and the producer is us, not yet pushing).
@@ -2457,10 +2081,11 @@ where
             .region
             .slot_cursor(claim.slot)
             .store(slot_guard(resume), Ordering::Release);
-        let consumer_anchor = Box::new(SpmcConsumerAnchor::new(
+        let consumer_anchor = Box::new(GateShmConsumer::new(
             Arc::clone(&opened.region),
             claim,
             opened.max_consumers,
+            SPMC_TABLE_OFFSET,
         ));
         // SAFETY: region validated by open(); forwarded caller contract.
         unsafe {
@@ -2552,14 +2177,21 @@ where
         let capacity = crate::cursor::round_capacity(min_capacity, BYTES_MIN_CAPACITY);
         let (region, producer_token) =
             create_spmc_region(fd, KIND_SPMC_BYTES, capacity, 1, max_consumers)?;
-        let claim = spmc_claim_slot(&region, max_consumers).expect("fresh table has free slots");
+        let claim = claim_table_slot(&region, SPMC_TABLE_OFFSET, max_consumers)
+            .expect("fresh table has free slots");
         let joined = claim.joined;
-        let producer_anchor = Box::new(SpmcProducerAnchor::new(
+        let producer_anchor = Box::new(GateShmProducer::new(
             Arc::clone(&region),
             producer_token,
             max_consumers,
+            SPMC_TABLE_OFFSET,
         ));
-        let consumer_anchor = Box::new(SpmcConsumerAnchor::new(region, claim, max_consumers));
+        let consumer_anchor = Box::new(GateShmConsumer::new(
+            region,
+            claim,
+            max_consumers,
+            SPMC_TABLE_OFFSET,
+        ));
         // SAFETY: freshly initialized region matches this ring's layout.
         unsafe {
             Ok((
@@ -2645,7 +2277,7 @@ where
                 "slot index out of range for this ring's consumer table",
             ));
         }
-        spmc_force_detach(&opened.region, slot, epoch)
+        force_detach_table_slot(&opened.region, SPMC_TABLE_OFFSET, slot, epoch)
     }
 
     /// [`recover_shm`](crate::spmc_bytes::BytesRingBuffer::recover_shm) with
@@ -2658,17 +2290,23 @@ where
         let opened = Self::open(fd)?;
         let producer_anchor = spmc_attach_producer_anchor::<C>(&opened, true)?;
         opened.region.spmc_aux().store(0, Ordering::Release);
-        let resume = spmc_reset_table(&opened.region, opened.max_consumers, opened.capacity);
-        let claim = spmc_claim_slot(&opened.region, opened.max_consumers)
+        let resume = reset_gate_table(
+            &opened.region,
+            SPMC_TABLE_OFFSET,
+            opened.max_consumers,
+            opened.capacity as u64,
+        );
+        let claim = claim_table_slot(&opened.region, SPMC_TABLE_OFFSET, opened.max_consumers)
             .expect("freshly reset table has free slots");
         opened
             .region
             .slot_cursor(claim.slot)
             .store(slot_guard(resume), Ordering::Release);
-        let consumer_anchor = Box::new(SpmcConsumerAnchor::new(
+        let consumer_anchor = Box::new(GateShmConsumer::new(
             Arc::clone(&opened.region),
             claim,
             opened.max_consumers,
+            SPMC_TABLE_OFFSET,
         ));
         // SAFETY: region validated by open(); forwarded caller contract.
         unsafe {
@@ -3548,7 +3186,7 @@ fn create_anch_region(
         for slot in 0..max_anchors {
             region
                 .anch_slot_cursor(table_offset, slot)
-                .store(ANCH_SLOT_DETACHED, Ordering::Relaxed);
+                .store(SLOT_DETACHED, Ordering::Relaxed);
         }
         // Publish the magic last with Release, then close the seqlock.
         region
@@ -3678,9 +3316,9 @@ fn open_anch_region(
     })
 }
 
-/// A freshly claimed anchor-table slot (the u64-cursor face of
-/// [`SlotClaim`]).
-pub(crate) struct AnchSlotClaim {
+/// A freshly claimed consumer/anchor-table slot (SPMC and anchored kinds —
+/// one table shape, one claim protocol).
+pub(crate) struct SlotClaim {
     pub(crate) slot: usize,
     /// The epoch the slot was claimed at (`ACTIVE@epoch` until detach or
     /// retirement).
@@ -3691,18 +3329,47 @@ pub(crate) struct AnchSlotClaim {
     pub(crate) joined: u64,
 }
 
-/// The anchor-claim choreography — [`spmc_claim_slot`] verbatim over the
-/// anchored kinds' u64 unified cursor (see that function for the [M-F2]
-/// step-by-step rationale: the control CAS is the claim AND the
-/// registration event, strictly before the SeqCst fence; the join point is
-/// the post-fence re-read).
-pub(crate) fn anch_claim_slot(
+/// The subscribe choreography over a consumer/anchor table — the shm
+/// mapping of the heap registries' [M-F2] protocol, with the control word
+/// playing the bitmap's role, parameterized by the kind's `table_offset`
+/// (`SPMC_TABLE_OFFSET` for the gating kinds; the anchored kinds' offsets
+/// for kinds 9/10 — the cursor word at offset 128 is the producer's
+/// published cursor for every one of them). Returns `None` when no FREE
+/// slot exists (table full; RETIRED slots stay unavailable until
+/// `recover_shm`).
+///
+/// Order (each step before the next):
+/// 1. CAS control `FREE@e -> ACTIVE@e+1` — the claim and the **registration
+///    event** in one RMW (the epoch bump gives every *occupancy* of a slot
+///    a distinct epoch, which is what lets `force_detach_consumer` prove it
+///    is retiring the occupancy the caller diagnosed dead and not a
+///    successor that re-claimed a gracefully freed slot), strictly BEFORE
+///    the SeqCst fence: the producer's
+///    rescan observes consumers only through the control word, so this is
+///    the store the [M-F2] fence dichotomy is about (set after the fence, a
+///    scan could miss the slot *while* the re-read below returns a stale
+///    write cursor, and the producer would lap a consumer it never saw).
+/// 2. Store the provisional cursor (a lower bound of the join point). The
+///    window between 1 and 2 — control ACTIVE, cursor still the previous
+///    occupant's sentinel/value — is covered on the scan side: a sentinel
+///    read is skipped without caching (and by the fence dichotomy such a
+///    joiner's join point is past the scan's wrap point); a leftover real
+///    cursor is at most the write cursor at the previous detach, which the
+///    new join point cannot undercut — a valid lower bound either way.
+/// 3. `fence(SeqCst)` — pairs with the producer's pre-scan fence.
+/// 4. Re-read the write cursor: **the join point is the re-read**; publish
+///    it as the final cursor (Release).
+/// 5. Take the slot lease (opaque random token, exactly like the role
+///    leases; teardown and the flush guard check it).
+pub(crate) fn claim_table_slot(
     region: &ShmRegion,
     table_offset: usize,
-    max_anchors: usize,
-) -> Option<AnchSlotClaim> {
+    max_slots: usize,
+) -> Option<SlotClaim> {
+    // The producer's published cursor: `bcast_tail`/`spmc_write_cursor` are
+    // the same u64 word at offset 128 for every table-bearing kind.
     let tail = region.bcast_tail();
-    'slots: for slot in 0..max_anchors {
+    'slots: for slot in 0..max_slots {
         let control = region.anch_slot_control(table_offset, slot);
         let mut current = control.load(Ordering::Acquire);
         loop {
@@ -3721,16 +3388,16 @@ pub(crate) fn anch_claim_slot(
             ) {
                 Ok(_) => {
                     let cursor = region.anch_slot_cursor(table_offset, slot);
-                    let provisional = anch_slot_guard(tail.load(Ordering::Acquire));
+                    let provisional = slot_guard(tail.load(Ordering::Acquire));
                     cursor.store(provisional, Ordering::Release);
                     std::sync::atomic::fence(Ordering::SeqCst);
                     let joined = tail.load(Ordering::Acquire);
-                    cursor.store(anch_slot_guard(joined), Ordering::Release);
+                    cursor.store(slot_guard(joined), Ordering::Release);
                     let token = lease_token();
                     region
                         .anch_slot_lease(table_offset, slot)
                         .store(token, Ordering::Release);
-                    return Some(AnchSlotClaim {
+                    return Some(SlotClaim {
                         slot,
                         epoch,
                         token,
@@ -3746,14 +3413,25 @@ pub(crate) fn anch_claim_slot(
     None
 }
 
-/// Roll a just-made claim back (attach-time seqlock conflict) — the
-/// generation-conditional rollback, exactly as [`spmc_release_claim`]: a
-/// changed generation means a concurrent reset owns the table now, and the
-/// only safe move is to touch nothing (a leak, never a clobber).
-pub(crate) fn anch_release_claim(
+/// Roll a just-made claim back (attach-time seqlock conflict): the graceful
+/// detach sequence minus the flush — sentinel, then availability, then the
+/// lease — **but only while the region generation still equals
+/// `generation`, the one the claim was made under**. A generation change
+/// means a concurrent `create_shm`/`recover_shm` reset the whole table (and
+/// restarted epochs), so the words this claim wrote no longer belong to it:
+/// an unconditional rollback could store the sentinel over a *new* ring's
+/// freshly-claimed cursor and CAS its `ACTIVE@e` control (epochs restart, so
+/// `e` can collide) back to FREE. In that case the only safe move is to
+/// touch nothing — at worst our claim landed after the reset and leaks one
+/// slot in the new table until the next `recover_shm`, which is the safe
+/// direction (a leak, never a clobber). Under an unchanged generation the
+/// claimant still owns the ACTIVE slot exclusively (only `force_detach` can
+/// move it, and the epoch-conditional CAS below fails harmlessly on a
+/// retired slot), so the sentinel store and the CASes are sound.
+pub(crate) fn release_table_claim(
     region: &ShmRegion,
     table_offset: usize,
-    claim: &AnchSlotClaim,
+    claim: &SlotClaim,
     generation: u64,
 ) {
     // SAFETY: OFF_GENERATION is 8-aligned and inside the mapping.
@@ -3763,7 +3441,7 @@ pub(crate) fn anch_release_claim(
     }
     region
         .anch_slot_cursor(table_offset, claim.slot)
-        .store(ANCH_SLOT_DETACHED, Ordering::Release);
+        .store(SLOT_DETACHED, Ordering::Release);
     let _ = region
         .anch_slot_control(table_offset, claim.slot)
         .compare_exchange(
@@ -3777,11 +3455,16 @@ pub(crate) fn anch_release_claim(
         .compare_exchange(claim.token, 0, Ordering::AcqRel, Ordering::Acquire);
 }
 
-/// Retire an anchor-table slot [A-4.1]: one compare-and-retire CAS
-/// `ACTIVE@epoch -> RETIRED@epoch+1` (see [`spmc_force_detach`] for the
-/// occupancy-proof rationale; the lease and cursor words are left as-is —
-/// dead until the table reset).
-fn anch_force_detach(
+/// Retire a consumer/anchor-table slot [A-4.1]: one compare-and-retire CAS
+/// `ACTIVE@epoch -> RETIRED@epoch+1`. The epoch is the caller's proof that
+/// it is retiring the *same occupancy it diagnosed dead* (each claim bumps
+/// the epoch, so a healthy consumer that re-claimed the slot after the dead
+/// one gracefully freed it holds a different epoch and the CAS fails instead
+/// of retiring the living). A retired slot is never re-issued until
+/// `recover_shm`; the (possibly live) previous holder's stores land on words
+/// nobody reads. The lease and cursor words are left as-is — they are dead
+/// until the table reset.
+fn force_detach_table_slot(
     region: &ShmRegion,
     table_offset: usize,
     slot: usize,
@@ -3806,19 +3489,22 @@ fn anch_force_detach(
         })
 }
 
-/// Reset the whole anchor table (recover) — [`spmc_reset_table`] over the
-/// u64 unified cursor: compute the at-least-once resume point (the slowest
-/// previously-registered cursor, ignoring implausible lag beyond one
-/// capacity), then free every slot with a bumped epoch, a zeroed lease, and
-/// the detached sentinel. The rewrite is **seqlock-armed** exactly like the
-/// create path (odd generation before the first table write, `+2` close
-/// after the last): without the bump a concurrent attach/subscribe whose
-/// claim interleaves the rewrite would pass its post-claim generation
-/// re-check and keep a slot the reset just freed out from under it.
-fn anch_reset_table(
+/// Reset a whole consumer/anchor table (recover): compute the
+/// at-least-once resume point — the slowest previously-registered cursor,
+/// ignoring implausible values (lag beyond one capacity: stale zombie
+/// leftovers the producer had already stopped honoring) — then free every
+/// slot with a bumped epoch, a zeroed lease, and the detached sentinel.
+/// Returns the resume cursor (the producer's published cursor itself when
+/// no consumer had registered). The rewrite is **seqlock-armed** exactly
+/// like the create path (odd generation before the first table write, `+2`
+/// close after the last): the reset is a re-initialization event for the
+/// table, and without the bump a concurrent attach/subscribe whose claim
+/// interleaves the rewrite would pass its post-claim generation re-check
+/// and keep a slot the reset just freed out from under it.
+fn reset_gate_table(
     region: &ShmRegion,
     table_offset: usize,
-    max_anchors: usize,
+    max_slots: usize,
     capacity: u64,
 ) -> u64 {
     // Seqlock open (see `create_region` for the ordering rationale).
@@ -3828,7 +3514,7 @@ fn anch_reset_table(
     generation.store(g | 1, Ordering::SeqCst);
     let tail = region.bcast_tail().load(Ordering::Acquire);
     let mut max_lag = 0u64;
-    for slot in 0..max_anchors {
+    for slot in 0..max_slots {
         if control_state(
             region
                 .anch_slot_control(table_offset, slot)
@@ -3840,7 +3526,7 @@ fn anch_reset_table(
         let cursor = region
             .anch_slot_cursor(table_offset, slot)
             .load(Ordering::Acquire);
-        if cursor == ANCH_SLOT_DETACHED {
+        if cursor == SLOT_DETACHED {
             continue;
         }
         let lag = tail.wrapping_sub(cursor);
@@ -3848,11 +3534,11 @@ fn anch_reset_table(
             max_lag = lag;
         }
     }
-    for slot in 0..max_anchors {
+    for slot in 0..max_slots {
         // Detach order per slot: sentinel, lease, availability last.
         region
             .anch_slot_cursor(table_offset, slot)
-            .store(ANCH_SLOT_DETACHED, Ordering::Release);
+            .store(SLOT_DETACHED, Ordering::Release);
         region
             .anch_slot_lease(table_offset, slot)
             .store(0, Ordering::Release);
@@ -3868,43 +3554,45 @@ fn anch_reset_table(
     tail.wrapping_sub(max_lag)
 }
 
-/// The shm backing for an anchored **producer**: keeps the mapping alive,
-/// holds the producer role lease, and exposes the anchor table to the
-/// producer's rescans (the [`SpmcProducerAnchor`] shape parameterized by
-/// the kind's table offset). Only the consumer-side wait strategy is
-/// carried — the producer's own waits use fresh per-call instances of its
-/// (stateless, `CrossProcess`) strategy.
-pub(crate) struct AnchShmProducer<C> {
+/// The shm backing for a gating **producer** (SPMC and anchored kinds):
+/// keeps the mapping alive, holds the producer role lease (same offset and
+/// discipline as the SPSC rings), and exposes the consumer/anchor table to
+/// the producer's rescans, parameterized by the kind's table offset. Only
+/// the consumer-side wait strategy is carried — the producer's own waits
+/// use fresh per-call instances of its (stateless, `CrossProcess`)
+/// strategy.
+pub(crate) struct GateShmProducer<C> {
     region: Arc<ShmRegion>,
     token: u64,
     /// Fork guard, exactly as in [`ShmAnchor`].
     owner_pid: libc::pid_t,
-    max_anchors: usize,
+    max_slots: usize,
     table_offset: usize,
     pub(crate) consumer_wait: C,
 }
 
-impl<C: Default> AnchShmProducer<C> {
-    fn new(region: Arc<ShmRegion>, token: u64, max_anchors: usize, table_offset: usize) -> Self {
+impl<C: Default> GateShmProducer<C> {
+    fn new(region: Arc<ShmRegion>, token: u64, max_slots: usize, table_offset: usize) -> Self {
         Self {
             region,
             token,
             // SAFETY: getpid is always safe.
             owner_pid: unsafe { libc::getpid() },
-            max_anchors,
+            max_slots,
             table_offset,
             consumer_wait: C::default(),
         }
     }
 }
 
-impl<C> AnchShmProducer<C> {
+impl<C> GateShmProducer<C> {
     pub(crate) fn region(&self) -> &Arc<ShmRegion> {
         &self.region
     }
 
-    pub(crate) fn max_anchors(&self) -> usize {
-        self.max_anchors
+    /// The table size (`max_consumers`/`max_anchors`, fixed at creation).
+    pub(crate) fn max_slots(&self) -> usize {
+        self.max_slots
     }
 
     pub(crate) fn table_offset(&self) -> usize {
@@ -3921,10 +3609,10 @@ impl<C> AnchShmProducer<C> {
         self.region.anch_slot_cursor(self.table_offset, slot)
     }
 
-    /// Number of ACTIVE table slots (snapshot). Observers are not counted:
-    /// nothing tracks them.
+    /// Number of ACTIVE table slots (snapshot). Lossy observers are not
+    /// counted: nothing tracks them.
     pub(crate) fn active_count(&self) -> usize {
-        (0..self.max_anchors)
+        (0..self.max_slots)
             .filter(|&slot| control_is_active(self.slot_control(slot).load(Ordering::Relaxed)))
             .count()
     }
@@ -3944,7 +3632,7 @@ impl<C> AnchShmProducer<C> {
     }
 }
 
-impl<C> Drop for AnchShmProducer<C> {
+impl<C> Drop for GateShmProducer<C> {
     fn drop(&mut self) {
         // Guarded lease release, exactly as [`ShmAnchor`]'s: pid guard
         // against fork copies, token CAS against force-takeovers.
@@ -3957,27 +3645,28 @@ impl<C> Drop for AnchShmProducer<C> {
     }
 }
 
-/// The shm backing for an anchored **anchor** (the gating consumer): the
-/// mapping, this handle's table-slot coordinates (slot index, claim epoch,
-/// slot lease token), the fork-guard pid, and the per-handle wait
-/// strategies — [`SpmcConsumerAnchor`] parameterized by the table offset.
-pub(crate) struct AnchShmAnchor<P, C> {
+/// The shm backing for a gating **consumer** (an SPMC consumer or an
+/// anchored ring's anchor): the mapping, this handle's table-slot
+/// coordinates (slot index, claim epoch, slot lease token), the fork-guard
+/// pid, and the per-handle wait strategies, parameterized by the kind's
+/// table offset.
+pub(crate) struct GateShmConsumer<P, C> {
     region: Arc<ShmRegion>,
     slot: usize,
     epoch: u32,
     token: u64,
     owner_pid: libc::pid_t,
-    max_anchors: usize,
+    max_slots: usize,
     table_offset: usize,
     pub(crate) producer_wait: P,
     pub(crate) consumer_wait: C,
 }
 
-impl<P: Default, C: Default> AnchShmAnchor<P, C> {
+impl<P: Default, C: Default> GateShmConsumer<P, C> {
     pub(crate) fn new(
         region: Arc<ShmRegion>,
-        claim: AnchSlotClaim,
-        max_anchors: usize,
+        claim: SlotClaim,
+        max_slots: usize,
         table_offset: usize,
     ) -> Self {
         Self {
@@ -3987,7 +3676,7 @@ impl<P: Default, C: Default> AnchShmAnchor<P, C> {
             token: claim.token,
             // SAFETY: getpid is always safe.
             owner_pid: unsafe { libc::getpid() },
-            max_anchors,
+            max_slots,
             table_offset,
             producer_wait: P::default(),
             consumer_wait: C::default(),
@@ -3995,7 +3684,7 @@ impl<P: Default, C: Default> AnchShmAnchor<P, C> {
     }
 }
 
-impl<P, C> AnchShmAnchor<P, C> {
+impl<P, C> GateShmConsumer<P, C> {
     pub(crate) fn region(&self) -> &Arc<ShmRegion> {
         &self.region
     }
@@ -4005,21 +3694,26 @@ impl<P, C> AnchShmAnchor<P, C> {
     }
 
     /// The epoch this handle's slot was claimed at — the occupancy proof
-    /// `force_detach_anchor` takes.
+    /// `force_detach_consumer`/`force_detach_anchor` take.
     pub(crate) fn epoch(&self) -> u32 {
         self.epoch
     }
 
-    pub(crate) fn max_anchors(&self) -> usize {
-        self.max_anchors
+    /// The table size (`max_consumers`/`max_anchors`, fixed at creation).
+    pub(crate) fn max_slots(&self) -> usize {
+        self.max_slots
     }
 
     pub(crate) fn table_offset(&self) -> usize {
         self.table_offset
     }
 
-    /// Whether the slot lease still holds this handle's token — the
-    /// hot-flush zombie guard (see [`SpmcConsumerAnchor::owns_slot`]).
+    /// Whether the slot lease still holds this handle's token. One Acquire
+    /// load of the slot's own line (which this consumer's flush traffic
+    /// already owns) — the hot-flush zombie guard. Note a force-detached
+    /// zombie still holds its lease: its stores keep landing on the RETIRED
+    /// slot, which no scan reads [A-4.1]; only `recover_shm`'s table reset
+    /// (which zeroes leases) silences it here.
     #[inline]
     pub(crate) fn owns_slot(&self) -> bool {
         self.region
@@ -4034,7 +3728,7 @@ impl<P, C> AnchShmAnchor<P, C> {
         (unsafe { libc::getpid() }) == self.owner_pid
     }
 
-    /// Graceful detach, called from the anchor's Drop after the flush and
+    /// Graceful detach, called from the consumer's Drop after the flush and
     /// the cursor-sentinel store: return the slot (CAS `ACTIVE@e -> FREE@e`
     /// — epoch UNCHANGED, the slot is immediately reusable; the CAS fails
     /// harmlessly on a force-retired slot, preserving retirement), release
@@ -4067,7 +3761,7 @@ impl<P, C> AnchShmAnchor<P, C> {
 fn anch_attach_producer_anchor<C: Default>(
     opened: &AnchOpened,
     force: bool,
-) -> io::Result<Box<AnchShmProducer<C>>> {
+) -> io::Result<Box<GateShmProducer<C>>> {
     let region = Arc::clone(&opened.region);
     let token = if force {
         force_claim_lease(&region, Role::Producer)
@@ -4075,7 +3769,7 @@ fn anch_attach_producer_anchor<C: Default>(
         claim_lease(&region, Role::Producer, opened.generation)?
     };
     region.bcast_closed().store(0, Ordering::Release);
-    Ok(Box::new(AnchShmProducer::new(
+    Ok(Box::new(GateShmProducer::new(
         region,
         token,
         opened.max_anchors,
@@ -4090,7 +3784,7 @@ fn anch_attach_producer_anchor<C: Default>(
 /// itself generation-conditional). Returns the backing plus the join point.
 fn anch_attach_anchor<P: Default, C: Default>(
     opened: &AnchOpened,
-) -> io::Result<(Box<AnchShmAnchor<P, C>>, u64)> {
+) -> io::Result<(Box<GateShmConsumer<P, C>>, u64)> {
     let region = Arc::clone(&opened.region);
     if region.bcast_closed().load(Ordering::Acquire) != 0 {
         return Err(io::Error::new(
@@ -4099,7 +3793,7 @@ fn anch_attach_anchor<P: Default, C: Default>(
         ));
     }
     let claim =
-        anch_claim_slot(&region, opened.table_offset, opened.max_anchors).ok_or_else(|| {
+        claim_table_slot(&region, opened.table_offset, opened.max_anchors).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::AddrInUse,
                 "anchor table is full (max_anchors is fixed at creation; \
@@ -4109,9 +3803,9 @@ fn anch_attach_anchor<P: Default, C: Default>(
     // SAFETY: OFF_GENERATION is 8-aligned and inside the mapping.
     let gen_now = unsafe { region.atomic::<AtomicU64>(OFF_GENERATION) }.load(Ordering::Acquire);
     if gen_now != opened.generation {
-        // Conditional rollback: `anch_release_claim` re-checks the
+        // Conditional rollback: `release_table_claim` re-checks the
         // generation and leaves a re-initialized table strictly alone.
-        anch_release_claim(&region, opened.table_offset, &claim, opened.generation);
+        release_table_claim(&region, opened.table_offset, &claim, opened.generation);
         return Err(io::Error::new(
             io::ErrorKind::AddrInUse,
             "ring was re-initialized during attach",
@@ -4119,7 +3813,7 @@ fn anch_attach_anchor<P: Default, C: Default>(
     }
     let joined = claim.joined;
     Ok((
-        Box::new(AnchShmAnchor::new(
+        Box::new(GateShmConsumer::new(
             region,
             claim,
             opened.max_anchors,
@@ -4325,16 +4019,16 @@ where
             max_anchors,
             slack as u64,
         )?;
-        let claim = anch_claim_slot(&region, ANCH_ELEMS_TABLE_OFFSET, max_anchors)
+        let claim = claim_table_slot(&region, ANCH_ELEMS_TABLE_OFFSET, max_anchors)
             .expect("fresh table has free slots");
         let joined = claim.joined;
-        let producer_anchor = Box::new(AnchShmProducer::new(
+        let producer_anchor = Box::new(GateShmProducer::new(
             Arc::clone(&region),
             producer_token,
             max_anchors,
             ANCH_ELEMS_TABLE_OFFSET,
         ));
-        let anchor_backing = Box::new(AnchShmAnchor::new(
+        let anchor_backing = Box::new(GateShmConsumer::new(
             region,
             claim,
             max_anchors,
@@ -4474,7 +4168,7 @@ where
                 "slot index out of range for this ring's anchor table",
             ));
         }
-        anch_force_detach(&opened.region, opened.table_offset, slot, epoch)
+        force_detach_table_slot(&opened.region, opened.table_offset, slot, epoch)
     }
 
     /// [`recover_shm`](crate::anchored::RingBuffer::recover_shm) with
@@ -4487,21 +4181,21 @@ where
     pub unsafe fn recover_shm_with(fd: BorrowedFd<'_>) -> io::Result<AnchElemPair<T, P, C>> {
         let opened = Self::open(fd, false)?;
         let producer_anchor = anch_attach_producer_anchor::<C>(&opened, true)?;
-        let resume = anch_reset_table(
+        let resume = reset_gate_table(
             &opened.region,
             opened.table_offset,
             opened.max_anchors,
             opened.capacity as u64,
         );
-        let claim = anch_claim_slot(&opened.region, opened.table_offset, opened.max_anchors)
+        let claim = claim_table_slot(&opened.region, opened.table_offset, opened.max_anchors)
             .expect("freshly reset table has free slots");
         // Move the fresh slot back to the resume point (a lower cursor only
         // gates the producer more — and the producer is us, not yet pushing).
         opened
             .region
             .anch_slot_cursor(opened.table_offset, claim.slot)
-            .store(anch_slot_guard(resume), Ordering::Release);
-        let anchor_backing = Box::new(AnchShmAnchor::new(
+            .store(slot_guard(resume), Ordering::Release);
+        let anchor_backing = Box::new(GateShmConsumer::new(
             Arc::clone(&opened.region),
             claim,
             opened.max_anchors,
@@ -4618,16 +4312,16 @@ where
             max_anchors,
             0,
         )?;
-        let claim = anch_claim_slot(&region, ANCH_BYTES_TABLE_OFFSET, max_anchors)
+        let claim = claim_table_slot(&region, ANCH_BYTES_TABLE_OFFSET, max_anchors)
             .expect("fresh table has free slots");
         let joined = claim.joined;
-        let producer_anchor = Box::new(AnchShmProducer::new(
+        let producer_anchor = Box::new(GateShmProducer::new(
             Arc::clone(&region),
             producer_token,
             max_anchors,
             ANCH_BYTES_TABLE_OFFSET,
         ));
-        let anchor_backing = Box::new(AnchShmAnchor::new(
+        let anchor_backing = Box::new(GateShmConsumer::new(
             region,
             claim,
             max_anchors,
@@ -4762,7 +4456,7 @@ where
                 "slot index out of range for this ring's anchor table",
             ));
         }
-        anch_force_detach(&opened.region, opened.table_offset, slot, epoch)
+        force_detach_table_slot(&opened.region, opened.table_offset, slot, epoch)
     }
 
     /// [`recover_shm`](crate::anchored_bytes::BytesRingBuffer::recover_shm)
@@ -4778,19 +4472,19 @@ where
         // Heal BEFORE the table reset: the floor and the latest repair are
         // producer-session state, independent of the anchor table.
         let floor = bytes_heal_on_attach(&opened.region);
-        let resume = anch_reset_table(
+        let resume = reset_gate_table(
             &opened.region,
             opened.table_offset,
             opened.max_anchors,
             opened.capacity as u64,
         );
-        let claim = anch_claim_slot(&opened.region, opened.table_offset, opened.max_anchors)
+        let claim = claim_table_slot(&opened.region, opened.table_offset, opened.max_anchors)
             .expect("freshly reset table has free slots");
         opened
             .region
             .anch_slot_cursor(opened.table_offset, claim.slot)
-            .store(anch_slot_guard(resume), Ordering::Release);
-        let anchor_backing = Box::new(AnchShmAnchor::new(
+            .store(slot_guard(resume), Ordering::Release);
+        let anchor_backing = Box::new(GateShmConsumer::new(
             Arc::clone(&opened.region),
             claim,
             opened.max_anchors,

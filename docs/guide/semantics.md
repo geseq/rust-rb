@@ -238,16 +238,16 @@ from trying. For fan-out, switch machines rather than fighting the types.
 
 # Wrap-around is invisible, but cursor indices are opaque
 
-Internally the ring's cursors are monotonic counters that keep incrementing and
-wrap around the `usize` range; they are never reset to zero. Every occupancy
-check compares the **wrapped difference** `write.wrapping_sub(read)` — the true
-number of units in flight — never the absolute cursor values. That is why
-correctness holds even when a cursor rolls over the top of `usize` (on a 32-bit
-target this happens after 2^32 units; on 64-bit it is effectively unreachable).
-(The lossy [`broadcast`](crate::broadcast) rings go one step further and keep
-all positions in `u64` on every target, because their lap detection relies on
-a strictly increasing generation series — a `u64` takes ~29 years to wrap at
-10 G msgs/s.)
+Internally the ring's cursors are monotonic counters that keep incrementing;
+they are never reset to zero. Every occupancy check compares the **wrapped
+difference** `write.wrapping_sub(read)` — the true number of units in flight —
+never the absolute cursor values. That is why correctness holds even when a
+cursor rolls over the top of its type (on a 32-bit target an SPSC `usize`
+cursor wraps after 2^32 units; on 64-bit it is effectively unreachable). The
+multi-consumer rings keep all positions in `u64` on every target — the lossy
+rings' lap detection relies on a strictly increasing generation series, and
+the gating rings share one registry engine in the same cursor domain — and a
+`u64` takes ~29 years to wrap at 10 G msgs/s.
 
 You never see any of this: the public API exposes occupancy through
 `len()`/`is_empty()`/`is_full()`/`capacity()`, all of which are already

@@ -184,8 +184,12 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
+#[cfg(target_has_atomic = "64")]
+mod atomic_copy;
 mod cache_padded;
 mod cursor;
+#[cfg(target_has_atomic = "64")]
+mod registry;
 
 #[cfg(target_has_atomic = "64")]
 pub mod anchored;

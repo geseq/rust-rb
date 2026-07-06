@@ -73,82 +73,24 @@
 use std::cell::UnsafeCell;
 use std::mem::{size_of, MaybeUninit};
 use std::ptr::NonNull;
-use std::sync::atomic::{fence, AtomicPtr, AtomicU64, Ordering};
-#[cfg(not(rust_rb_volatile_copy))]
-use std::sync::atomic::{AtomicU8, AtomicUsize};
+use std::sync::atomic::{fence, AtomicU64, Ordering};
 use std::sync::Arc;
 
+use crate::atomic_copy::{read_payload, write_payload};
 use crate::cache_padded::CachePadded;
+use crate::cursor::round_capacity;
+#[cfg(all(feature = "shm", target_os = "linux", target_has_atomic = "64"))]
+use crate::registry::scan_shm_table;
+use crate::registry::{
+    guard_sentinel, lacks_space, publish_batch_elems as publish_batch, rescan_gate,
+    scan_chunk_registry, subscribe_slot, Chunk, FlushOnDrop, FlushPending, DETACHED,
+};
 use crate::wait::{SelfTimed, WaitStrategy, YieldWait};
 
 #[doc(inline)]
 pub use crate::broadcast::{NoUninit, PopError};
 #[doc(inline)]
 pub use crate::spmc::{Closed, SubscribeError};
-
-/// Registry slot sentinel: no anchor owns this slot. A correctness backstop
-/// *under* the bitmap — the producer skips a slot that reads `DETACHED` even
-/// when its bitmap bit is (transiently) set.
-const DETACHED: u64 = u64::MAX;
-
-/// Registry chunk width: one bitmap word of anchor slots.
-const CHUNK_SLOTS: usize = 64;
-
-/// The clamp for the shared publish-batch policy: at most 64 elements of
-/// deferred, already-consumed progress per anchor (mirrors the SPSC engine).
-const MAX_PUBLISH_BATCH: u64 = 64;
-
-/// The deferred-publish bound for the adaptive publish: `capacity / 8`,
-/// clamped to `[1, MAX_PUBLISH_BATCH]` (replicated from the spmc ring, in
-/// the u64 cursor domain).
-#[inline(always)]
-const fn publish_batch(capacity: u64) -> u64 {
-    let batch = capacity / 8;
-    if batch == 0 {
-        1
-    } else if batch > MAX_PUBLISH_BATCH {
-        MAX_PUBLISH_BATCH
-    } else {
-        batch
-    }
-}
-
-/// Round a requested minimum capacity to the ring's real capacity: the next
-/// power of two, floor 2 (the audience-less gating default is the producer's
-/// own cursor minus one, which a capacity-1 ring could never pass).
-///
-/// # Panics
-///
-/// Panics if `min_capacity == 0` or the rounding overflows `usize`.
-fn round_capacity(min_capacity: usize) -> usize {
-    assert!(min_capacity > 0, "capacity must be greater than zero");
-    min_capacity
-        .checked_next_power_of_two()
-        .expect("capacity too large to round up to a power of two")
-        .max(2)
-}
-
-/// The wrap-safe fullness predicate, lifted verbatim from the spmc gate into
-/// the u64 cursor domain the slot generations require. Kept in wrapped form
-/// even though u64 cursors cannot practically wrap (~29 years at 10 G msg/s)
-/// so the arithmetic stays the audited shape.
-#[inline(always)]
-const fn lacks_space(write: u64, needed: u64, read: u64, capacity: u64) -> bool {
-    write.wrapping_add(needed).wrapping_sub(read) > capacity
-}
-
-/// A cursor value about to be stored into a registry slot must never equal
-/// the `DETACHED` sentinel. Publishing one unit less is always safe: a lower
-/// published cursor only gates the producer more. (Unreachable for u64
-/// cursors in practice; kept for the audited spmc shape.)
-#[inline(always)]
-const fn guard_sentinel(cursor: u64) -> u64 {
-    if cursor == DETACHED {
-        cursor.wrapping_sub(1)
-    } else {
-        cursor
-    }
-}
 
 /// The default reposition slack for observers: `capacity / 8`, clamped to at
 /// least 1 (capacity is at least 2 here, so broadcast's capacity-1 special
@@ -194,27 +136,6 @@ struct TailSide {
     closed: AtomicU64,
 }
 
-/// One 64-slot block of the anchor registry — spmc's chunk, with the cursor
-/// words widened to the u64 domain. `bitmap` marks active slots (written
-/// only on subscribe/detach); each cursor slot is written by exactly one
-/// anchor on its own padded line; `next` links the append-only chunk list
-/// (chunks are never moved or freed until the shared state drops).
-struct Chunk {
-    bitmap: CachePadded<AtomicU64>,
-    next: AtomicPtr<Chunk>,
-    slots: [CachePadded<AtomicU64>; CHUNK_SLOTS],
-}
-
-impl Chunk {
-    fn new() -> Self {
-        Self {
-            bitmap: CachePadded::new(AtomicU64::new(0)),
-            next: AtomicPtr::new(std::ptr::null_mut()),
-            slots: std::array::from_fn(|_| CachePadded::new(AtomicU64::new(DETACHED))),
-        }
-    }
-}
-
 /// The state all handles share on a **heap** ring, kept alive by an `Arc`.
 /// The shm variant (design §9.4) keeps this same state in a mapped region
 /// instead; the handles reach either through the backing seam below.
@@ -244,163 +165,7 @@ impl<T, P, C> Drop for Shared<T, P, C> {
     fn drop(&mut self) {
         // `T: NoUninit` is `Copy`: elements never need dropping. Only the
         // appended registry chunks are freed (the first chunk is inline).
-        let mut next = *self.registry.next.get_mut();
-        while !next.is_null() {
-            // SAFETY: appended chunks were created via `Box::into_raw` and
-            // are unreachable now (no handle outlives the shared state).
-            let chunk = unsafe { Box::from_raw(next) };
-            next = chunk.next.load(Ordering::Relaxed);
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// The strict word-wise atomic payload copy, replicated from
-// `crate::broadcast` (whose helpers are private; factoring them out is a
-// deliberate non-goal of this change — noted for a future cleanup). The
-// `rust_rb_volatile_copy` dev cfg swaps in whole-payload volatile copies,
-// exactly as there.
-// ---------------------------------------------------------------------------
-
-/// Copy `len` bytes from private memory into a slot payload using
-/// machine-word **atomic** `Relaxed` stores (tail bytes byte-wise). Plain
-/// stores would be UB against a racing observer's atomic copy and could be
-/// compiler-hoisted above the invalidation fence [M-F10].
-///
-/// # Safety
-///
-/// `src..src + len` must be readable (any alignment); `dst..dst + len` must
-/// be writable, `dst` word-aligned, and concurrently accessed only through
-/// atomics.
-#[cfg(not(rust_rb_volatile_copy))]
-#[inline(always)]
-unsafe fn copy_in_words(src: *const u8, dst: *mut u8, len: usize) {
-    debug_assert_eq!(
-        dst as usize % std::mem::align_of::<usize>(),
-        0,
-        "slot payload must be word-aligned (repr(C) guarantees it)"
-    );
-    let word = size_of::<usize>();
-    let mut off = 0;
-    while off + word <= len {
-        // SAFETY: `off + word <= len` keeps the read in range; the source is
-        // a private value of `T`, whose alignment may be below `usize`'s —
-        // hence `read_unaligned`.
-        let v = unsafe { src.add(off).cast::<usize>().read_unaligned() };
-        // SAFETY: in range and word-aligned (base asserted above, offsets
-        // are word multiples); a shared atomic reference over the slot's
-        // `UnsafeCell` storage is the sanctioned way to store while readers
-        // race.
-        unsafe { &*(dst.add(off).cast::<AtomicUsize>()) }.store(v, Ordering::Relaxed);
-        off += word;
-    }
-    while off < len {
-        // SAFETY: `off < len`.
-        let v = unsafe { *src.add(off) };
-        // SAFETY: in range; byte atomics have no alignment requirement.
-        unsafe { &*(dst.add(off).cast::<AtomicU8>()) }.store(v, Ordering::Relaxed);
-        off += 1;
-    }
-}
-
-/// Copy `len` bytes out of a slot payload into private memory using
-/// machine-word **atomic** `Relaxed` loads (tail bytes byte-wise). The bytes
-/// may be torn; the caller must treat the destination as `MaybeUninit` until
-/// the seqlock generation revalidates [M-F11].
-///
-/// # Safety
-///
-/// `src..src + len` must be readable, `src` word-aligned, initialized (the
-/// caller observed the slot published at least once), and concurrently
-/// accessed only through atomics; `dst..dst + len` must be writable (any
-/// alignment) and private to the caller.
-#[cfg(not(rust_rb_volatile_copy))]
-#[inline(always)]
-unsafe fn copy_out_words(src: *const u8, dst: *mut u8, len: usize) {
-    debug_assert_eq!(
-        src as usize % std::mem::align_of::<usize>(),
-        0,
-        "slot payload must be word-aligned (repr(C) guarantees it)"
-    );
-    let word = size_of::<usize>();
-    let mut off = 0;
-    while off + word <= len {
-        // SAFETY: in range and word-aligned, as in `copy_in_words`; every
-        // byte was initialized by a prior publish, so the atomic load reads
-        // initialized (if possibly torn) data.
-        let v = unsafe { &*(src.add(off).cast::<AtomicUsize>()) }.load(Ordering::Relaxed);
-        // SAFETY: `off + word <= len`; the destination is a private local,
-        // possibly under-aligned for `usize` — hence `write_unaligned`.
-        unsafe { dst.add(off).cast::<usize>().write_unaligned(v) };
-        off += word;
-    }
-    while off < len {
-        // SAFETY: in range; byte atomics have no alignment requirement.
-        let v = unsafe { &*(src.add(off).cast::<AtomicU8>()) }.load(Ordering::Relaxed);
-        // SAFETY: `off < len`.
-        unsafe { *dst.add(off) = v };
-        off += 1;
-    }
-}
-
-/// Store `value` into a slot payload with the strict word-wise atomic copy
-/// (or, under the private `rust_rb_volatile_copy` dev cfg, one volatile
-/// write — the A/B benchmark alternative; formally racy, kept off the
-/// default build).
-///
-/// # Safety
-///
-/// `dst` must be the payload of a live slot this producer owns for writing
-/// (observers may race through atomics; the seqlock brackets the write).
-#[inline(always)]
-unsafe fn write_payload<T: NoUninit>(dst: *mut MaybeUninit<T>, value: &T) {
-    #[cfg(not(rust_rb_volatile_copy))]
-    // SAFETY: `dst` is a valid slot payload, word-aligned by the `repr(C)`
-    // slot layout; `value` is a live `T` with every byte initialized
-    // (`NoUninit`); readers only race through atomics.
-    unsafe {
-        copy_in_words(
-            (value as *const T).cast::<u8>(),
-            dst.cast::<u8>(),
-            size_of::<T>(),
-        )
-    };
-    #[cfg(rust_rb_volatile_copy)]
-    // SAFETY: `dst` is a valid, suitably aligned slot payload; `T: Copy`.
-    // The concurrent volatile read on the observer side makes this the
-    // classic (formally racy) seqlock shape — dev switch only.
-    unsafe {
-        dst.cast::<T>().write_volatile(*value)
-    };
-}
-
-/// Copy a slot payload into `out` with the strict word-wise atomic copy (or
-/// the volatile alternative under `rust_rb_volatile_copy`). The result may
-/// be torn: it stays `MaybeUninit` until the caller revalidates the
-/// generation.
-///
-/// # Safety
-///
-/// `src` must be the payload of a live slot observed published at least
-/// once (every byte initialized).
-#[inline(always)]
-unsafe fn read_payload<T: NoUninit>(src: *const MaybeUninit<T>, out: &mut MaybeUninit<T>) {
-    #[cfg(not(rust_rb_volatile_copy))]
-    // SAFETY: `src` is a valid slot payload, word-aligned by the `repr(C)`
-    // slot layout, initialized by a prior publish; `out` is a private local.
-    unsafe {
-        copy_out_words(
-            src.cast::<u8>(),
-            out.as_mut_ptr().cast::<u8>(),
-            size_of::<T>(),
-        )
-    };
-    #[cfg(rust_rb_volatile_copy)]
-    {
-        // SAFETY: `src` is a valid, suitably aligned slot payload; torn
-        // bytes land in a `MaybeUninit` and are never interpreted before
-        // validation. Dev switch only (see `write_payload`).
-        *out = unsafe { src.read_volatile() };
+        self.registry.free_appended();
     }
 }
 
@@ -449,7 +214,7 @@ where
     ///
     /// Panics if `min_capacity == 0` or `T` is zero-sized.
     pub fn with_wait_strategies(min_capacity: usize) -> (Producer<T, P, C>, Anchor<T, P, C>) {
-        let capacity = round_capacity(min_capacity);
+        let capacity = round_capacity(min_capacity, 2);
         Self::build(capacity, default_slack(capacity as u64) as usize)
     }
 
@@ -465,7 +230,7 @@ where
     /// Panics if `min_capacity == 0`, if `slack >= capacity` (after
     /// power-of-two rounding), or if `T` is zero-sized.
     pub fn with_slack(min_capacity: usize, slack: usize) -> (Producer<T, P, C>, Anchor<T, P, C>) {
-        let capacity = round_capacity(min_capacity);
+        let capacity = round_capacity(min_capacity, 2);
         assert!(slack < capacity, "slack must be less than the capacity");
         Self::build(capacity, slack)
     }
@@ -513,12 +278,10 @@ where
 }
 
 /// Register a new anchor on live shared state — spmc's `addSequences`
-/// choreography [M-F2], verbatim over u64 cursors. The `SeqCst` fence pairs
-/// with the producer's pre-scan fence; the **join point is the post-fence
-/// re-read** of the unified cursor. The registration bitmap RMW MUST precede
-/// the fence (the d0549dc regression): set after it, a scan could miss the
-/// bit while the re-read returns a stale cursor, and the producer would lap
-/// an anchor it never saw.
+/// choreography [M-F2], provided by the shared gating engine
+/// ([`subscribe_slot`]): claim, bitmap RMW strictly before the `SeqCst`
+/// fence (the d0549dc regression), join point = the post-fence re-read of
+/// the unified cursor.
 fn subscribe_from<T, P, C>(shared: &Arc<Shared<T, P, C>>) -> Result<Anchor<T, P, C>, SubscribeError>
 where
     P: WaitStrategy,
@@ -531,44 +294,25 @@ where
         return Err(SubscribeError::Closed);
     }
 
-    // 1. Claim a free registry slot with a provisional cursor.
-    let (chunk, slot_idx) = claim_registry_slot(&shared);
-    // SAFETY: chunks live until `Shared::drop`, and we hold the `Arc`.
-    let chunk_ref = unsafe { chunk.as_ref() };
-
-    // 2. Activate the slot for the producer's rescans (cold RMW), strictly
-    //    BEFORE the fence — see the function doc.
-    chunk_ref
-        .bitmap
-        .fetch_or(1u64 << slot_idx, Ordering::AcqRel);
-
-    // 3. Pair with the producer's pre-scan fence [M-F2]: either that scan's
-    //    bitmap load sees the bit set above, or this fence follows the
-    //    scan's in the SC order and the re-read below returns a cursor at
-    //    least as fresh as the scan's wrap point.
-    fence(Ordering::SeqCst);
-
-    // 4. The join point: re-read the unified cursor and publish it as this
-    //    anchor's cursor. Only messages published after `joined` are seen.
-    let joined = shared.tail_side.tail.load(Ordering::Acquire);
-    let published = guard_sentinel(joined);
-    chunk_ref.slots[slot_idx].store(published, Ordering::Release);
+    // The [M-F2] claim/activate/fence/re-read choreography (see
+    // `crate::registry::subscribe_slot`).
+    let slot = subscribe_slot(&shared.registry, &shared.tail_side.tail);
 
     let buf = NonNull::new(shared.slots.as_ptr().cast_mut()).expect("buffer is non-null");
     let mask = shared.mask;
     Ok(Anchor {
         buf,
         mask,
-        cursor_slot: NonNull::from(&*chunk_ref.slots[slot_idx]),
+        cursor_slot: slot.cursor_slot,
         tail: NonNull::from(&shared.tail_side.tail),
         closed: NonNull::from(&shared.tail_side.closed),
-        read_cursor: joined,
-        published,
-        tail_cache: joined,
+        read_cursor: slot.joined,
+        published: slot.published,
+        tail_cache: slot.joined,
         backing: AnchorBacking::Heap {
             shared,
-            chunk,
-            slot_idx,
+            chunk: slot.chunk,
+            slot_idx: slot.slot_idx,
         },
     })
 }
@@ -598,56 +342,6 @@ where
     }
 }
 
-/// Find (or append) a registry slot and claim it: CAS `DETACHED` → a
-/// provisional read of the unified cursor. Only slots whose bitmap bit is
-/// **clear** are candidates: a detaching anchor stores `DETACHED` *before*
-/// clearing its bit, so observing the bit clear proves the detach fully
-/// completed (spmc's bit-clear-then-CAS discipline, verbatim).
-fn claim_registry_slot<T, P, C>(shared: &Shared<T, P, C>) -> (NonNull<Chunk>, usize) {
-    let mut chunk: &Chunk = &shared.registry;
-    loop {
-        let bitmap = chunk.bitmap.load(Ordering::Acquire);
-        let mut free = !bitmap;
-        while free != 0 {
-            let idx = free.trailing_zeros() as usize;
-            free &= free - 1;
-            let provisional = guard_sentinel(shared.tail_side.tail.load(Ordering::Acquire));
-            // A bit-clear slot that is not DETACHED is a concurrent joiner
-            // that has not set its bit yet; skip it.
-            if chunk.slots[idx]
-                .compare_exchange(DETACHED, provisional, Ordering::AcqRel, Ordering::Relaxed)
-                .is_ok()
-            {
-                return (NonNull::from(chunk), idx);
-            }
-        }
-        let next = chunk.next.load(Ordering::Acquire);
-        if !next.is_null() {
-            // SAFETY: chunks are never freed while the shared state lives.
-            chunk = unsafe { &*next };
-            continue;
-        }
-        // Every chunk is full: cold-append a new one. On a lost CAS race the
-        // winner's chunk is used (and searched) instead.
-        let fresh = Box::into_raw(Box::new(Chunk::new()));
-        match chunk.next.compare_exchange(
-            std::ptr::null_mut(),
-            fresh,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            // SAFETY: we just leaked `fresh`; it is live and now published.
-            Ok(_) => chunk = unsafe { &*fresh },
-            Err(winner) => {
-                // SAFETY: `fresh` was never published; reclaim and free it.
-                drop(unsafe { Box::from_raw(fresh) });
-                // SAFETY: the winner's chunk is published and never freed.
-                chunk = unsafe { &*winner };
-            }
-        }
-    }
-}
-
 /// Where the producing handle's shared state lives — the backing seam,
 /// mirroring `crate::spmc`'s registry seam (named `*Backing` here because
 /// this module's public consumer type is itself called [`Anchor`]): every
@@ -664,7 +358,7 @@ enum ProducerBacking<T, P, C> {
     /// registry is the flat anchor table. Boxed so enabling the feature
     /// does not grow heap handles.
     #[cfg(all(feature = "shm", target_os = "linux", target_has_atomic = "64"))]
-    Shm(Box<crate::shm::AnchShmProducer<C>>),
+    Shm(Box<crate::shm::GateShmProducer<C>>),
 }
 
 impl<T, P: WaitStrategy, C: WaitStrategy> ProducerBacking<T, P, C> {
@@ -705,7 +399,7 @@ enum AnchorBacking<T, P, C> {
         slot_idx: usize,
     },
     #[cfg(all(feature = "shm", target_os = "linux", target_has_atomic = "64"))]
-    Shm(Box<crate::shm::AnchShmAnchor<P, C>>),
+    Shm(Box<crate::shm::GateShmConsumer<P, C>>),
 }
 
 impl<T, P: WaitStrategy, C: WaitStrategy> AnchorBacking<T, P, C> {
@@ -756,10 +450,7 @@ impl<T, P: WaitStrategy, C: WaitStrategy> AnchorBacking<T, P, C> {
             } => {
                 // SAFETY: the chunk lives until `Shared::drop`; we hold the
                 // `Arc`.
-                let chunk = unsafe { chunk.as_ref() };
-                chunk
-                    .bitmap
-                    .fetch_and(!(1u64 << slot_idx), Ordering::AcqRel);
+                unsafe { chunk.as_ref() }.deactivate(*slot_idx);
                 shared.producer_wait.notify();
             }
             #[cfg(all(feature = "shm", target_os = "linux", target_has_atomic = "64"))]
@@ -785,122 +476,6 @@ enum ObserverBacking<T, P, C> {
     },
 }
 
-/// The chunk-list walk of the gate-miss rescan, lifted verbatim from spmc
-/// into the u64 domain (the surrounding [M-F2] SeqCst and [P-F1] Acquire
-/// fences are supplied by `rescan`). Returns `(any_active, max_lag)` over
-/// the active anchor slots, refreshing only the cursors still behind the
-/// wrap point (selective refresh [P-F3], `Relaxed` loads so misses overlap).
-fn scan_chunk_registry(
-    registry: &Chunk,
-    cached_cursors: &mut Vec<[u64; CHUNK_SLOTS]>,
-    next_seq: u64,
-    needed: u64,
-    capacity: u64,
-) -> (bool, u64) {
-    let mut any_active = false;
-    let mut max_lag = 0u64;
-    let mut ci = 0usize;
-    let mut chunk: &Chunk = registry;
-    loop {
-        if cached_cursors.len() == ci {
-            // Fresh cache block: seed with a value that always compares as
-            // gating (lag == capacity), forcing a real load before first use.
-            cached_cursors.push([next_seq.wrapping_sub(capacity); CHUNK_SLOTS]);
-        }
-        let cache = &mut cached_cursors[ci];
-        let mut bits = chunk.bitmap.load(Ordering::Relaxed);
-        while bits != 0 {
-            let idx = bits.trailing_zeros() as usize;
-            bits &= bits - 1;
-            let mut cursor = cache[idx];
-            // Selective refresh [P-F3]: monotonicity makes cached values
-            // permanent lower bounds, so a slot already known past the wrap
-            // point cannot be gating.
-            if lacks_space(next_seq, needed, cursor, capacity) {
-                // Relaxed: the single Acquire fence after the scan orders
-                // the whole batch [P-F1].
-                let fresh = chunk.slots[idx].load(Ordering::Relaxed);
-                if fresh == DETACHED {
-                    // Backstop: a mid-detach slot (bit still set) imposes no
-                    // constraint; do not poison the cache with the sentinel.
-                    continue;
-                }
-                cache[idx] = fresh;
-                cursor = fresh;
-            }
-            any_active = true;
-            let lag = next_seq.wrapping_sub(cursor);
-            if lag > max_lag {
-                max_lag = lag;
-            }
-        }
-        let next = chunk.next.load(Ordering::Acquire);
-        if next.is_null() {
-            break;
-        }
-        // SAFETY: chunks are never freed while the shared state lives.
-        chunk = unsafe { &*next };
-        ci += 1;
-    }
-    (any_active, max_lag)
-}
-
-/// The anchor-table walk of the gate-miss rescan — the shm registry side of
-/// the seam (fence discipline supplied by `rescan`, exactly as for
-/// [`scan_chunk_registry`]): `crate::spmc`'s table walk lifted into the u64
-/// unified-cursor domain. The control word plays the bitmap's role in the
-/// [M-F2] dichotomy: it is read first (Relaxed, covered by the trailing
-/// Acquire fence) and non-ACTIVE slots are skipped **regardless of cursor
-/// content** — FREE slots hold sentinels or a leftover cursor, RETIRED
-/// slots are force-detached zombies whose words nobody may trust [A-4.1].
-#[cfg(all(feature = "shm", target_os = "linux", target_has_atomic = "64"))]
-fn scan_shm_table<C>(
-    backing: &crate::shm::AnchShmProducer<C>,
-    cached_cursors: &mut Vec<[u64; CHUNK_SLOTS]>,
-    next_seq: u64,
-    needed: u64,
-    capacity: u64,
-) -> (bool, u64) {
-    let mut any_active = false;
-    let mut max_lag = 0u64;
-    for slot in 0..backing.max_anchors() {
-        let ci = slot / CHUNK_SLOTS;
-        let idx = slot % CHUNK_SLOTS;
-        if cached_cursors.len() == ci {
-            // Fresh cache block, always-gating seed (see the heap walk).
-            cached_cursors.push([next_seq.wrapping_sub(capacity); CHUNK_SLOTS]);
-        }
-        if !crate::shm::control_is_active(backing.slot_control(slot).load(Ordering::Relaxed)) {
-            continue;
-        }
-        let cache = &mut cached_cursors[ci];
-        let mut cursor = cache[idx];
-        // Selective refresh [P-F3] — the lower-bound argument holds across
-        // slot reuse here too: a freed slot's leftover cursor is at most the
-        // unified cursor at its detach, which a later claimant's join point
-        // can never undercut.
-        if lacks_space(next_seq, needed, cursor, capacity) {
-            let fresh = backing.slot_cursor(slot).load(Ordering::Relaxed);
-            if fresh == DETACHED {
-                // Backstop, the shm face of the heap walk's mid-detach skip:
-                // an ACTIVE slot whose joiner has not stored its provisional
-                // cursor yet imposes no constraint — by the [M-F2] fence
-                // dichotomy such a joiner's join point is at or past this
-                // scan's wrap point. Do not poison the cache.
-                continue;
-            }
-            cache[idx] = fresh;
-            cursor = fresh;
-        }
-        any_active = true;
-        let lag = next_seq.wrapping_sub(cursor);
-        if lag > max_lag {
-            max_lag = lag;
-        }
-    }
-    (any_active, max_lag)
-}
-
 /// The producing half of a [`RingBuffer`]: spmc's gate composed with
 /// broadcast's write bracket over one unified u64 cursor. `Send` but not
 /// `Clone`: exactly one producer, enforced by the type system.
@@ -921,7 +496,7 @@ pub struct Producer<T, P: WaitStrategy = YieldWait, C: WaitStrategy = YieldWait>
     /// Per-slot cached anchor cursors, mirroring the registry geometry.
     /// Monotonicity makes every cached value a permanent lower bound — for
     /// later occupants of the slot too [P-F3].
-    cached_cursors: Vec<[u64; CHUNK_SLOTS]>,
+    cached_cursors: Vec<[u64; crate::registry::CHUNK_SLOTS]>,
     /// The shared unified cursor (cached raw pointer; heap: into the `Arc`,
     /// shm: into the mapped region — the hot publish path is identical).
     tail: NonNull<AtomicU64>,
@@ -1026,7 +601,7 @@ where
             // SAFETY: the backing's region was validated for this `T` and
             // capacity when this handle was constructed.
             ProducerBacking::Shm(backing) => unsafe {
-                shm_subscribe_anchor(backing.region(), backing.max_anchors(), self.mask + 1)
+                shm_subscribe_anchor(backing.region(), backing.max_slots(), self.mask + 1)
             },
         }
     }
@@ -1051,12 +626,7 @@ where
                 let region = Arc::clone(backing.region());
                 let slack = region.bcast_slack();
                 unsafe {
-                    Observer::from_shm(
-                        region,
-                        (self.mask + 1) as usize,
-                        slack,
-                        backing.max_anchors(),
-                    )
+                    Observer::from_shm(region, (self.mask + 1) as usize, slack, backing.max_slots())
                 }
             }
         }
@@ -1067,20 +637,7 @@ where
     /// Observers are not counted: nothing tracks them.
     pub fn anchor_count(&self) -> usize {
         match &self.backing {
-            ProducerBacking::Heap(shared) => {
-                let mut chunk: &Chunk = &shared.registry;
-                let mut count = 0usize;
-                loop {
-                    count += chunk.bitmap.load(Ordering::Relaxed).count_ones() as usize;
-                    let next = chunk.next.load(Ordering::Acquire);
-                    if next.is_null() {
-                        return count;
-                    }
-                    // SAFETY: chunks are never freed while the shared state
-                    // lives.
-                    chunk = unsafe { &*next };
-                }
-            }
+            ProducerBacking::Heap(shared) => shared.registry.active_count(),
             #[cfg(all(feature = "shm", target_os = "linux", target_has_atomic = "64"))]
             ProducerBacking::Shm(backing) => backing.active_count(),
         }
@@ -1132,53 +689,34 @@ where
     }
 
     /// The gate-miss slow path: rescan the registry and recompute
-    /// `cached_min`. Returns whether `needed` slots are now free.
+    /// `cached_min` — the [M-F2]/[P-F1]/[M-F1, §9.6] fence discipline (and
+    /// the load-bearing empty-registry `- 1`) lives in [`rescan_gate`]; this
+    /// supplies the registry seam (one walk per registry kind, same cache
+    /// geometry). Returns whether `needed` slots are now free.
     fn rescan(&mut self, needed: u64) -> bool {
-        // Disruptor `setVolatile` analog: pairs with the subscriber's fence
-        // [M-F2] — either this scan sees the joiner's registration, or the
-        // joiner's post-fence re-read saw a cursor at least as high as
-        // everything published before this fence.
-        fence(Ordering::SeqCst);
         let capacity = self.mask + 1;
-        // The registry seam: one walk per registry kind, same fence
-        // discipline and cache geometry.
-        let (any_active, max_lag) = match &self.backing {
-            ProducerBacking::Heap(shared) => scan_chunk_registry(
-                &shared.registry,
-                &mut self.cached_cursors,
-                self.next_seq,
-                needed,
-                capacity,
-            ),
-            #[cfg(all(feature = "shm", target_os = "linux", target_has_atomic = "64"))]
-            ProducerBacking::Shm(backing) => scan_shm_table(
-                backing,
-                &mut self.cached_cursors,
-                self.next_seq,
-                needed,
-                capacity,
-            ),
-        };
-        // One fence for the whole scan [P-F1]: the gating anchors' last
-        // reads of the slots we are about to overwrite happen-before our
-        // writes after this fence.
-        fence(Ordering::Acquire);
-        self.cached_min = if any_active {
-            // The minimum in wrapped terms: the cursor with the largest
-            // wrapped distance behind `next_seq`.
-            self.next_seq.wrapping_sub(max_lag)
-        } else {
-            // Empty registry: the producer's own published position MINUS
-            // ONE, never anything else [M-F1, §9.6]. The `- 1` is
-            // load-bearing twice over: it forces at least one rescan per
-            // free-running lap (so a joining anchor is noticed in time),
-            // and it caps a free-run grant at seqs `<= scan_cursor +
-            // capacity - 2` — strictly below any joiner's post-fence
-            // re-read, which is what makes unvalidated anchor reads sound
-            // after a join. Do not "optimize" it.
-            self.next_seq.wrapping_sub(1)
-        };
-        !lacks_space(self.next_seq, needed, self.cached_min, capacity)
+        let next_seq = self.next_seq;
+        let backing = &self.backing;
+        let cached_cursors = &mut self.cached_cursors;
+        rescan_gate(
+            next_seq,
+            needed,
+            capacity,
+            &mut self.cached_min,
+            || match backing {
+                ProducerBacking::Heap(shared) => scan_chunk_registry(
+                    &shared.registry,
+                    cached_cursors,
+                    next_seq,
+                    needed,
+                    capacity,
+                ),
+                #[cfg(all(feature = "shm", target_os = "linux", target_has_atomic = "64"))]
+                ProducerBacking::Shm(backing) => {
+                    scan_shm_table(backing, cached_cursors, next_seq, needed, capacity)
+                }
+            },
+        )
     }
 
     /// Reference to the slot sequence `s` maps to (in bounds by masking).
@@ -1427,14 +965,8 @@ where
         }
         let count = available.min(publish_batch(self.mask + 1));
 
-        // Publish on exit — including an unwind out of `f`.
-        struct FlushOnDrop<'a, T, P: WaitStrategy, C: WaitStrategy>(&'a mut Anchor<T, P, C>);
-        impl<T, P: WaitStrategy, C: WaitStrategy> Drop for FlushOnDrop<'_, T, P, C> {
-            fn drop(&mut self) {
-                self.0.flush_pending();
-            }
-        }
-
+        // Publish on exit — including an unwind out of `f` (the engine's
+        // `FlushOnDrop` guard over this anchor's `flush_pending`).
         let guard = FlushOnDrop(self);
         for _ in 0..count {
             let data = guard.0.slot().data.get();
@@ -1458,7 +990,7 @@ where
             // SAFETY: the backing's region was validated for this `T` and
             // capacity when this handle was constructed.
             AnchorBacking::Shm(backing) => unsafe {
-                shm_subscribe_anchor(backing.region(), backing.max_anchors(), self.mask + 1)
+                shm_subscribe_anchor(backing.region(), backing.max_slots(), self.mask + 1)
             },
         }
     }
@@ -1473,12 +1005,7 @@ where
                 let region = Arc::clone(backing.region());
                 let slack = region.bcast_slack();
                 unsafe {
-                    Observer::from_shm(
-                        region,
-                        (self.mask + 1) as usize,
-                        slack,
-                        backing.max_anchors(),
-                    )
+                    Observer::from_shm(region, (self.mask + 1) as usize, slack, backing.max_slots())
                 }
             }
         }
@@ -1668,6 +1195,13 @@ impl<T, P: WaitStrategy, C: WaitStrategy> Anchor<T, P, C> {
         if self.read_cursor != self.published {
             self.flush();
         }
+    }
+}
+
+impl<T, P: WaitStrategy, C: WaitStrategy> FlushPending for Anchor<T, P, C> {
+    #[inline(always)]
+    fn flush_pending(&mut self) {
+        Anchor::flush_pending(self);
     }
 }
 
@@ -2026,14 +1560,14 @@ where
     /// exactly this `T` and `capacity` (`create`/`open` in `crate::shm`),
     /// and the backing must hold the producer lease.
     pub(crate) unsafe fn from_shm(
-        backing: Box<crate::shm::AnchShmProducer<C>>,
+        backing: Box<crate::shm::GateShmProducer<C>>,
         capacity: usize,
     ) -> Self {
         let region = backing.region();
         let tail = NonNull::from(region.bcast_tail());
         let closed = NonNull::from(region.bcast_closed());
         let buf = region
-            .anch_buffer(backing.table_offset(), backing.max_anchors())
+            .anch_buffer(backing.table_offset(), backing.max_slots())
             .cast::<Slot<T>>();
         // SAFETY: `tail` references the live mapping (per contract).
         let next_seq = unsafe { tail.as_ref() }.load(Ordering::Acquire);
@@ -2070,7 +1604,7 @@ impl<T, P: WaitStrategy, C: WaitStrategy> Anchor<T, P, C> {
     /// by the `crate::shm` claim choreography whose cursor word currently
     /// holds (the sentinel-guarded image of) `read_cursor`.
     pub(crate) unsafe fn from_shm(
-        backing: Box<crate::shm::AnchShmAnchor<P, C>>,
+        backing: Box<crate::shm::GateShmConsumer<P, C>>,
         capacity: usize,
         read_cursor: u64,
     ) -> Self {
@@ -2080,7 +1614,7 @@ impl<T, P: WaitStrategy, C: WaitStrategy> Anchor<T, P, C> {
         let cursor_slot =
             NonNull::from(region.anch_slot_cursor(backing.table_offset(), backing.slot()));
         let buf = region
-            .anch_buffer(backing.table_offset(), backing.max_anchors())
+            .anch_buffer(backing.table_offset(), backing.max_slots())
             .cast::<Slot<T>>();
         Anchor {
             buf,
@@ -2196,18 +1730,18 @@ where
         return Err(SubscribeError::Closed);
     }
     let claim =
-        crate::shm::anch_claim_slot(&region, TABLE, max_anchors).ok_or(SubscribeError::Full)?;
+        crate::shm::claim_table_slot(&region, TABLE, max_anchors).ok_or(SubscribeError::Full)?;
     // Post-claim re-check: a generation change means the table was reset
     // while we claimed. The rollback is itself generation-conditional, so a
     // re-initialized table is left strictly alone (at worst one leaked slot
     // until the next `recover_shm` — a leak, never a clobber). The ring
     // this handle was subscribed from is gone, which is `Closed`.
     if region.generation() != generation {
-        crate::shm::anch_release_claim(&region, TABLE, &claim, generation);
+        crate::shm::release_table_claim(&region, TABLE, &claim, generation);
         return Err(SubscribeError::Closed);
     }
     let joined = claim.joined;
-    let backing = Box::new(crate::shm::AnchShmAnchor::new(
+    let backing = Box::new(crate::shm::GateShmConsumer::new(
         region,
         claim,
         max_anchors,
@@ -2226,7 +1760,10 @@ mod tests {
         assert_eq!(publish_batch(2), 1);
         assert_eq!(publish_batch(64), 8);
         assert_eq!(publish_batch(1024), 64);
-        assert_eq!(publish_batch(1 << 20), MAX_PUBLISH_BATCH);
+        assert_eq!(
+            publish_batch(1 << 20),
+            crate::registry::MAX_PUBLISH_BATCH_ELEMS
+        );
     }
 
     #[test]

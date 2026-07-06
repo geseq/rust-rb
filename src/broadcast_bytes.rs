@@ -161,6 +161,7 @@ use std::ptr::NonNull;
 use std::sync::atomic::{fence, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
+use crate::atomic_copy::{copy_in_lanes, copy_out_lanes};
 use crate::cache_padded::CachePadded;
 use crate::wait::{SelfTimed, WaitStrategy, YieldWait};
 
@@ -303,136 +304,12 @@ unsafe fn store_lane(base: *mut u8, off: usize, v: u32) {
     unsafe { &*(base.add(off).cast::<AtomicU32>()) }.store(v, Ordering::Relaxed);
 }
 
-/// Copy `len` payload bytes from private memory into the ring using 4-byte
-/// atomic `Relaxed` stores, one per lane; the final partial lane is
-/// zero-padded (the extra bytes stay inside this record's 8-aligned
-/// footprint). Plain stores would be UB against the readers' concurrent
-/// atomic copies and could be compiler-hoisted above the intent fence — the
-/// strict copy is mandatory on the producer side too.
-///
-/// Every ring access in this module — headers included — is a 4-byte atomic
-/// on the same 4-aligned lane grid, so two racing accesses are always
-/// same-size and identically aligned. Record boundaries shift across laps,
-/// so a mixed-size scheme (machine-word payload stores racing another lap's
-/// header loads) would put differently-sized atomics on the same bytes:
-/// formally unspecified, and rejected by Miri.
-///
-/// # Safety
-///
-/// `src..src + len` must be readable (any alignment); the destination lanes
-/// (`dst` 4-aligned, `align_up(len)` bytes) must be in bounds, writable by
-/// this producer, and concurrently accessed only through atomics.
-#[cfg(not(rust_rb_volatile_copy))]
-#[inline(always)]
-unsafe fn copy_in_lanes(src: *const u8, dst: *mut u8, len: usize) {
-    debug_assert_eq!(dst as usize % 4, 0, "payload base must be lane-aligned");
-    let mut off = 0;
-    while off + 4 <= len {
-        // SAFETY: `off + 4 <= len` keeps the read in range; the source is a
-        // caller slice of arbitrary alignment — hence `read_unaligned`.
-        let v = unsafe { src.add(off).cast::<u32>().read_unaligned() };
-        // SAFETY: lane in range per the contract (`off < len <= align_up(len)`).
-        unsafe { &*(dst.add(off).cast::<AtomicU32>()) }.store(v, Ordering::Relaxed);
-        off += 4;
-    }
-    if off < len {
-        let mut lane = [0u8; 4];
-        // SAFETY: `len - off < 4` remaining source bytes, all readable.
-        unsafe { std::ptr::copy_nonoverlapping(src.add(off), lane.as_mut_ptr(), len - off) };
-        // SAFETY: the lane straddling the payload tail is still inside the
-        // record's 8-aligned footprint (`align_up(HEADER + len)`).
-        unsafe { &*(dst.add(off).cast::<AtomicU32>()) }
-            .store(u32::from_ne_bytes(lane), Ordering::Relaxed);
-    }
-}
-
-/// Copy `len` payload bytes out of the ring into private memory using 4-byte
-/// atomic `Relaxed` loads, one per lane. The bytes may be torn (a racing
-/// overwrite); the caller must not expose them until the out-of-band window
-/// check revalidates.
-///
-/// # Safety
-///
-/// The source lanes (`src` 4-aligned, `align_up(len)` bytes) must be in
-/// bounds, initialized (the buffer is zeroed at construction), and
-/// concurrently accessed only through atomics; `dst..dst + len` must be
-/// writable (any alignment) and private to the caller.
-#[cfg(not(rust_rb_volatile_copy))]
-#[inline(always)]
-unsafe fn copy_out_lanes(src: *const u8, dst: *mut u8, len: usize) {
-    debug_assert_eq!(src as usize % 4, 0, "payload base must be lane-aligned");
-    let mut off = 0;
-    while off + 4 <= len {
-        // SAFETY: lane in range and 4-aligned per the contract; every byte
-        // is initialized, so the load reads initialized (if torn) data.
-        let v = unsafe { &*(src.add(off).cast::<AtomicU32>()) }.load(Ordering::Relaxed);
-        // SAFETY: `off + 4 <= len`; the destination may be under-aligned —
-        // hence `write_unaligned`.
-        unsafe { dst.add(off).cast::<u32>().write_unaligned(v) };
-        off += 4;
-    }
-    if off < len {
-        // SAFETY: the lane straddling the payload tail is inside the
-        // record's 8-aligned footprint, hence in bounds.
-        let v = unsafe { &*(src.add(off).cast::<AtomicU32>()) }.load(Ordering::Relaxed);
-        let lane = v.to_ne_bytes();
-        // SAFETY: `len - off < 4` remaining destination bytes, all writable.
-        unsafe { std::ptr::copy_nonoverlapping(lane.as_ptr(), dst.add(off), len - off) };
-    }
-}
-
-/// The `rust_rb_volatile_copy` A/B alternative: identical lane walk with
-/// volatile instead of atomic lane accesses — formally racy, kept off the
-/// default build (see the module docs and `crate::broadcast`).
-#[cfg(rust_rb_volatile_copy)]
-#[inline(always)]
-unsafe fn copy_in_lanes(src: *const u8, dst: *mut u8, len: usize) {
-    debug_assert_eq!(dst as usize % 4, 0, "payload base must be lane-aligned");
-    let mut off = 0;
-    while off + 4 <= len {
-        // SAFETY: as in the atomic variant; volatile lane stores are the
-        // classic (formally racy) A/B shape — dev switch only.
-        unsafe {
-            let v = src.add(off).cast::<u32>().read_unaligned();
-            dst.add(off).cast::<u32>().write_volatile(v);
-        }
-        off += 4;
-    }
-    if off < len {
-        let mut lane = [0u8; 4];
-        // SAFETY: as in the atomic variant.
-        unsafe {
-            std::ptr::copy_nonoverlapping(src.add(off), lane.as_mut_ptr(), len - off);
-            dst.add(off)
-                .cast::<u32>()
-                .write_volatile(u32::from_ne_bytes(lane));
-        }
-    }
-}
-
-/// See the atomic `copy_out_lanes`; volatile A/B variant (dev switch only).
-#[cfg(rust_rb_volatile_copy)]
-#[inline(always)]
-unsafe fn copy_out_lanes(src: *const u8, dst: *mut u8, len: usize) {
-    debug_assert_eq!(src as usize % 4, 0, "payload base must be lane-aligned");
-    let mut off = 0;
-    while off + 4 <= len {
-        // SAFETY: as in the atomic variant — dev switch only.
-        unsafe {
-            let v = src.add(off).cast::<u32>().read_volatile();
-            dst.add(off).cast::<u32>().write_unaligned(v);
-        }
-        off += 4;
-    }
-    if off < len {
-        // SAFETY: as in the atomic variant.
-        unsafe {
-            let v = src.add(off).cast::<u32>().read_volatile();
-            let lane = v.to_ne_bytes();
-            std::ptr::copy_nonoverlapping(lane.as_ptr(), dst.add(off), len - off);
-        }
-    }
-}
+// The bulk payload copies (`copy_in_lanes`/`copy_out_lanes`, atomic lanes;
+// volatile under the `rust_rb_volatile_copy` dev cfg) live in
+// `crate::atomic_copy`, shared with the composed `crate::anchored_bytes`
+// ring. The single-lane header accessors above stay local: this module
+// deliberately keeps them atomic even under the volatile A/B switch (the
+// composed ring flips its own with everything else).
 
 // -----------------------------------------------------------------------------
 // Shared state

@@ -54,8 +54,11 @@ CachePadded write_cursor           AtomicUsize  (written: producer only)
                                     advanced BEFORE each overwrite-drop;
                                     teardown's lower bound) [A-2.1]
 CachePadded active_bitmap          AtomicU64    (written: subscribe/detach, cold)   [P-F2]
-CachePadded consumer_slots[MAX]    AtomicUsize× (each written by exactly ONE consumer)
-             DETACHED = usize::MAX sentinel (correctness backstop under the bitmap)
+CachePadded consumer_slots[MAX]    AtomicU64×  (each written by exactly ONE consumer)
+             DETACHED = u64::MAX sentinel (correctness backstop under the bitmap)
+             (cursors were lifted from usize to u64 when the four gating
+             machines were deduplicated onto one shared registry engine —
+             identical layout on 64-bit targets, ABA-immune everywhere)
 buffer      [Slot<T>; capacity]                 (written: producer only)
 ```
 
@@ -243,8 +246,10 @@ element ring's local check avoids).
   reject unknown kinds); `max_consumers: u32` at offset 36 (current gap);
   `closed` in the write-cursor's padded slot; consumer table at offset 384,
   **one 128-byte slot per consumer**: `{ lease: u64, control: u64
-  (epoch|state), cursor: usize }` co-resident (producer scan touches one
-  line per consumer; that line already carries the consumer's flush).
+  (epoch|state), cursor: u64 }` co-resident (producer scan touches one
+  line per consumer; that line already carries the consumer's flush;
+  the cursor word is u64 since the shared-registry dedup — byte-identical
+  on 64-bit targets, and `arch_bits` still rejects cross-arch attach).
   Buffer at `384 + 128·max_consumers`.
 - **Zombie consumer — slot retirement + epoch [A-4.1, adopted]**: the
   control word is `{u32 epoch | u32 state}`, separate from the cursor word.
