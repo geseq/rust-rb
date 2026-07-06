@@ -16,7 +16,8 @@
 //! 8    version   u32
 //! 12   kind      u32      1 = byte ring, 2 = element ring,
 //!                         3 = SPMC byte ring, 4 = SPMC element ring,
-//!                         5 = broadcast element ring, 6 = broadcast byte ring
+//!                         5 = broadcast element ring, 6 = broadcast byte ring,
+//!                         9 = anchored element ring, 10 = anchored byte ring
 //! 16   capacity  u64      cursor units (power of two)
 //! 24   unit_size u64      bytes per cursor unit (1, or size_of::<T>())
 //! 32   arch_bits u32      usize width; cross-arch attach is rejected
@@ -66,6 +67,21 @@
 //! 384  latest    u64 (atomic) start of the most recent record — the
 //!                    lap-recovery jump target, own 128-byte slot
 //! 512  buffer        capacity bytes
+//! Anchored kinds (9/10): broadcast's counters ∪ the SPMC table shape —
+//! `max_consumers` holds `max_anchors`; the u64 tail at 128 is the unified
+//! cursor (both roles spin on it); closed at 136; the third tail-slot word
+//! at 144 is the element kind's slack / the byte kind's starving span; the
+//! stride word at 152 as for the broadcast kinds. Table slots are the SPMC
+//! shape with a **u64** cursor word:
+//! Anchored element kind (9):
+//! 384  anchor table   max_anchors slots of 128 bytes
+//!        {lease u64, control u64 (epoch|state), cursor u64}
+//! 384 + 128 * max_anchors  buffer  capacity element slots
+//! Anchored byte kind (10):
+//! 256  tail_intent   u64 (atomic) declared write frontier, own slot
+//! 384  latest        u64 (atomic) lap-recovery jump target, own slot
+//! 512  anchor table   max_anchors slots of 128 bytes (as for kind 9)
+//! 512 + 128 * max_anchors  buffer  capacity bytes
 //! ```
 //!
 //! Broadcast element slot-stride math (kind 5): each of the `capacity` slots
@@ -171,6 +187,8 @@ const KIND_SPMC_BYTES: u32 = 3;
 const KIND_SPMC_ELEMS: u32 = 4;
 const KIND_BCAST_ELEMS: u32 = 5;
 const KIND_BCAST_BYTES: u32 = 6;
+const KIND_ANCH_ELEMS: u32 = 9;
+const KIND_ANCH_BYTES: u32 = 10;
 
 const OFF_MAGIC: usize = 0;
 const OFF_VERSION: usize = 8;
@@ -243,6 +261,53 @@ const OFF_BCAST_LATEST: usize = 384;
 /// Broadcast byte kind's buffer start (the element kind keeps the common
 /// [`BUFFER_OFFSET`]: it needs no third counter slot).
 const BCAST_BYTES_BUFFER_OFFSET: usize = 512;
+
+// --- Anchored counter/table geometry (kinds 9/10) ----------------------------
+//
+// The anchored kinds are the union of the two shipped designs: broadcast's
+// counter slots (the u64 tail doubles as the unified cursor both roles spin
+// on) plus the SPMC consumer table (here: the ANCHOR table) with the same
+// 128-byte {lease, epoch|state control, cursor} slots — except the cursor
+// word is a u64 (the anchored rings' unified cursor domain; the slot
+// generations `2s+1/2s+2` require it).
+//
+// Element kind (9): tail@128, closed@136, slack@144, stride@152 (all in the
+// tail's padded slot, broadcast offsets verbatim); table@384 (the SPMC table
+// offset — element observers validate via the slot seqlocks and need no
+// extra counters); buffer@384 + 128 * max_anchors.
+//
+// Byte kind (10): tail@128, closed@136, starving@144 (the span-valued
+// producer-starving word — the byte kind's third word, where the element
+// kind parks its slack), stride@152 (= 1); tail_intent@256 and latest@384
+// in their own padded slots (broadcast-bytes offsets verbatim — but 384 is
+// the SPMC table offset, so the anchor table moves); table@512;
+// buffer@512 + 128 * max_anchors.
+
+/// Anchored element kind: the anchor table starts where the SPMC consumer
+/// table does (no intent/latest slots needed). `pub(crate)`: the anchored
+/// modules' in-process subscribe paths address their kind's table directly.
+pub(crate) const ANCH_ELEMS_TABLE_OFFSET: usize = 384;
+/// Anchored byte kind: the table starts past the `latest` slot at 384.
+pub(crate) const ANCH_BYTES_TABLE_OFFSET: usize = 512;
+/// Anchored byte kind: the producer-starving word (blocked-push span), in
+/// the tail slot's third word — the same offset the element kind uses for
+/// its slack and the SPMC kinds for their aux word.
+const OFF_ANCH_STARVING: usize = OFF_WRITE_CURSOR + 16;
+
+/// Anchor-table cursor sentinel: the u64 face of [`SLOT_DETACHED`] (the
+/// anchored rings publish u64 cursors — `crate::anchored::DETACHED`).
+const ANCH_SLOT_DETACHED: u64 = u64::MAX;
+
+/// The u64 face of [`slot_guard`]: a published anchor cursor must never
+/// equal the sentinel; one unit less only gates the producer more.
+#[inline(always)]
+const fn anch_slot_guard(cursor: u64) -> u64 {
+    if cursor == ANCH_SLOT_DETACHED {
+        cursor.wrapping_sub(1)
+    } else {
+        cursor
+    }
+}
 
 // --- SPMC consumer table geometry (kinds 3/4) --------------------------------
 
@@ -958,6 +1023,58 @@ impl ShmRegion {
     /// slot).
     pub(crate) fn bcast_bytes_buffer(&self) -> NonNull<u8> {
         NonNull::new(self.at(BCAST_BYTES_BUFFER_OFFSET)).expect("mapping is non-null")
+    }
+
+    // --- Anchored accessors (meaningful only over regions of the anchored
+    //     kinds; offsets are validated header geometry, inside any mapping
+    //     that passed `open_anch_region`/`create_anch_region`). The counter
+    //     words reuse the broadcast accessors above — the anchored kinds
+    //     share those offsets by design (tail/closed at 128/136, the byte
+    //     kind's intent/latest at 256/384); only the table geometry is new,
+    //     parameterized by the kind's table offset (384 elems / 512 bytes).
+    //     Observers hold these through read-only mappings: loads only. ---
+
+    /// The anchored byte kind's producer-starving word (blocked-push span).
+    pub(crate) fn anch_starving(&self) -> &AtomicU64 {
+        // SAFETY: OFF_ANCH_STARVING is 8-aligned and inside the mapping.
+        unsafe { self.atomic(OFF_ANCH_STARVING) }
+    }
+
+    /// Byte offset of an anchor-table slot field.
+    #[inline]
+    fn anch_slot_off(table_offset: usize, slot: usize, field: usize) -> usize {
+        table_offset + slot * SPMC_SLOT_STRIDE + field
+    }
+
+    /// An anchor slot's lease word (`slot` below the region's `max_anchors`,
+    /// upheld by every caller — as for the SPMC table).
+    pub(crate) fn anch_slot_lease(&self, table_offset: usize, slot: usize) -> &AtomicU64 {
+        // SAFETY: 8-aligned (stride 128, field 0) and inside the mapping for
+        // any valid slot index.
+        unsafe { self.atomic(Self::anch_slot_off(table_offset, slot, SLOT_LEASE)) }
+    }
+
+    /// An anchor slot's control word (`epoch | state`).
+    pub(crate) fn anch_slot_control(&self, table_offset: usize, slot: usize) -> &AtomicU64 {
+        // SAFETY: 8-aligned (stride 128, field 8) and inside the mapping for
+        // any valid slot index.
+        unsafe { self.atomic(Self::anch_slot_off(table_offset, slot, SLOT_CONTROL)) }
+    }
+
+    /// An anchor slot's published **u64** read cursor (the anchored rings'
+    /// unified-cursor domain — the one field where the anchor table departs
+    /// from the SPMC table's `usize`).
+    pub(crate) fn anch_slot_cursor(&self, table_offset: usize, slot: usize) -> &AtomicU64 {
+        // SAFETY: 8-aligned (stride 128, field 16) and inside the mapping
+        // for any valid slot index.
+        unsafe { self.atomic(Self::anch_slot_off(table_offset, slot, SLOT_CURSOR)) }
+    }
+
+    /// Base of an anchored region's buffer: past the anchor table, 128-byte
+    /// aligned (slot alignment above 128 is rejected at construction).
+    pub(crate) fn anch_buffer(&self, table_offset: usize, max_anchors: usize) -> NonNull<u8> {
+        NonNull::new(self.at(table_offset + max_anchors * SPMC_SLOT_STRIDE))
+            .expect("mapping is non-null")
     }
 }
 
@@ -3134,10 +3251,16 @@ fn open_bcast_bytes(fd: BorrowedFd<'_>, read_only: bool) -> io::Result<BcastOpen
 ///   the time `tail` moves past its position the new session has committed
 ///   real bytes there.
 fn bcast_bytes_heal_on_attach(opened: &BcastOpened) -> u64 {
-    let tail = opened.region.bcast_tail().load(Ordering::Acquire);
-    let intent = opened.region.bcast_intent().load(Ordering::Acquire);
+    bytes_heal_on_attach(&opened.region)
+}
+
+/// The counter-level body of [`bcast_bytes_heal_on_attach`], shared with the
+/// anchored byte kind (whose tail/intent/latest live at the same offsets).
+fn bytes_heal_on_attach(region: &ShmRegion) -> u64 {
+    let tail = region.bcast_tail().load(Ordering::Acquire);
+    let intent = region.bcast_intent().load(Ordering::Acquire);
     if intent != tail {
-        opened.region.bcast_latest().store(tail, Ordering::Release);
+        region.bcast_latest().store(tail, Ordering::Release);
     }
     intent.max(tail)
 }
@@ -3279,6 +3402,1415 @@ where
         Ok(unsafe {
             crate::broadcast_bytes::BytesConsumer::from_shm(opened.region, opened.capacity)
         })
+    }
+}
+
+// =============================================================================
+// ANCHORED rings (kinds 9/10): the union of the two shipped designs — the
+// gating anchor table (SPMC's consumer-table machinery verbatim, u64
+// cursors) plus broadcast's lease-free PROT_READ observers and counters.
+// =============================================================================
+//
+// The producer role reuses the SPSC lease at `OFF_PRODUCER_LEASE` verbatim.
+// Anchors hold per-slot leases in the anchor table (claim/epoch/retire
+// exactly as the SPMC kinds — `force_detach_anchor` is the compare-and-retire
+// zombie answer [A-4.1], `recover_shm` the seqlock-armed table reset).
+// Observers keep NO shared state at all: they attach over a `PROT_READ`
+// mapping, take no lease, never write a byte, and are unbounded — their drop
+// is an munmap, and the read-only mapping turns any store regression in the
+// observer path into a deterministic SIGSEGV [P-F8].
+
+/// Region length for an anchored ring: header (+ counter slots) + anchor
+/// table + buffer. `stride` is the bytes one capacity unit occupies (the
+/// element kind's slot stride; 1 for the byte kind); `table_offset` is the
+/// kind's table start (384 elems / 512 bytes).
+fn anch_region_len(
+    capacity: usize,
+    stride: usize,
+    table_offset: usize,
+    max_anchors: usize,
+) -> io::Result<usize> {
+    let err = || io::Error::new(io::ErrorKind::InvalidInput, "capacity overflows region");
+    let table = max_anchors.checked_mul(SPMC_SLOT_STRIDE).ok_or_else(err)?;
+    let len = capacity
+        .checked_mul(stride)
+        .and_then(|b| b.checked_add(table_offset))
+        .and_then(|b| b.checked_add(table))
+        .ok_or_else(err)?;
+    // Same off_t clamp as `region_len` (32-bit sign-flip guard).
+    if len as u64 > libc::off_t::MAX as u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "region length exceeds the platform file-offset limit",
+        ));
+    }
+    Ok(len)
+}
+
+/// Initialize a fresh anchored region: size the fd, map it, write the header
+/// (zeroed counters, the element kind's slack, the exact stride), a
+/// fully-FREE anchor table with sentinel cursors, and a zeroed buffer; take
+/// the producer lease. The seqlock write protocol is identical to
+/// `create_region`'s.
+#[allow(clippy::too_many_arguments)] // one knob per header invariant, as for the broadcast open
+fn create_anch_region(
+    fd: BorrowedFd<'_>,
+    kind: u32,
+    capacity: usize,
+    unit_size: usize,
+    stride: usize,
+    table_offset: usize,
+    max_anchors: usize,
+    slack: u64,
+) -> io::Result<(Arc<ShmRegion>, u64)> {
+    if max_anchors == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "max_anchors must be at least 1",
+        ));
+    }
+    // The header stores the table size as a u32: reject anything the store
+    // below would silently truncate (before any layout math trusts it).
+    if max_anchors > u32::MAX as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "max_anchors exceeds the header field width (u32)",
+        ));
+    }
+    let len = anch_region_len(capacity, stride, table_offset, max_anchors)?;
+    // SAFETY: valid fd for the borrow; `anch_region_len` confirmed `len`
+    // fits off_t.
+    if unsafe { libc::ftruncate(fd.as_raw_fd(), len as libc::off_t) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let region = ShmRegion::map(fd, len)?;
+
+    // SAFETY: all header offsets are naturally aligned and inside the
+    // mapping (see `create_region` for the seqlock/atomics rationale).
+    let producer_token = unsafe {
+        // Seqlock open: odd generation before touching anything.
+        let generation = region.atomic::<AtomicU64>(OFF_GENERATION);
+        let g = generation.load(Ordering::Relaxed);
+        generation.store(g | 1, Ordering::SeqCst);
+        region
+            .atomic::<AtomicU64>(OFF_MAGIC)
+            .store(0, Ordering::SeqCst);
+        region
+            .atomic::<AtomicU32>(OFF_VERSION)
+            .store(VERSION, Ordering::Relaxed);
+        region
+            .atomic::<AtomicU32>(OFF_KIND)
+            .store(kind, Ordering::Relaxed);
+        region
+            .atomic::<AtomicU64>(OFF_CAPACITY)
+            .store(capacity as u64, Ordering::Relaxed);
+        region
+            .atomic::<AtomicU64>(OFF_UNIT_SIZE)
+            .store(unit_size as u64, Ordering::Relaxed);
+        region
+            .atomic::<AtomicU32>(OFF_ARCH_BITS)
+            .store(usize::BITS, Ordering::Relaxed);
+        // `max_consumers` holds the anchor-table size (observers are
+        // unbounded and keep no shared state — nothing to size for them).
+        region
+            .atomic::<AtomicU32>(OFF_MAX_CONSUMERS)
+            .store(max_anchors as u32, Ordering::Relaxed);
+        let pt = lease_token();
+        region
+            .atomic::<AtomicU64>(OFF_PRODUCER_LEASE)
+            .store(pt, Ordering::Relaxed);
+        // The SPSC consumer lease is unused (anchors lease per slot,
+        // observers are lease-free); keep it deterministically zero.
+        region
+            .atomic::<AtomicU64>(OFF_CONSUMER_LEASE)
+            .store(0, Ordering::Relaxed);
+        // Counters + table + buffer: zero wholesale from the cursor area
+        // down (tail, closed, slack/starving, stride, intent, latest, the
+        // table, the buffer — also pre-faults every page and matches the
+        // heap rings' zeroed-buffer guarantee: element slot seq 0 is below
+        // every accepted generation, and the byte ring's lapped readers
+        // legitimately load bytes the producer never wrote). Still
+        // pre-publish: a racing validator sees the odd generation and
+        // discards.
+        std::ptr::write_bytes(region.at(OFF_WRITE_CURSOR), 0, len - OFF_WRITE_CURSOR);
+        // The element kind's observer slack (the byte kind passes 0: its
+        // third word is the starving span, which starts clear either way).
+        region
+            .atomic::<AtomicU64>(OFF_BCAST_SLACK)
+            .store(slack, Ordering::Relaxed);
+        // The exact per-unit stride, validated for equality on every open
+        // (see the broadcast kinds for why `unit_size` alone is not enough).
+        region
+            .atomic::<AtomicU64>(OFF_BCAST_STRIDE)
+            .store(stride as u64, Ordering::Relaxed);
+        // Anchor-table cursors to the detached sentinel (leases/controls
+        // stay zeroed: FREE@0).
+        for slot in 0..max_anchors {
+            region
+                .anch_slot_cursor(table_offset, slot)
+                .store(ANCH_SLOT_DETACHED, Ordering::Relaxed);
+        }
+        // Publish the magic last with Release, then close the seqlock.
+        region
+            .atomic::<AtomicU64>(OFF_MAGIC)
+            .store(MAGIC, Ordering::Release);
+        generation.store((g | 1).wrapping_add(1), Ordering::Release);
+        pt
+    };
+    Ok((Arc::new(region), producer_token))
+}
+
+/// A validated anchored region plus the header facts every constructor
+/// needs.
+pub(crate) struct AnchOpened {
+    region: Arc<ShmRegion>,
+    capacity: usize,
+    max_anchors: usize,
+    table_offset: usize,
+    generation: u64,
+    slack: u64,
+}
+
+/// Map and validate an existing anchored region — the SPMC open (table
+/// geometry) ∪ the broadcast open (stride equality, the element kind's
+/// slack, the observer's `read_only` `PROT_READ` mapping). No occupancy
+/// check beyond tail alignment: the table holds protocol-maintained lower
+/// bounds and judging them against a live producer is inherently racy (the
+/// trust model — validation catches accidents, not adversaries).
+#[allow(clippy::too_many_arguments)] // one knob per header invariant, as for the broadcast open
+fn open_anch_region(
+    fd: BorrowedFd<'_>,
+    kind: u32,
+    unit_size: usize,
+    stride: usize,
+    table_offset: usize,
+    min_capacity: usize,
+    tail_align: u64,
+    read_only: bool,
+) -> io::Result<AnchOpened> {
+    let err = |m: &str| io::Error::new(io::ErrorKind::InvalidData, m.to_string());
+    let file_len = fd_len(fd)?;
+    if file_len < BUFFER_OFFSET as u64 {
+        return Err(err("region too small to hold a ring header"));
+    }
+    // Map just the header first to learn capacity and max_anchors (the
+    // probe is read-only: it never writes, whichever role is attaching).
+    let header = ShmRegion::map_read_only(fd, BUFFER_OFFSET)?;
+    // Seqlock read (see `open_region`).
+    // SAFETY: OFF_GENERATION is 8-aligned and inside the mapping.
+    let generation = unsafe { header.atomic::<AtomicU64>(OFF_GENERATION) }.load(Ordering::Acquire);
+    if generation & 1 == 1 {
+        return Err(err("ring is being initialized by another process"));
+    }
+    if header.read_magic() != MAGIC {
+        return Err(err("bad magic: not a rust-rb shm ring"));
+    }
+    if header.read_u32(OFF_VERSION) != VERSION {
+        return Err(err("unsupported ring version"));
+    }
+    if header.read_u32(OFF_KIND) != kind {
+        return Err(err("ring kind mismatch"));
+    }
+    if unit_size == 0 {
+        return Err(err("zero-sized elements are not supported in shm rings"));
+    }
+    if header.read_u64(OFF_UNIT_SIZE) != unit_size as u64 {
+        return Err(err("element size mismatch"));
+    }
+    if header.read_u32(OFF_ARCH_BITS) != usize::BITS {
+        return Err(err("architecture (usize width) mismatch"));
+    }
+    let capacity = header.read_u64(OFF_CAPACITY) as usize;
+    if capacity == 0 || !capacity.is_power_of_two() || capacity < min_capacity {
+        return Err(err("corrupt capacity"));
+    }
+    let max_anchors = header.read_u32(OFF_MAX_CONSUMERS) as usize;
+    if max_anchors == 0 {
+        return Err(err("corrupt max_anchors"));
+    }
+    // The slack is meaningful on the element kind (the byte kind writes 0
+    // and its third word is the starving span — dynamic state, unjudged);
+    // `slack < capacity` is the element constructor invariant.
+    let slack = if kind == KIND_ANCH_ELEMS {
+        let slack = header.read_u64(OFF_BCAST_SLACK);
+        if slack >= capacity as u64 {
+            return Err(err("corrupt slack: not below the capacity"));
+        }
+        slack
+    } else {
+        0
+    };
+    // Exact-stride check (see the broadcast open for the rationale).
+    if header.read_u64(OFF_BCAST_STRIDE) != stride as u64 {
+        return Err(err("element slot stride mismatch"));
+    }
+    drop(header);
+
+    let len = anch_region_len(capacity, stride, table_offset, max_anchors)
+        .map_err(|_| err("corrupt geometry: region length overflows"))?;
+    if file_len < len as u64 {
+        return Err(err("region smaller than its declared capacity"));
+    }
+    let region = if read_only {
+        ShmRegion::map_read_only(fd, len)?
+    } else {
+        ShmRegion::map(fd, len)?
+    };
+
+    // Alignment holds for every individually-published tail value (byte
+    // kind: committed tails are record boundaries; element kind: any count
+    // decodes, align 1).
+    if region.bcast_tail().load(Ordering::Acquire) % tail_align != 0 {
+        return Err(err("corrupt tail: not record-aligned"));
+    }
+    // Seqlock re-check on the full mapping.
+    // SAFETY: OFF_GENERATION is 8-aligned and inside the mapping.
+    if unsafe { region.atomic::<AtomicU64>(OFF_GENERATION) }.load(Ordering::Acquire) != generation {
+        return Err(err("ring was re-initialized during validation"));
+    }
+    Ok(AnchOpened {
+        region: Arc::new(region),
+        capacity,
+        max_anchors,
+        table_offset,
+        generation,
+        slack,
+    })
+}
+
+/// A freshly claimed anchor-table slot (the u64-cursor face of
+/// [`SlotClaim`]).
+pub(crate) struct AnchSlotClaim {
+    pub(crate) slot: usize,
+    /// The epoch the slot was claimed at (`ACTIVE@epoch` until detach or
+    /// retirement).
+    pub(crate) epoch: u32,
+    /// The slot lease token this claimant wrote.
+    pub(crate) token: u64,
+    /// The join point: only messages published after this cursor are seen.
+    pub(crate) joined: u64,
+}
+
+/// The anchor-claim choreography — [`spmc_claim_slot`] verbatim over the
+/// anchored kinds' u64 unified cursor (see that function for the [M-F2]
+/// step-by-step rationale: the control CAS is the claim AND the
+/// registration event, strictly before the SeqCst fence; the join point is
+/// the post-fence re-read).
+pub(crate) fn anch_claim_slot(
+    region: &ShmRegion,
+    table_offset: usize,
+    max_anchors: usize,
+) -> Option<AnchSlotClaim> {
+    let tail = region.bcast_tail();
+    'slots: for slot in 0..max_anchors {
+        let control = region.anch_slot_control(table_offset, slot);
+        let mut current = control.load(Ordering::Acquire);
+        loop {
+            if control_state(current) != STATE_FREE {
+                continue 'slots;
+            }
+            // Bump the epoch on claim: each occupancy of the slot gets its
+            // own epoch (graceful detach keeps it, so FREE@e means "last
+            // occupied by epoch e").
+            let epoch = control_epoch(current).wrapping_add(1);
+            match control.compare_exchange(
+                current,
+                control_word(epoch, STATE_ACTIVE),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    let cursor = region.anch_slot_cursor(table_offset, slot);
+                    let provisional = anch_slot_guard(tail.load(Ordering::Acquire));
+                    cursor.store(provisional, Ordering::Release);
+                    std::sync::atomic::fence(Ordering::SeqCst);
+                    let joined = tail.load(Ordering::Acquire);
+                    cursor.store(anch_slot_guard(joined), Ordering::Release);
+                    let token = lease_token();
+                    region
+                        .anch_slot_lease(table_offset, slot)
+                        .store(token, Ordering::Release);
+                    return Some(AnchSlotClaim {
+                        slot,
+                        epoch,
+                        token,
+                        joined,
+                    });
+                }
+                // Lost a race (concurrent joiner or force-detach): re-examine
+                // this slot with the fresh value.
+                Err(fresh) => current = fresh,
+            }
+        }
+    }
+    None
+}
+
+/// Roll a just-made claim back (attach-time seqlock conflict) — the
+/// generation-conditional rollback, exactly as [`spmc_release_claim`]: a
+/// changed generation means a concurrent reset owns the table now, and the
+/// only safe move is to touch nothing (a leak, never a clobber).
+pub(crate) fn anch_release_claim(
+    region: &ShmRegion,
+    table_offset: usize,
+    claim: &AnchSlotClaim,
+    generation: u64,
+) {
+    // SAFETY: OFF_GENERATION is 8-aligned and inside the mapping.
+    let gen_now = unsafe { region.atomic::<AtomicU64>(OFF_GENERATION) }.load(Ordering::Acquire);
+    if gen_now != generation {
+        return;
+    }
+    region
+        .anch_slot_cursor(table_offset, claim.slot)
+        .store(ANCH_SLOT_DETACHED, Ordering::Release);
+    let _ = region
+        .anch_slot_control(table_offset, claim.slot)
+        .compare_exchange(
+            control_word(claim.epoch, STATE_ACTIVE),
+            control_word(claim.epoch, STATE_FREE),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    let _ = region
+        .anch_slot_lease(table_offset, claim.slot)
+        .compare_exchange(claim.token, 0, Ordering::AcqRel, Ordering::Acquire);
+}
+
+/// Retire an anchor-table slot [A-4.1]: one compare-and-retire CAS
+/// `ACTIVE@epoch -> RETIRED@epoch+1` (see [`spmc_force_detach`] for the
+/// occupancy-proof rationale; the lease and cursor words are left as-is —
+/// dead until the table reset).
+fn anch_force_detach(
+    region: &ShmRegion,
+    table_offset: usize,
+    slot: usize,
+    epoch: u32,
+) -> io::Result<()> {
+    region
+        .anch_slot_control(table_offset, slot)
+        .compare_exchange(
+            control_word(epoch, STATE_ACTIVE),
+            control_word(epoch.wrapping_add(1), STATE_RETIRED),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .map(drop)
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "slot epoch mismatch — the slot no longer belongs to the \
+                 anchor you diagnosed (freed, re-claimed, or already \
+                 retired)",
+            )
+        })
+}
+
+/// Reset the whole anchor table (recover) — [`spmc_reset_table`] over the
+/// u64 unified cursor: compute the at-least-once resume point (the slowest
+/// previously-registered cursor, ignoring implausible lag beyond one
+/// capacity), then free every slot with a bumped epoch, a zeroed lease, and
+/// the detached sentinel. The rewrite is **seqlock-armed** exactly like the
+/// create path (odd generation before the first table write, `+2` close
+/// after the last): without the bump a concurrent attach/subscribe whose
+/// claim interleaves the rewrite would pass its post-claim generation
+/// re-check and keep a slot the reset just freed out from under it.
+fn anch_reset_table(
+    region: &ShmRegion,
+    table_offset: usize,
+    max_anchors: usize,
+    capacity: u64,
+) -> u64 {
+    // Seqlock open (see `create_region` for the ordering rationale).
+    // SAFETY: OFF_GENERATION is 8-aligned and inside the mapping.
+    let generation = unsafe { region.atomic::<AtomicU64>(OFF_GENERATION) };
+    let g = generation.load(Ordering::Relaxed);
+    generation.store(g | 1, Ordering::SeqCst);
+    let tail = region.bcast_tail().load(Ordering::Acquire);
+    let mut max_lag = 0u64;
+    for slot in 0..max_anchors {
+        if control_state(
+            region
+                .anch_slot_control(table_offset, slot)
+                .load(Ordering::Acquire),
+        ) == STATE_FREE
+        {
+            continue;
+        }
+        let cursor = region
+            .anch_slot_cursor(table_offset, slot)
+            .load(Ordering::Acquire);
+        if cursor == ANCH_SLOT_DETACHED {
+            continue;
+        }
+        let lag = tail.wrapping_sub(cursor);
+        if lag <= capacity && lag > max_lag {
+            max_lag = lag;
+        }
+    }
+    for slot in 0..max_anchors {
+        // Detach order per slot: sentinel, lease, availability last.
+        region
+            .anch_slot_cursor(table_offset, slot)
+            .store(ANCH_SLOT_DETACHED, Ordering::Release);
+        region
+            .anch_slot_lease(table_offset, slot)
+            .store(0, Ordering::Release);
+        let control = region.anch_slot_control(table_offset, slot);
+        let current = control.load(Ordering::Acquire);
+        control.store(
+            control_word(control_epoch(current).wrapping_add(1), STATE_FREE),
+            Ordering::Release,
+        );
+    }
+    // Seqlock close: even generation, strictly greater than before.
+    generation.store((g | 1).wrapping_add(1), Ordering::Release);
+    tail.wrapping_sub(max_lag)
+}
+
+/// The shm backing for an anchored **producer**: keeps the mapping alive,
+/// holds the producer role lease, and exposes the anchor table to the
+/// producer's rescans (the [`SpmcProducerAnchor`] shape parameterized by
+/// the kind's table offset). Only the consumer-side wait strategy is
+/// carried — the producer's own waits use fresh per-call instances of its
+/// (stateless, `CrossProcess`) strategy.
+pub(crate) struct AnchShmProducer<C> {
+    region: Arc<ShmRegion>,
+    token: u64,
+    /// Fork guard, exactly as in [`ShmAnchor`].
+    owner_pid: libc::pid_t,
+    max_anchors: usize,
+    table_offset: usize,
+    pub(crate) consumer_wait: C,
+}
+
+impl<C: Default> AnchShmProducer<C> {
+    fn new(region: Arc<ShmRegion>, token: u64, max_anchors: usize, table_offset: usize) -> Self {
+        Self {
+            region,
+            token,
+            // SAFETY: getpid is always safe.
+            owner_pid: unsafe { libc::getpid() },
+            max_anchors,
+            table_offset,
+            consumer_wait: C::default(),
+        }
+    }
+}
+
+impl<C> AnchShmProducer<C> {
+    pub(crate) fn region(&self) -> &Arc<ShmRegion> {
+        &self.region
+    }
+
+    pub(crate) fn max_anchors(&self) -> usize {
+        self.max_anchors
+    }
+
+    pub(crate) fn table_offset(&self) -> usize {
+        self.table_offset
+    }
+
+    #[inline(always)]
+    pub(crate) fn slot_control(&self, slot: usize) -> &AtomicU64 {
+        self.region.anch_slot_control(self.table_offset, slot)
+    }
+
+    #[inline(always)]
+    pub(crate) fn slot_cursor(&self, slot: usize) -> &AtomicU64 {
+        self.region.anch_slot_cursor(self.table_offset, slot)
+    }
+
+    /// Number of ACTIVE table slots (snapshot). Observers are not counted:
+    /// nothing tracks them.
+    pub(crate) fn active_count(&self) -> usize {
+        (0..self.max_anchors)
+            .filter(|&slot| control_is_active(self.slot_control(slot).load(Ordering::Relaxed)))
+            .count()
+    }
+
+    /// Whether the producer lease still holds this handle's token (see
+    /// [`ShmAnchor::owns_lease`]).
+    pub(crate) fn owns_lease(&self) -> bool {
+        // SAFETY: the lease offset is 8-aligned and inside the mapping.
+        let lease: &AtomicU64 = unsafe { self.region.atomic(OFF_PRODUCER_LEASE) };
+        lease.load(Ordering::Acquire) == self.token
+    }
+
+    /// Fork guard (see [`ShmAnchor::owned_by_current_process`]).
+    pub(crate) fn owned_by_current_process(&self) -> bool {
+        // SAFETY: getpid is always safe.
+        (unsafe { libc::getpid() }) == self.owner_pid
+    }
+}
+
+impl<C> Drop for AnchShmProducer<C> {
+    fn drop(&mut self) {
+        // Guarded lease release, exactly as [`ShmAnchor`]'s: pid guard
+        // against fork copies, token CAS against force-takeovers.
+        if !self.owned_by_current_process() {
+            return;
+        }
+        // SAFETY: the lease offset is 8-aligned and inside the mapping.
+        let lease: &AtomicU64 = unsafe { self.region.atomic(OFF_PRODUCER_LEASE) };
+        let _ = lease.compare_exchange(self.token, 0, Ordering::AcqRel, Ordering::Acquire);
+    }
+}
+
+/// The shm backing for an anchored **anchor** (the gating consumer): the
+/// mapping, this handle's table-slot coordinates (slot index, claim epoch,
+/// slot lease token), the fork-guard pid, and the per-handle wait
+/// strategies — [`SpmcConsumerAnchor`] parameterized by the table offset.
+pub(crate) struct AnchShmAnchor<P, C> {
+    region: Arc<ShmRegion>,
+    slot: usize,
+    epoch: u32,
+    token: u64,
+    owner_pid: libc::pid_t,
+    max_anchors: usize,
+    table_offset: usize,
+    pub(crate) producer_wait: P,
+    pub(crate) consumer_wait: C,
+}
+
+impl<P: Default, C: Default> AnchShmAnchor<P, C> {
+    pub(crate) fn new(
+        region: Arc<ShmRegion>,
+        claim: AnchSlotClaim,
+        max_anchors: usize,
+        table_offset: usize,
+    ) -> Self {
+        Self {
+            region,
+            slot: claim.slot,
+            epoch: claim.epoch,
+            token: claim.token,
+            // SAFETY: getpid is always safe.
+            owner_pid: unsafe { libc::getpid() },
+            max_anchors,
+            table_offset,
+            producer_wait: P::default(),
+            consumer_wait: C::default(),
+        }
+    }
+}
+
+impl<P, C> AnchShmAnchor<P, C> {
+    pub(crate) fn region(&self) -> &Arc<ShmRegion> {
+        &self.region
+    }
+
+    pub(crate) fn slot(&self) -> usize {
+        self.slot
+    }
+
+    /// The epoch this handle's slot was claimed at — the occupancy proof
+    /// `force_detach_anchor` takes.
+    pub(crate) fn epoch(&self) -> u32 {
+        self.epoch
+    }
+
+    pub(crate) fn max_anchors(&self) -> usize {
+        self.max_anchors
+    }
+
+    pub(crate) fn table_offset(&self) -> usize {
+        self.table_offset
+    }
+
+    /// Whether the slot lease still holds this handle's token — the
+    /// hot-flush zombie guard (see [`SpmcConsumerAnchor::owns_slot`]).
+    #[inline]
+    pub(crate) fn owns_slot(&self) -> bool {
+        self.region
+            .anch_slot_lease(self.table_offset, self.slot)
+            .load(Ordering::Acquire)
+            == self.token
+    }
+
+    /// Fork guard (see [`ShmAnchor::owned_by_current_process`]).
+    pub(crate) fn owned_by_current_process(&self) -> bool {
+        // SAFETY: getpid is always safe.
+        (unsafe { libc::getpid() }) == self.owner_pid
+    }
+
+    /// Graceful detach, called from the anchor's Drop after the flush and
+    /// the cursor-sentinel store: return the slot (CAS `ACTIVE@e -> FREE@e`
+    /// — epoch UNCHANGED, the slot is immediately reusable; the CAS fails
+    /// harmlessly on a force-retired slot, preserving retirement), release
+    /// the slot lease (guarded CAS), and wake a gated producer [A-1.3].
+    pub(crate) fn detach(&self)
+    where
+        P: crate::wait::WaitStrategy,
+    {
+        let _ = self
+            .region
+            .anch_slot_control(self.table_offset, self.slot)
+            .compare_exchange(
+                control_word(self.epoch, STATE_ACTIVE),
+                control_word(self.epoch, STATE_FREE),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        let _ = self
+            .region
+            .anch_slot_lease(self.table_offset, self.slot)
+            .compare_exchange(self.token, 0, Ordering::AcqRel, Ordering::Acquire);
+        self.producer_wait.notify();
+    }
+}
+
+/// Claim (or force-take) the producer role over a validated anchored region
+/// and reset the closed word — a (re)attached producer re-opens the ring
+/// (shm `Closed` is end-of-session; only the producer ever writes that
+/// word, and we now hold its lease).
+fn anch_attach_producer_anchor<C: Default>(
+    opened: &AnchOpened,
+    force: bool,
+) -> io::Result<Box<AnchShmProducer<C>>> {
+    let region = Arc::clone(&opened.region);
+    let token = if force {
+        force_claim_lease(&region, Role::Producer)
+    } else {
+        claim_lease(&region, Role::Producer, opened.generation)?
+    };
+    region.bcast_closed().store(0, Ordering::Release);
+    Ok(Box::new(AnchShmProducer::new(
+        region,
+        token,
+        opened.max_anchors,
+        opened.table_offset,
+    )))
+}
+
+/// Claim an anchor-table slot over a validated anchored region: refuse
+/// closed rings (mirroring the heap `SubscribeError::Closed`), map a full
+/// table to `AddrInUse` (the role-conflict error), and re-check the seqlock
+/// generation after the claim exactly as `claim_lease` does (the rollback is
+/// itself generation-conditional). Returns the backing plus the join point.
+fn anch_attach_anchor<P: Default, C: Default>(
+    opened: &AnchOpened,
+) -> io::Result<(Box<AnchShmAnchor<P, C>>, u64)> {
+    let region = Arc::clone(&opened.region);
+    if region.bcast_closed().load(Ordering::Acquire) != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "ring closed: producer dropped (attach a new producer to reopen)",
+        ));
+    }
+    let claim =
+        anch_claim_slot(&region, opened.table_offset, opened.max_anchors).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::AddrInUse,
+                "anchor table is full (max_anchors is fixed at creation; \
+                 retired slots free only via recover_shm)",
+            )
+        })?;
+    // SAFETY: OFF_GENERATION is 8-aligned and inside the mapping.
+    let gen_now = unsafe { region.atomic::<AtomicU64>(OFF_GENERATION) }.load(Ordering::Acquire);
+    if gen_now != opened.generation {
+        // Conditional rollback: `anch_release_claim` re-checks the
+        // generation and leaves a re-initialized table strictly alone.
+        anch_release_claim(&region, opened.table_offset, &claim, opened.generation);
+        return Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            "ring was re-initialized during attach",
+        ));
+    }
+    let joined = claim.joined;
+    Ok((
+        Box::new(AnchShmAnchor::new(
+            region,
+            claim,
+            opened.max_anchors,
+            opened.table_offset,
+        )),
+        joined,
+    ))
+}
+
+/// Both required halves of a shm-backed anchored element ring (observers
+/// attach separately, unbounded).
+pub type AnchElemPair<T, P, C> = (
+    crate::anchored::Producer<T, P, C>,
+    crate::anchored::Anchor<T, P, C>,
+);
+/// Both required halves of a shm-backed anchored byte ring.
+pub type AnchBytesPair<P, C> = (
+    crate::anchored_bytes::BytesProducer<P, C>,
+    crate::anchored_bytes::BytesAnchor<P, C>,
+);
+
+/// Element-type invariants for the anchored element ring, enforced on
+/// create AND attach (as errors — fallible paths). The slot carries the seq
+/// word in front of the payload, so the alignment bound is the *slot's*.
+fn check_anch_elem_type<T>() -> io::Result<()> {
+    let err = |m: &str| io::Error::new(io::ErrorKind::InvalidInput, m.to_string());
+    if std::mem::size_of::<T>() == 0 {
+        return Err(err("zero-sized elements are not supported in shm rings"));
+    }
+    if crate::anchored::shm_slot_align::<T>() > 128 {
+        return Err(err("element alignment exceeds the buffer offset alignment"));
+    }
+    Ok(())
+}
+
+impl<T> crate::anchored::RingBuffer<T>
+where
+    // All four bounds pull their weight: `ShmItem` asserts every bit pattern
+    // a cooperating peer writes is a valid `T` (cross-process reads of
+    // memory that is untrusted by construction); `NoUninit` asserts every
+    // byte of a valid `T` is initialized data (the observers' racing
+    // word-wise atomic copies read and write every byte — neither trait
+    // implies the other); `Send` because observers copy values across the
+    // process/thread boundary and teardown frees producer-written storage;
+    // `Sync` because anchors take shared `&T` borrows of the *same* mapped
+    // element from several processes at once.
+    T: ShmItem + crate::broadcast::NoUninit + Send + Sync,
+{
+    /// Initialize `fd` as a fresh shm-backed anchored element ring with a
+    /// `max_anchors`-slot anchor table and return the producer plus one
+    /// initial anchor, with default ([`YieldWait`](crate::wait::YieldWait))
+    /// wait strategies. Observers are **not** table-bound: attach any number
+    /// with [`attach_shm_observer`](Self::attach_shm_observer), each
+    /// lease-free over its own **read-only** mapping.
+    ///
+    /// Unlike heap anchor membership (unbounded), `max_anchors` is fixed at
+    /// creation — a mapped layout cannot grow. That constraint is physical,
+    /// not a design choice. The observer reposition slack defaults to
+    /// `capacity / 8` (clamped to at least 1), as on the heap.
+    ///
+    /// ```
+    /// use std::os::fd::AsFd;
+    /// use rust_rb::{anchored, memfd};
+    /// # fn main() -> std::io::Result<()> {
+    /// let fd = memfd("anchored-doc")?;
+    /// // SAFETY: fresh private memfd, only cooperating handles touch it.
+    /// let (mut tx, mut anchor) =
+    ///     unsafe { anchored::RingBuffer::<u64>::create_shm(fd.as_fd(), 64, 8)? };
+    /// // Observers attach lease-free, over a read-only mapping.
+    /// // SAFETY: cooperating handles only.
+    /// let mut observer = unsafe {
+    ///     anchored::RingBuffer::<u64>::attach_shm_observer(fd.as_fd())?
+    /// };
+    /// tx.push(7);
+    /// assert_eq!(anchor.pop(), Ok(7));
+    /// assert_eq!(observer.pop(), Ok(7));
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Safety
+    ///
+    /// See [the module's trust model](self): the region must only ever be
+    /// accessed by cooperating rust-rb handles.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `min_capacity == 0`.
+    #[allow(clippy::type_complexity)]
+    pub unsafe fn create_shm(
+        fd: BorrowedFd<'_>,
+        min_capacity: usize,
+        max_anchors: usize,
+    ) -> io::Result<(crate::anchored::Producer<T>, crate::anchored::Anchor<T>)> {
+        // SAFETY: forwarded caller contract.
+        unsafe {
+            crate::anchored::RingBuffer::<T, _, _>::create_shm_with(fd, min_capacity, max_anchors)
+        }
+    }
+
+    /// Unconditionally take over an existing anchored ring: force-take the
+    /// producer role, **reset the whole anchor table** (leases zeroed, every
+    /// slot FREE at a bumped epoch — retired slots become issuable again),
+    /// and return a fresh pair. The returned anchor resumes at the slowest
+    /// previously-registered anchor cursor, so recovery is at-least-once;
+    /// the producer resumes at the committed tail with its gating caches
+    /// seeded to rescan. Live observers need nothing: everything published
+    /// stays drainable throughout.
+    ///
+    /// # Safety
+    ///
+    /// Trust model, plus: the takeover is unconditional — the caller asserts
+    /// **every** previous holder (producer and all anchors) is gone. A
+    /// still-live anchor would be silently unregistered (its flushes are
+    /// suppressed by the slot-lease guard, but its reads lose all gating
+    /// protection); a still-live producer would corrupt the ring.
+    #[allow(clippy::type_complexity)]
+    pub unsafe fn recover_shm(
+        fd: BorrowedFd<'_>,
+    ) -> io::Result<(crate::anchored::Producer<T>, crate::anchored::Anchor<T>)> {
+        // SAFETY: forwarded caller contract.
+        unsafe { crate::anchored::RingBuffer::<T, _, _>::recover_shm_with(fd) }
+    }
+}
+
+impl<T, P, C> crate::anchored::RingBuffer<T, P, C>
+where
+    T: ShmItem + crate::broadcast::NoUninit + Send + Sync,
+    P: CrossProcess + SelfTimed + Send + Sync,
+    C: CrossProcess + SelfTimed + Send + Sync,
+{
+    fn open(fd: BorrowedFd<'_>, read_only: bool) -> io::Result<AnchOpened> {
+        check_anch_elem_type::<T>()?;
+        // Capacity floor 2 = the heap constructor's floor (the empty-registry
+        // gating default `next_seq - 1` needs it); element cursors are always
+        // decodable, so no alignment constraint (align 1).
+        open_anch_region(
+            fd,
+            KIND_ANCH_ELEMS,
+            std::mem::size_of::<T>(),
+            crate::anchored::shm_slot_stride::<T>(),
+            ANCH_ELEMS_TABLE_OFFSET,
+            2,
+            1,
+            read_only,
+        )
+    }
+
+    /// [`create_shm`](crate::anchored::RingBuffer::create_shm) with explicit
+    /// [`CrossProcess`] + [`SelfTimed`] wait strategies (both bounds on both
+    /// sides: the strategy must survive a process boundary *and* never need
+    /// a peer notify — the spin family) and the default observer slack.
+    ///
+    /// # Safety
+    ///
+    /// See [the module's trust model](self).
+    pub unsafe fn create_shm_with(
+        fd: BorrowedFd<'_>,
+        min_capacity: usize,
+        max_anchors: usize,
+    ) -> io::Result<AnchElemPair<T, P, C>> {
+        let capacity = crate::cursor::round_capacity(min_capacity, 2);
+        let slack = crate::anchored::shm_default_slack(capacity as u64);
+        // SAFETY: forwarded caller contract.
+        unsafe { Self::create_shm_with_slack(fd, min_capacity, max_anchors, slack as usize) }
+    }
+
+    /// [`create_shm_with`](Self::create_shm_with) with an explicit observer
+    /// reposition `slack` [A-3.2] — the create-time knob every observer of
+    /// this ring inherits (stored in the region header and validated on
+    /// attach). Anchors never lag, so the slack concerns observers only.
+    ///
+    /// # Safety
+    ///
+    /// See [the module's trust model](self).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `min_capacity == 0`. Unlike the heap constructor,
+    /// `slack >= capacity` is an **error** (`InvalidInput`), not a panic —
+    /// shm constructors surface misuse on their fallible path.
+    pub unsafe fn create_shm_with_slack(
+        fd: BorrowedFd<'_>,
+        min_capacity: usize,
+        max_anchors: usize,
+        slack: usize,
+    ) -> io::Result<AnchElemPair<T, P, C>> {
+        check_anch_elem_type::<T>()?;
+        let capacity = crate::cursor::round_capacity(min_capacity, 2);
+        if slack >= capacity {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "slack must be less than the capacity",
+            ));
+        }
+        let (region, producer_token) = create_anch_region(
+            fd,
+            KIND_ANCH_ELEMS,
+            capacity,
+            std::mem::size_of::<T>(),
+            crate::anchored::shm_slot_stride::<T>(),
+            ANCH_ELEMS_TABLE_OFFSET,
+            max_anchors,
+            slack as u64,
+        )?;
+        let claim = anch_claim_slot(&region, ANCH_ELEMS_TABLE_OFFSET, max_anchors)
+            .expect("fresh table has free slots");
+        let joined = claim.joined;
+        let producer_anchor = Box::new(AnchShmProducer::new(
+            Arc::clone(&region),
+            producer_token,
+            max_anchors,
+            ANCH_ELEMS_TABLE_OFFSET,
+        ));
+        let anchor_backing = Box::new(AnchShmAnchor::new(
+            region,
+            claim,
+            max_anchors,
+            ANCH_ELEMS_TABLE_OFFSET,
+        ));
+        // SAFETY: freshly initialized region matches this ring's layout.
+        unsafe {
+            Ok((
+                crate::anchored::Producer::from_shm(producer_anchor, capacity),
+                crate::anchored::Anchor::from_shm(anchor_backing, capacity, joined),
+            ))
+        }
+    }
+
+    /// Attach to an existing anchored element ring as the producer. Fails
+    /// with `AddrInUse` while the producer lease is held; resets the
+    /// graceful `closed` flag (the ring is open again — shm `Closed` is
+    /// end-of-session for both consumer roles). The gating caches are
+    /// rebuilt from the live anchor table before the handle is returned —
+    /// never from defaults.
+    ///
+    /// # Safety
+    ///
+    /// Trust model, plus single-producer, plus `T` must be the exact type
+    /// the ring was created with (only its size and slot stride are
+    /// validated).
+    pub unsafe fn attach_shm_producer(
+        fd: BorrowedFd<'_>,
+    ) -> io::Result<crate::anchored::Producer<T, P, C>> {
+        let opened = Self::open(fd, false)?;
+        let anchor = anch_attach_producer_anchor::<C>(&opened, false)?;
+        // SAFETY: region validated by open(); forwarded caller contract.
+        Ok(unsafe { crate::anchored::Producer::from_shm(anchor, opened.capacity) })
+    }
+
+    /// Unconditionally take over the producer role (single-side crash
+    /// recovery while anchors and observers keep running; the element ring
+    /// needs no counter healing — a reader racing the recovered producer's
+    /// re-publishes self-heals via the slot seqlock generations).
+    ///
+    /// # Safety
+    ///
+    /// Trust model, plus: unconditional takeover — the caller asserts the
+    /// previous producer is gone, plus the `T` caveat of
+    /// [`attach_shm_producer`](Self::attach_shm_producer).
+    pub unsafe fn force_attach_shm_producer(
+        fd: BorrowedFd<'_>,
+    ) -> io::Result<crate::anchored::Producer<T, P, C>> {
+        let opened = Self::open(fd, false)?;
+        let anchor = anch_attach_producer_anchor::<C>(&opened, true)?;
+        // SAFETY: region validated by open(); forwarded caller contract.
+        Ok(unsafe { crate::anchored::Producer::from_shm(anchor, opened.capacity) })
+    }
+
+    /// Attach a **new anchor**: claims a FREE anchor-table slot (the shm
+    /// face of `subscribe_anchor`; the join point is the unified cursor at
+    /// claim time — from there the anchor sees **every** message, even
+    /// against a free-running producer [§9.6]). Fails with `AddrInUse` when
+    /// the table is full and `BrokenPipe` when the ring is closed.
+    ///
+    /// # Safety
+    ///
+    /// Trust model, plus the `T` caveat of
+    /// [`attach_shm_producer`](Self::attach_shm_producer).
+    pub unsafe fn attach_shm_anchor(
+        fd: BorrowedFd<'_>,
+    ) -> io::Result<crate::anchored::Anchor<T, P, C>> {
+        let opened = Self::open(fd, false)?;
+        let (backing, joined) = anch_attach_anchor::<P, C>(&opened)?;
+        // SAFETY: region validated by open(); the claim choreography just
+        // ran (its final store published `joined` into the slot).
+        Ok(unsafe { crate::anchored::Anchor::from_shm(backing, opened.capacity, joined) })
+    }
+
+    /// Attach a **new observer**: validates the header and maps the region
+    /// **read-only** (`PROT_READ`). The observer takes **no lease**, claims
+    /// no table slot, and never writes a byte of shared state — membership
+    /// is unbounded, and dropping it just unmaps. Its join point is the
+    /// unified cursor at attach time.
+    ///
+    /// Attaching to a *closed* ring succeeds (mirroring the heap
+    /// `subscribe_observer`): the observer is born drained and pops
+    /// [`PopError::Closed`](crate::anchored::PopError::Closed) — until a new
+    /// producer attach reopens the session.
+    ///
+    /// The read-only mapping doubles as enforcement: a store accidentally
+    /// introduced anywhere in the observer path is a deterministic SIGSEGV
+    /// rather than silent corruption.
+    ///
+    /// # Safety
+    ///
+    /// Trust model, plus the `T` caveat of
+    /// [`attach_shm_producer`](Self::attach_shm_producer).
+    pub unsafe fn attach_shm_observer(
+        fd: BorrowedFd<'_>,
+    ) -> io::Result<crate::anchored::Observer<T, P, C>> {
+        let opened = Self::open(fd, true)?;
+        // SAFETY: region validated by the open; forwarded caller contract.
+        Ok(unsafe {
+            crate::anchored::Observer::from_shm(
+                opened.region,
+                opened.capacity,
+                opened.slack,
+                opened.max_anchors,
+            )
+        })
+    }
+
+    /// Retire anchor-table slot `slot` [A-4.1]: bump its epoch and mark it
+    /// RETIRED, **iff it is still `ACTIVE` at `epoch`**. `(slot, epoch)` is
+    /// what the victim's
+    /// [`Anchor::shm_slot_epoch`](crate::anchored::Anchor::shm_slot_epoch)
+    /// reported — the epoch proves the caller is retiring the same occupancy
+    /// it observed dead (every claim bumps the epoch, so a healthy anchor
+    /// that re-claimed a gracefully freed slot holds a different epoch and
+    /// this fails with `InvalidInput` instead of retiring the living). The
+    /// producer's next rescan stops honoring a retired slot's cursor
+    /// (un-gating a producer blocked on a dead anchor); the slot is **never
+    /// re-issued** until [`recover_shm`](crate::anchored::RingBuffer::recover_shm)
+    /// resets the table.
+    ///
+    /// # Safety
+    ///
+    /// The caller asserts the holder of `(slot, epoch)` is **dead**. Same
+    /// trust register as `force_attach`: a live holder's flushes land on the
+    /// retired slot (harmless), but its **reads lose all gating
+    /// protection** — the producer may overwrite data it still borrows.
+    pub unsafe fn force_detach_anchor(
+        fd: BorrowedFd<'_>,
+        slot: usize,
+        epoch: u32,
+    ) -> io::Result<()> {
+        let opened = Self::open(fd, false)?;
+        if slot >= opened.max_anchors {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "slot index out of range for this ring's anchor table",
+            ));
+        }
+        anch_force_detach(&opened.region, opened.table_offset, slot, epoch)
+    }
+
+    /// [`recover_shm`](crate::anchored::RingBuffer::recover_shm) with
+    /// explicit wait strategies.
+    ///
+    /// # Safety
+    ///
+    /// See [`recover_shm`](crate::anchored::RingBuffer::recover_shm), plus
+    /// the `T` caveat of [`attach_shm_producer`](Self::attach_shm_producer).
+    pub unsafe fn recover_shm_with(fd: BorrowedFd<'_>) -> io::Result<AnchElemPair<T, P, C>> {
+        let opened = Self::open(fd, false)?;
+        let producer_anchor = anch_attach_producer_anchor::<C>(&opened, true)?;
+        let resume = anch_reset_table(
+            &opened.region,
+            opened.table_offset,
+            opened.max_anchors,
+            opened.capacity as u64,
+        );
+        let claim = anch_claim_slot(&opened.region, opened.table_offset, opened.max_anchors)
+            .expect("freshly reset table has free slots");
+        // Move the fresh slot back to the resume point (a lower cursor only
+        // gates the producer more — and the producer is us, not yet pushing).
+        opened
+            .region
+            .anch_slot_cursor(opened.table_offset, claim.slot)
+            .store(anch_slot_guard(resume), Ordering::Release);
+        let anchor_backing = Box::new(AnchShmAnchor::new(
+            Arc::clone(&opened.region),
+            claim,
+            opened.max_anchors,
+            opened.table_offset,
+        ));
+        // SAFETY: region validated by open(); forwarded caller contract.
+        unsafe {
+            Ok((
+                crate::anchored::Producer::from_shm(producer_anchor, opened.capacity),
+                crate::anchored::Anchor::from_shm(anchor_backing, opened.capacity, resume),
+            ))
+        }
+    }
+}
+
+/// Byte-ring capacity floor and record alignment for the anchored byte
+/// ring, shared with the ring's own constructor and frame decoder so they
+/// cannot drift.
+const ANCH_BYTES_MIN_CAPACITY: usize = crate::anchored_bytes::MIN_CAPACITY;
+const ANCH_BYTES_TAIL_ALIGN: u64 = crate::broadcast_bytes::ALIGN as u64;
+
+impl crate::anchored_bytes::BytesRingBuffer {
+    /// Initialize `fd` as a fresh shm-backed anchored **byte** ring (see
+    /// [`anchored::RingBuffer::create_shm`](crate::anchored::RingBuffer::create_shm);
+    /// capacity is in bytes, minimum 16; observers attach separately with
+    /// [`attach_shm_observer`](Self::attach_shm_observer), lease-free over
+    /// read-only mappings).
+    ///
+    /// # Safety
+    ///
+    /// See [the module's trust model](self).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `min_capacity == 0`.
+    #[allow(clippy::type_complexity)]
+    pub unsafe fn create_shm(
+        fd: BorrowedFd<'_>,
+        min_capacity: usize,
+        max_anchors: usize,
+    ) -> io::Result<(
+        crate::anchored_bytes::BytesProducer,
+        crate::anchored_bytes::BytesAnchor,
+    )> {
+        // SAFETY: forwarded caller contract.
+        unsafe {
+            crate::anchored_bytes::BytesRingBuffer::<_, _>::create_shm_with(
+                fd,
+                min_capacity,
+                max_anchors,
+            )
+        }
+    }
+
+    /// Unconditionally take over an existing anchored byte ring (see
+    /// [`anchored::RingBuffer::recover_shm`](crate::anchored::RingBuffer::recover_shm):
+    /// full table reset; the returned anchor resumes at the slowest
+    /// previously-registered anchor cursor — always a record boundary —
+    /// at-least-once). Also heals a predecessor's mid-push crash exactly as
+    /// [`attach_shm_producer`](Self::attach_shm_producer) does.
+    ///
+    /// # Safety
+    ///
+    /// See [`anchored::RingBuffer::recover_shm`](crate::anchored::RingBuffer::recover_shm).
+    #[allow(clippy::type_complexity)]
+    pub unsafe fn recover_shm(
+        fd: BorrowedFd<'_>,
+    ) -> io::Result<(
+        crate::anchored_bytes::BytesProducer,
+        crate::anchored_bytes::BytesAnchor,
+    )> {
+        // SAFETY: forwarded caller contract.
+        unsafe { crate::anchored_bytes::BytesRingBuffer::<_, _>::recover_shm_with(fd) }
+    }
+}
+
+impl<P, C> crate::anchored_bytes::BytesRingBuffer<P, C>
+where
+    P: CrossProcess + SelfTimed + Send + Sync,
+    C: CrossProcess + SelfTimed + Send + Sync,
+{
+    fn open(fd: BorrowedFd<'_>, read_only: bool) -> io::Result<AnchOpened> {
+        open_anch_region(
+            fd,
+            KIND_ANCH_BYTES,
+            1,
+            1,
+            ANCH_BYTES_TABLE_OFFSET,
+            ANCH_BYTES_MIN_CAPACITY,
+            ANCH_BYTES_TAIL_ALIGN,
+            read_only,
+        )
+    }
+
+    /// [`create_shm`](crate::anchored_bytes::BytesRingBuffer::create_shm)
+    /// with explicit [`CrossProcess`] + [`SelfTimed`] wait strategies.
+    ///
+    /// # Safety
+    ///
+    /// See [the module's trust model](self).
+    pub unsafe fn create_shm_with(
+        fd: BorrowedFd<'_>,
+        min_capacity: usize,
+        max_anchors: usize,
+    ) -> io::Result<AnchBytesPair<P, C>> {
+        let capacity = crate::cursor::round_capacity(min_capacity, ANCH_BYTES_MIN_CAPACITY);
+        let (region, producer_token) = create_anch_region(
+            fd,
+            KIND_ANCH_BYTES,
+            capacity,
+            1,
+            1,
+            ANCH_BYTES_TABLE_OFFSET,
+            max_anchors,
+            0,
+        )?;
+        let claim = anch_claim_slot(&region, ANCH_BYTES_TABLE_OFFSET, max_anchors)
+            .expect("fresh table has free slots");
+        let joined = claim.joined;
+        let producer_anchor = Box::new(AnchShmProducer::new(
+            Arc::clone(&region),
+            producer_token,
+            max_anchors,
+            ANCH_BYTES_TABLE_OFFSET,
+        ));
+        let anchor_backing = Box::new(AnchShmAnchor::new(
+            region,
+            claim,
+            max_anchors,
+            ANCH_BYTES_TABLE_OFFSET,
+        ));
+        // SAFETY: freshly initialized region matches this ring's layout
+        // (fresh counters: the intent floor is 0).
+        unsafe {
+            Ok((
+                crate::anchored_bytes::BytesProducer::from_shm(producer_anchor, capacity, 0),
+                crate::anchored_bytes::BytesAnchor::from_shm(anchor_backing, capacity, joined),
+            ))
+        }
+    }
+
+    /// Attach to an existing anchored byte ring as the producer (see the
+    /// element ring's
+    /// [`attach_shm_producer`](crate::anchored::RingBuffer::attach_shm_producer)
+    /// for the lease and reopen story). Also resets the starving flag a
+    /// departed predecessor may have left set, and heals a mid-push crash:
+    /// the declared-intent frontier stays **monotonic across producer
+    /// sessions** (the new producer's pushes declare
+    /// `max(new_tail, floor)` at §9.3 step (2) — after the gate, as always)
+    /// and `latest` is repaired to the committed tail, so observers'
+    /// validation windows never re-admit destroyed bytes.
+    ///
+    /// # Safety
+    ///
+    /// Trust model, plus single-producer.
+    pub unsafe fn attach_shm_producer(
+        fd: BorrowedFd<'_>,
+    ) -> io::Result<crate::anchored_bytes::BytesProducer<P, C>> {
+        let opened = Self::open(fd, false)?;
+        let anchor = anch_attach_producer_anchor::<C>(&opened, false)?;
+        // A newly-attached producer is not starving (only the producer
+        // writes this flag, and we now hold its lease).
+        opened.region.anch_starving().store(0, Ordering::Release);
+        let floor = bytes_heal_on_attach(&opened.region);
+        // SAFETY: region validated by open(); forwarded caller contract;
+        // `floor` is the sampled `max(intent, tail)`.
+        Ok(unsafe {
+            crate::anchored_bytes::BytesProducer::from_shm(anchor, opened.capacity, floor)
+        })
+    }
+
+    /// Unconditionally take over the producer role (see
+    /// [`attach_shm_producer`](Self::attach_shm_producer) for the starving
+    /// reset and the mid-push healing; everything published stays drainable
+    /// throughout).
+    ///
+    /// # Safety
+    ///
+    /// Trust model, plus: unconditional takeover — the caller asserts the
+    /// previous producer is gone.
+    pub unsafe fn force_attach_shm_producer(
+        fd: BorrowedFd<'_>,
+    ) -> io::Result<crate::anchored_bytes::BytesProducer<P, C>> {
+        let opened = Self::open(fd, false)?;
+        let anchor = anch_attach_producer_anchor::<C>(&opened, true)?;
+        opened.region.anch_starving().store(0, Ordering::Release);
+        let floor = bytes_heal_on_attach(&opened.region);
+        // SAFETY: region validated by open(); forwarded caller contract;
+        // `floor` is the sampled `max(intent, tail)`.
+        Ok(unsafe {
+            crate::anchored_bytes::BytesProducer::from_shm(anchor, opened.capacity, floor)
+        })
+    }
+
+    /// Attach a new anchor (see the element ring's
+    /// [`attach_shm_anchor`](crate::anchored::RingBuffer::attach_shm_anchor);
+    /// the join point is always a record boundary).
+    ///
+    /// # Safety
+    ///
+    /// Trust model.
+    pub unsafe fn attach_shm_anchor(
+        fd: BorrowedFd<'_>,
+    ) -> io::Result<crate::anchored_bytes::BytesAnchor<P, C>> {
+        let opened = Self::open(fd, false)?;
+        let (backing, joined) = anch_attach_anchor::<P, C>(&opened)?;
+        // SAFETY: region validated by open(); the claim choreography just
+        // ran (its final store published `joined` into the slot).
+        Ok(unsafe {
+            crate::anchored_bytes::BytesAnchor::from_shm(backing, opened.capacity, joined)
+        })
+    }
+
+    /// Attach a new observer over a **read-only** (`PROT_READ`) mapping: no
+    /// lease, no table slot, no shared writes, unbounded membership — see
+    /// the element ring's
+    /// [`attach_shm_observer`](crate::anchored::RingBuffer::attach_shm_observer)
+    /// for the full contract (including closed-ring attaches succeeding).
+    /// The join point is the unified cursor at attach time — always a
+    /// record boundary.
+    ///
+    /// # Safety
+    ///
+    /// Trust model.
+    pub unsafe fn attach_shm_observer(
+        fd: BorrowedFd<'_>,
+    ) -> io::Result<crate::anchored_bytes::BytesObserver<P, C>> {
+        let opened = Self::open(fd, true)?;
+        // SAFETY: region validated by the open; forwarded caller contract.
+        Ok(unsafe {
+            crate::anchored_bytes::BytesObserver::from_shm(
+                opened.region,
+                opened.capacity,
+                opened.max_anchors,
+            )
+        })
+    }
+
+    /// Retire anchor-table slot `slot` iff still `ACTIVE` at `epoch` (see
+    /// the element ring's
+    /// [`force_detach_anchor`](crate::anchored::RingBuffer::force_detach_anchor);
+    /// `(slot, epoch)` comes from the victim's
+    /// [`BytesAnchor::shm_slot_epoch`](crate::anchored_bytes::BytesAnchor::shm_slot_epoch)).
+    ///
+    /// # Safety
+    ///
+    /// The caller asserts the holder of `(slot, epoch)` is dead; a live
+    /// holder's reads lose all gating protection (revoked read validity).
+    pub unsafe fn force_detach_anchor(
+        fd: BorrowedFd<'_>,
+        slot: usize,
+        epoch: u32,
+    ) -> io::Result<()> {
+        let opened = Self::open(fd, false)?;
+        if slot >= opened.max_anchors {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "slot index out of range for this ring's anchor table",
+            ));
+        }
+        anch_force_detach(&opened.region, opened.table_offset, slot, epoch)
+    }
+
+    /// [`recover_shm`](crate::anchored_bytes::BytesRingBuffer::recover_shm)
+    /// with explicit wait strategies.
+    ///
+    /// # Safety
+    ///
+    /// See [`recover_shm`](crate::anchored_bytes::BytesRingBuffer::recover_shm).
+    pub unsafe fn recover_shm_with(fd: BorrowedFd<'_>) -> io::Result<AnchBytesPair<P, C>> {
+        let opened = Self::open(fd, false)?;
+        let producer_anchor = anch_attach_producer_anchor::<C>(&opened, true)?;
+        opened.region.anch_starving().store(0, Ordering::Release);
+        // Heal BEFORE the table reset: the floor and the latest repair are
+        // producer-session state, independent of the anchor table.
+        let floor = bytes_heal_on_attach(&opened.region);
+        let resume = anch_reset_table(
+            &opened.region,
+            opened.table_offset,
+            opened.max_anchors,
+            opened.capacity as u64,
+        );
+        let claim = anch_claim_slot(&opened.region, opened.table_offset, opened.max_anchors)
+            .expect("freshly reset table has free slots");
+        opened
+            .region
+            .anch_slot_cursor(opened.table_offset, claim.slot)
+            .store(anch_slot_guard(resume), Ordering::Release);
+        let anchor_backing = Box::new(AnchShmAnchor::new(
+            Arc::clone(&opened.region),
+            claim,
+            opened.max_anchors,
+            opened.table_offset,
+        ));
+        // SAFETY: region validated by open(); forwarded caller contract.
+        unsafe {
+            Ok((
+                crate::anchored_bytes::BytesProducer::from_shm(
+                    producer_anchor,
+                    opened.capacity,
+                    floor,
+                ),
+                crate::anchored_bytes::BytesAnchor::from_shm(
+                    anchor_backing,
+                    opened.capacity,
+                    resume,
+                ),
+            ))
+        }
     }
 }
 

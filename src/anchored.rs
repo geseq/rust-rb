@@ -215,9 +215,9 @@ impl Chunk {
     }
 }
 
-/// The state all handles share, kept alive by an `Arc`. Heap-only for now: a
-/// future shm variant (design §9.4) would reintroduce the backing seam the
-/// parent modules carry.
+/// The state all handles share on a **heap** ring, kept alive by an `Arc`.
+/// The shm variant (design §9.4) keeps this same state in a mapped region
+/// instead; the handles reach either through the backing seam below.
 struct Shared<T, P, C> {
     slots: Box<[Slot<T>]>,
     /// `capacity - 1`, in the u64 domain of all position arithmetic.
@@ -506,7 +506,7 @@ where
             cached_cursors: Vec::new(),
             tail: NonNull::from(&shared.tail_side.tail),
             closed: NonNull::from(&shared.tail_side.closed),
-            shared,
+            backing: ProducerBacking::Heap(shared),
         };
         (producer, anchor)
     }
@@ -565,9 +565,11 @@ where
         read_cursor: joined,
         published,
         tail_cache: joined,
-        chunk,
-        slot_idx,
-        shared,
+        backing: AnchorBacking::Heap {
+            shared,
+            chunk,
+            slot_idx,
+        },
     })
 }
 
@@ -592,7 +594,7 @@ where
         wait: C::default(),
         tail: NonNull::from(&shared.tail_side.tail),
         closed: NonNull::from(&shared.tail_side.closed),
-        shared,
+        backing: ObserverBacking::Heap(shared),
     }
 }
 
@@ -644,6 +646,143 @@ fn claim_registry_slot<T, P, C>(shared: &Shared<T, P, C>) -> (NonNull<Chunk>, us
             }
         }
     }
+}
+
+/// Where the producing handle's shared state lives — the backing seam,
+/// mirroring `crate::spmc`'s registry seam (named `*Backing` here because
+/// this module's public consumer type is itself called [`Anchor`]): every
+/// hot atomic is reached through the handle's cached raw pointers
+/// (identical for both variants); the backing is consulted on cold paths
+/// (blocking waits, subscribe, the gate-miss rescan walk, teardown) plus
+/// the wait-strategy `notify()` accessor on publish (a no-op the spin
+/// strategies inline away).
+enum ProducerBacking<T, P, C> {
+    /// In-process ring: the shared state lives on the heap in an `Arc`; the
+    /// anchor registry is the append-only chunk list.
+    Heap(Arc<Shared<T, P, C>>),
+    /// Cross-process ring: the state lives in a mapped shared region; the
+    /// registry is the flat anchor table. Boxed so enabling the feature
+    /// does not grow heap handles.
+    #[cfg(all(feature = "shm", target_os = "linux", target_has_atomic = "64"))]
+    Shm(Box<crate::shm::AnchShmProducer<C>>),
+}
+
+impl<T, P: WaitStrategy, C: WaitStrategy> ProducerBacking<T, P, C> {
+    #[inline(always)]
+    fn consumer_wait(&self) -> &C {
+        match self {
+            ProducerBacking::Heap(shared) => &shared.consumer_wait,
+            #[cfg(all(feature = "shm", target_os = "linux", target_has_atomic = "64"))]
+            ProducerBacking::Shm(backing) => &backing.consumer_wait,
+        }
+    }
+
+    /// Whether teardown may touch shared state (the ring-wide closed word).
+    /// Heap: always. Shm: only the current producer-lease holder in the
+    /// constructing process — a crashed producer never gets here, and a fork
+    /// child or superseded zombie must not close the successor's ring.
+    #[inline]
+    fn teardown_allowed(&self) -> bool {
+        match self {
+            ProducerBacking::Heap(_) => true,
+            #[cfg(all(feature = "shm", target_os = "linux", target_has_atomic = "64"))]
+            ProducerBacking::Shm(backing) => {
+                backing.owned_by_current_process() && backing.owns_lease()
+            }
+        }
+    }
+}
+
+/// The [`Anchor`] handle's side of the backing seam (see
+/// [`ProducerBacking`]).
+enum AnchorBacking<T, P, C> {
+    /// Heap ring: the `Arc` plus this anchor's chunk/slot coordinates for
+    /// the cold detach (the hot flush goes through the handle's cached
+    /// cursor-slot pointer).
+    Heap {
+        shared: Arc<Shared<T, P, C>>,
+        chunk: NonNull<Chunk>,
+        slot_idx: usize,
+    },
+    #[cfg(all(feature = "shm", target_os = "linux", target_has_atomic = "64"))]
+    Shm(Box<crate::shm::AnchShmAnchor<P, C>>),
+}
+
+impl<T, P: WaitStrategy, C: WaitStrategy> AnchorBacking<T, P, C> {
+    #[inline(always)]
+    fn producer_wait(&self) -> &P {
+        match self {
+            AnchorBacking::Heap { shared, .. } => &shared.producer_wait,
+            #[cfg(all(feature = "shm", target_os = "linux", target_has_atomic = "64"))]
+            AnchorBacking::Shm(backing) => &backing.producer_wait,
+        }
+    }
+
+    #[inline(always)]
+    fn consumer_wait(&self) -> &C {
+        match self {
+            AnchorBacking::Heap { shared, .. } => &shared.consumer_wait,
+            #[cfg(all(feature = "shm", target_os = "linux", target_has_atomic = "64"))]
+            AnchorBacking::Shm(backing) => &backing.consumer_wait,
+        }
+    }
+
+    /// Whether teardown may touch shared state. Heap: always. Shm: only the
+    /// slot-lease holder in the constructing process — a fork-inherited copy
+    /// must not flush over (or free) the parent's live slot, and a zombie
+    /// whose slot was reset by `recover_shm` must not resurrect it.
+    #[inline]
+    fn teardown_allowed(&self) -> bool {
+        match self {
+            AnchorBacking::Heap { .. } => true,
+            #[cfg(all(feature = "shm", target_os = "linux", target_has_atomic = "64"))]
+            AnchorBacking::Shm(backing) => {
+                backing.owned_by_current_process() && backing.owns_slot()
+            }
+        }
+    }
+
+    /// The registry de-registration half of anchor teardown (the caller has
+    /// already flushed and stored the cursor sentinel). Heap: clear the
+    /// bitmap bit. Shm: return the table slot (a guarded control-word CAS —
+    /// it fails harmlessly if the slot was force-retired) and release the
+    /// slot lease. Both then wake a producer blocked on the gate [A-1.3].
+    fn detach(&self) {
+        match self {
+            AnchorBacking::Heap {
+                shared,
+                chunk,
+                slot_idx,
+            } => {
+                // SAFETY: the chunk lives until `Shared::drop`; we hold the
+                // `Arc`.
+                let chunk = unsafe { chunk.as_ref() };
+                chunk
+                    .bitmap
+                    .fetch_and(!(1u64 << slot_idx), Ordering::AcqRel);
+                shared.producer_wait.notify();
+            }
+            #[cfg(all(feature = "shm", target_os = "linux", target_has_atomic = "64"))]
+            AnchorBacking::Shm(backing) => backing.detach(),
+        }
+    }
+}
+
+/// The [`Observer`] handle's side of the backing seam: purely a keep-alive.
+/// An observer is a pure reader — dropping it releases nothing and writes
+/// nothing, so the shm variant is nothing but the mapping `Arc` (mapped
+/// **read-only**: any accidental store in the observer path would be a
+/// deterministic SIGSEGV, which is the enforcement).
+enum ObserverBacking<T, P, C> {
+    Heap(Arc<Shared<T, P, C>>),
+    #[cfg(all(feature = "shm", target_os = "linux", target_has_atomic = "64"))]
+    Shm {
+        region: Arc<crate::shm::ShmRegion>,
+        /// The table size, needed to re-derive the buffer base when this
+        /// observer subscribes a sibling (the region wrapper is geometry-
+        /// agnostic).
+        max_anchors: usize,
+    },
 }
 
 /// The chunk-list walk of the gate-miss rescan, lifted verbatim from spmc
@@ -706,6 +845,62 @@ fn scan_chunk_registry(
     (any_active, max_lag)
 }
 
+/// The anchor-table walk of the gate-miss rescan — the shm registry side of
+/// the seam (fence discipline supplied by `rescan`, exactly as for
+/// [`scan_chunk_registry`]): `crate::spmc`'s table walk lifted into the u64
+/// unified-cursor domain. The control word plays the bitmap's role in the
+/// [M-F2] dichotomy: it is read first (Relaxed, covered by the trailing
+/// Acquire fence) and non-ACTIVE slots are skipped **regardless of cursor
+/// content** — FREE slots hold sentinels or a leftover cursor, RETIRED
+/// slots are force-detached zombies whose words nobody may trust [A-4.1].
+#[cfg(all(feature = "shm", target_os = "linux", target_has_atomic = "64"))]
+fn scan_shm_table<C>(
+    backing: &crate::shm::AnchShmProducer<C>,
+    cached_cursors: &mut Vec<[u64; CHUNK_SLOTS]>,
+    next_seq: u64,
+    needed: u64,
+    capacity: u64,
+) -> (bool, u64) {
+    let mut any_active = false;
+    let mut max_lag = 0u64;
+    for slot in 0..backing.max_anchors() {
+        let ci = slot / CHUNK_SLOTS;
+        let idx = slot % CHUNK_SLOTS;
+        if cached_cursors.len() == ci {
+            // Fresh cache block, always-gating seed (see the heap walk).
+            cached_cursors.push([next_seq.wrapping_sub(capacity); CHUNK_SLOTS]);
+        }
+        if !crate::shm::control_is_active(backing.slot_control(slot).load(Ordering::Relaxed)) {
+            continue;
+        }
+        let cache = &mut cached_cursors[ci];
+        let mut cursor = cache[idx];
+        // Selective refresh [P-F3] — the lower-bound argument holds across
+        // slot reuse here too: a freed slot's leftover cursor is at most the
+        // unified cursor at its detach, which a later claimant's join point
+        // can never undercut.
+        if lacks_space(next_seq, needed, cursor, capacity) {
+            let fresh = backing.slot_cursor(slot).load(Ordering::Relaxed);
+            if fresh == DETACHED {
+                // Backstop, the shm face of the heap walk's mid-detach skip:
+                // an ACTIVE slot whose joiner has not stored its provisional
+                // cursor yet imposes no constraint — by the [M-F2] fence
+                // dichotomy such a joiner's join point is at or past this
+                // scan's wrap point. Do not poison the cache.
+                continue;
+            }
+            cache[idx] = fresh;
+            cursor = fresh;
+        }
+        any_active = true;
+        let lag = next_seq.wrapping_sub(cursor);
+        if lag > max_lag {
+            max_lag = lag;
+        }
+    }
+    (any_active, max_lag)
+}
+
 /// The producing half of a [`RingBuffer`]: spmc's gate composed with
 /// broadcast's write bracket over one unified u64 cursor. `Send` but not
 /// `Clone`: exactly one producer, enforced by the type system.
@@ -727,17 +922,18 @@ pub struct Producer<T, P: WaitStrategy = YieldWait, C: WaitStrategy = YieldWait>
     /// Monotonicity makes every cached value a permanent lower bound — for
     /// later occupants of the slot too [P-F3].
     cached_cursors: Vec<[u64; CHUNK_SLOTS]>,
-    /// The shared unified cursor (cached raw pointer into the `Arc`).
+    /// The shared unified cursor (cached raw pointer; heap: into the `Arc`,
+    /// shm: into the mapped region — the hot publish path is identical).
     tail: NonNull<AtomicU64>,
     /// The shared closed word (written once, on drop).
     closed: NonNull<AtomicU64>,
-    /// Keeps the ring's memory alive and carries the wait strategies and
-    /// the anchor registry for the cold paths.
-    shared: Arc<Shared<T, P, C>>,
+    /// Keeps the ring's memory alive, carries the wait strategies, and
+    /// names the registry (heap chunks vs shm table) for the cold paths.
+    backing: ProducerBacking<T, P, C>,
 }
 
 // SAFETY: the producer only touches producer-private state plus atomics; the
-// cached pointers reference state the `Arc` keeps alive. `T: Send + Sync`
+// cached pointers reference state the backing keeps alive. `T: Send + Sync`
 // per the shared-state contract (see `Shared`'s impls).
 unsafe impl<T: Send + Sync, P: WaitStrategy + Send + Sync, C: WaitStrategy + Send + Sync> Send
     for Producer<T, P, C>
@@ -749,10 +945,15 @@ impl<T, P: WaitStrategy, C: WaitStrategy> Drop for Producer<T, P, C> {
         // Flag-then-notify [A-1.1]: an anchor that checked the flag just
         // before this store is parked in a wait whose predicate re-checks
         // `closed`, and the notify wakes it. Observers are `SelfTimed` and
-        // re-check on their own; the notify is for anchors.
-        // SAFETY: `closed` points into the live shared state.
-        unsafe { self.closed.as_ref() }.store(1, Ordering::Release);
-        self.shared.consumer_wait.notify();
+        // re-check on their own; the notify is for anchors. Guarded for shm
+        // (heap: constant true): only a graceful drop by the live lease
+        // holder sets the ring-wide closed word — a crashed producer never
+        // runs this, per the trust model.
+        if self.backing.teardown_allowed() {
+            // SAFETY: `closed` points into the live shared state.
+            unsafe { self.closed.as_ref() }.store(1, Ordering::Release);
+            self.backing.consumer_wait().notify();
+        }
     }
 }
 
@@ -815,31 +1016,73 @@ where
     ///
     /// Cold: the producer's gating caches pick the newcomer up on the next
     /// rescan, which the gating default forces at least once per lap.
+    ///
+    /// On a shared-memory ring the anchor table is fixed at creation, so
+    /// this can additionally fail with [`SubscribeError::Full`].
     pub fn subscribe_anchor(&self) -> Result<Anchor<T, P, C>, SubscribeError> {
-        subscribe_from(&self.shared)
+        match &self.backing {
+            ProducerBacking::Heap(shared) => subscribe_from(shared),
+            #[cfg(all(feature = "shm", target_os = "linux", target_has_atomic = "64"))]
+            // SAFETY: the backing's region was validated for this `T` and
+            // capacity when this handle was constructed.
+            ProducerBacking::Shm(backing) => unsafe {
+                shm_subscribe_anchor(backing.region(), backing.max_anchors(), self.mask + 1)
+            },
+        }
     }
 
     /// Subscribe a new observer at the current tail. Never fails: observers
     /// are unbounded pure readers (one subscribed to a closed ring is born
     /// drained and pops [`PopError::Closed`]).
+    ///
+    /// On a shared-memory ring the subscriber shares this producer's
+    /// **read-write** mapping (same process, same pages) — the read-only
+    /// enforcement story belongs to
+    /// [`attach_shm_observer`](RingBuffer::attach_shm_observer), which maps
+    /// the region afresh with `PROT_READ`.
     pub fn subscribe_observer(&self) -> Observer<T, P, C> {
-        observe_from(&self.shared)
+        match &self.backing {
+            ProducerBacking::Heap(shared) => observe_from(shared),
+            #[cfg(all(feature = "shm", target_os = "linux", target_has_atomic = "64"))]
+            // SAFETY: the backing's region was validated for this `T` and
+            // capacity when this handle was constructed; the slack is the
+            // create-time header field every observer inherits.
+            ProducerBacking::Shm(backing) => {
+                let region = Arc::clone(backing.region());
+                let slack = region.bcast_slack();
+                unsafe {
+                    Observer::from_shm(
+                        region,
+                        (self.mask + 1) as usize,
+                        slack,
+                        backing.max_anchors(),
+                    )
+                }
+            }
+        }
     }
 
     /// Number of currently attached anchors (a registry scan — cold; a
     /// racing subscribe/detach makes it a snapshot, not a guarantee).
     /// Observers are not counted: nothing tracks them.
     pub fn anchor_count(&self) -> usize {
-        let mut chunk: &Chunk = &self.shared.registry;
-        let mut count = 0usize;
-        loop {
-            count += chunk.bitmap.load(Ordering::Relaxed).count_ones() as usize;
-            let next = chunk.next.load(Ordering::Acquire);
-            if next.is_null() {
-                return count;
+        match &self.backing {
+            ProducerBacking::Heap(shared) => {
+                let mut chunk: &Chunk = &shared.registry;
+                let mut count = 0usize;
+                loop {
+                    count += chunk.bitmap.load(Ordering::Relaxed).count_ones() as usize;
+                    let next = chunk.next.load(Ordering::Acquire);
+                    if next.is_null() {
+                        return count;
+                    }
+                    // SAFETY: chunks are never freed while the shared state
+                    // lives.
+                    chunk = unsafe { &*next };
+                }
             }
-            // SAFETY: chunks are never freed while the shared state lives.
-            chunk = unsafe { &*next };
+            #[cfg(all(feature = "shm", target_os = "linux", target_has_atomic = "64"))]
+            ProducerBacking::Shm(backing) => backing.active_count(),
         }
     }
 
@@ -860,13 +1103,31 @@ where
             return;
         }
         // A separate handle on the wait strategy, so the predicate below can
-        // borrow `self` mutably (cold path; one refcount bump).
-        let shared = Arc::clone(&self.shared);
-        while !self.has_space(needed) {
-            // The predicate re-runs the FULL scan [M-F4]: a cached minimum
-            // here is a deadlock, and rescanning is also what lets the wait
-            // terminate when every gating anchor detaches.
-            shared.producer_wait.wait(|| self.rescan(needed));
+        // borrow `self` mutably (cold path; one refcount bump). Shm backings
+        // carry per-handle `CrossProcess` strategies, for which a fresh
+        // default instance IS the same (stateless, self-timed) strategy.
+        let heap = match &self.backing {
+            ProducerBacking::Heap(shared) => Some(Arc::clone(shared)),
+            #[cfg(all(feature = "shm", target_os = "linux", target_has_atomic = "64"))]
+            ProducerBacking::Shm(_) => None,
+        };
+        match heap {
+            Some(shared) => {
+                while !self.has_space(needed) {
+                    // The predicate re-runs the FULL scan [M-F4]: a cached
+                    // minimum here is a deadlock, and rescanning is also
+                    // what lets the wait terminate when every gating anchor
+                    // detaches.
+                    shared.producer_wait.wait(|| self.rescan(needed));
+                }
+            }
+            None => {
+                let wait = P::default();
+                while !self.has_space(needed) {
+                    // Full-scan predicate [M-F4], as above.
+                    wait.wait(|| self.rescan(needed));
+                }
+            }
         }
     }
 
@@ -879,13 +1140,25 @@ where
         // everything published before this fence.
         fence(Ordering::SeqCst);
         let capacity = self.mask + 1;
-        let (any_active, max_lag) = scan_chunk_registry(
-            &self.shared.registry,
-            &mut self.cached_cursors,
-            self.next_seq,
-            needed,
-            capacity,
-        );
+        // The registry seam: one walk per registry kind, same fence
+        // discipline and cache geometry.
+        let (any_active, max_lag) = match &self.backing {
+            ProducerBacking::Heap(shared) => scan_chunk_registry(
+                &shared.registry,
+                &mut self.cached_cursors,
+                self.next_seq,
+                needed,
+                capacity,
+            ),
+            #[cfg(all(feature = "shm", target_os = "linux", target_has_atomic = "64"))]
+            ProducerBacking::Shm(backing) => scan_shm_table(
+                backing,
+                &mut self.cached_cursors,
+                self.next_seq,
+                needed,
+                capacity,
+            ),
+        };
         // One fence for the whole scan [P-F1]: the gating anchors' last
         // reads of the slots we are about to overwrite happen-before our
         // writes after this fence.
@@ -945,7 +1218,7 @@ where
         unsafe { self.tail.as_ref() }.store(self.next_seq, Ordering::Release);
         // Wake anchors blocked on data (a no-op for the spin strategies);
         // observers are `SelfTimed` and never wait for a notify.
-        self.shared.consumer_wait.notify();
+        self.backing.consumer_wait().notify();
     }
 
     /// Number of elements queued ahead of the slowest anchor, per the
@@ -1039,15 +1312,14 @@ pub struct Anchor<T, P: WaitStrategy = YieldWait, C: WaitStrategy = YieldWait> {
     published: u64,
     /// Cached snapshot of the producer's unified cursor.
     tail_cache: u64,
-    /// This anchor's registry coordinates, for the cold detach.
-    chunk: NonNull<Chunk>,
-    slot_idx: usize,
-    /// Keeps the ring's memory alive and carries the wait strategies.
-    shared: Arc<Shared<T, P, C>>,
+    /// Keeps the ring's memory alive, carries the wait strategies, and
+    /// names the registry (heap chunk coordinates vs shm table slot) for
+    /// the cold detach.
+    backing: AnchorBacking<T, P, C>,
 }
 
 // SAFETY: the anchor only touches anchor-private state plus atomics; the
-// cached pointers reference state the `Arc` keeps alive. `T: Send + Sync`
+// cached pointers reference state the backing keeps alive. `T: Send + Sync`
 // per the shared-state contract (see `Shared`'s impls).
 unsafe impl<T: Send + Sync, P: WaitStrategy + Send + Sync, C: WaitStrategy + Send + Sync> Send
     for Anchor<T, P, C>
@@ -1056,24 +1328,26 @@ unsafe impl<T: Send + Sync, P: WaitStrategy + Send + Sync, C: WaitStrategy + Sen
 
 impl<T, P: WaitStrategy, C: WaitStrategy> Drop for Anchor<T, P, C> {
     fn drop(&mut self) {
+        // Guarded teardown (heap: constant true): a fork-inherited copy or a
+        // handle whose slot lease was superseded must not flush over — or
+        // free — live state it no longer owns.
+        if !self.backing.teardown_allowed() {
+            return;
+        }
         // Publish any deferred progress first (harmless — the detach store
         // below supersedes it, but a concurrent rescan between the two sees
         // the freshest cursor instead of a stale one).
         self.flush_pending();
-        // Detach order matters: sentinel first, then the bitmap clear — a
-        // subscriber only claims fully-detached slots, which this ordering
-        // proves (see `claim_registry_slot`).
+        // Detach order matters: sentinel first, then the registry
+        // de-registration (heap: bitmap bit clear; shm: control-word FREE) —
+        // a subscriber only claims fully-detached slots, which this ordering
+        // proves (see `claim_registry_slot` and the shm claim choreography).
         // SAFETY: `cursor_slot` points into the live shared state.
         unsafe { self.cursor_slot.as_ref() }.store(DETACHED, Ordering::Release);
-        // SAFETY: the chunk lives until `Shared::drop`; we hold the `Arc`.
-        let chunk = unsafe { self.chunk.as_ref() };
-        chunk
-            .bitmap
-            .fetch_and(!(1u64 << self.slot_idx), Ordering::AcqRel);
-        // Wake a producer blocked on the gate [A-1.3]: a producer parked
-        // waiting for the minimum to move would stall forever if its last
-        // gating anchor detached silently.
-        self.shared.producer_wait.notify();
+        // De-register and wake a producer blocked on the gate [A-1.3]: a
+        // producer parked waiting for the minimum to move would stall
+        // forever if its last gating anchor detached silently.
+        self.backing.detach();
     }
 }
 
@@ -1178,12 +1452,36 @@ where
 
     /// Subscribe a further anchor; see [`Producer::subscribe_anchor`].
     pub fn subscribe_anchor(&self) -> Result<Anchor<T, P, C>, SubscribeError> {
-        subscribe_from(&self.shared)
+        match &self.backing {
+            AnchorBacking::Heap { shared, .. } => subscribe_from(shared),
+            #[cfg(all(feature = "shm", target_os = "linux", target_has_atomic = "64"))]
+            // SAFETY: the backing's region was validated for this `T` and
+            // capacity when this handle was constructed.
+            AnchorBacking::Shm(backing) => unsafe {
+                shm_subscribe_anchor(backing.region(), backing.max_anchors(), self.mask + 1)
+            },
+        }
     }
 
     /// Subscribe an observer; see [`Producer::subscribe_observer`].
     pub fn subscribe_observer(&self) -> Observer<T, P, C> {
-        observe_from(&self.shared)
+        match &self.backing {
+            AnchorBacking::Heap { shared, .. } => observe_from(shared),
+            #[cfg(all(feature = "shm", target_os = "linux", target_has_atomic = "64"))]
+            // SAFETY: as for [`Producer::subscribe_observer`]'s shm arm.
+            AnchorBacking::Shm(backing) => {
+                let region = Arc::clone(backing.region());
+                let slack = region.bcast_slack();
+                unsafe {
+                    Observer::from_shm(
+                        region,
+                        (self.mask + 1) as usize,
+                        slack,
+                        backing.max_anchors(),
+                    )
+                }
+            }
+        }
     }
 
     /// Number of elements available to this anchor. Exact on this side:
@@ -1268,9 +1566,9 @@ where
             let tail = self.tail;
             let closed = self.closed;
             let read = self.read_cursor;
-            self.shared.consumer_wait.wait(|| {
-                // SAFETY: the pointers reference live shared state the `Arc`
-                // keeps alive for the duration of the wait.
+            self.backing.consumer_wait().wait(|| {
+                // SAFETY: the pointers reference live shared state the
+                // backing keeps alive for the duration of the wait.
                 unsafe {
                     tail.as_ref().load(Ordering::Acquire).wrapping_sub(read) != 0
                         || closed.as_ref().load(Ordering::Acquire) != 0
@@ -1338,15 +1636,30 @@ where
 impl<T, P: WaitStrategy, C: WaitStrategy> Anchor<T, P, C> {
     /// Publish the private read cursor to this anchor's registry slot and
     /// wake a producer blocked on the gate (a no-op for spin strategies).
+    ///
+    /// Guarded by slot-lease ownership on shm rings (heap: no check at all):
+    /// every publish path funnels through here, so a zombie handle whose
+    /// slot was reset by `recover_shm` can never store over a successor's
+    /// cursor. A force-detached zombie still holds its lease and still
+    /// stores — onto its RETIRED slot, which no scan reads [A-4.1].
     #[inline(always)]
     fn flush(&mut self) {
+        #[cfg(all(feature = "shm", target_os = "linux", target_has_atomic = "64"))]
+        if let AnchorBacking::Shm(backing) = &self.backing {
+            if !backing.owns_slot() {
+                // Mark as published so retry paths don't spin on the dead
+                // lease.
+                self.published = self.read_cursor;
+                return;
+            }
+        }
         // Never publish the DETACHED sentinel; one unit less only gates the
         // producer more, and the next flush publishes past it.
         // SAFETY: `cursor_slot` points into the live shared state.
         unsafe { self.cursor_slot.as_ref() }
             .store(guard_sentinel(self.read_cursor), Ordering::Release);
         self.published = self.read_cursor;
-        self.shared.producer_wait.notify();
+        self.backing.producer_wait().notify();
     }
 
     /// [`flush`](Self::flush) only if there is unpublished progress.
@@ -1428,12 +1741,13 @@ pub struct Observer<T, P: WaitStrategy = YieldWait, C: WaitStrategy = YieldWait>
     tail: NonNull<AtomicU64>,
     /// The shared closed word (loads only, would-block paths).
     closed: NonNull<AtomicU64>,
-    /// Keeps the ring's memory alive.
-    shared: Arc<Shared<T, P, C>>,
+    /// Keeps the ring's memory alive (heap `Arc`, or the shm mapping —
+    /// **read-only** for observers attached through `attach_shm_observer`).
+    backing: ObserverBacking<T, P, C>,
 }
 
 // SAFETY: the observer only touches observer-private state plus atomics; the
-// cached pointers reference state the `Arc` keeps alive. `T: Send + Sync`
+// cached pointers reference state the backing keeps alive. `T: Send + Sync`
 // per the shared-state contract (see `Shared`'s impls).
 unsafe impl<T: Send + Sync, P: WaitStrategy + Send + Sync, C: WaitStrategy + Send + Sync> Send
     for Observer<T, P, C>
@@ -1503,9 +1817,27 @@ where
     /// Subscribe a further observer; its join point is the current tail.
     /// Never fails (see [`Producer::subscribe_observer`]). Observers cannot
     /// subscribe anchors — anchors join from the [`Producer`] or an
-    /// [`Anchor`].
+    /// [`Anchor`]. On a shared-memory ring the sibling shares this
+    /// observer's mapping (read-only when this observer's is).
     pub fn subscribe_observer(&self) -> Observer<T, P, C> {
-        observe_from(&self.shared)
+        match &self.backing {
+            ObserverBacking::Heap(shared) => observe_from(shared),
+            #[cfg(all(feature = "shm", target_os = "linux", target_has_atomic = "64"))]
+            // SAFETY: the backing's region was validated for this `T` and
+            // capacity when this handle was constructed; the sibling
+            // inherits the same cached slack.
+            ObserverBacking::Shm {
+                region,
+                max_anchors,
+            } => unsafe {
+                Observer::from_shm(
+                    Arc::clone(region),
+                    (self.mask + 1) as usize,
+                    self.slack,
+                    *max_anchors,
+                )
+            },
+        }
     }
 
     /// The ring's true capacity (the requested minimum rounded up to a power
@@ -1638,6 +1970,251 @@ where
         // the `Arc` keeps alive.
         unsafe { &*self.buf.as_ptr().add((s & self.mask) as usize) }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Shared-memory plumbing (crate-internal; the public constructors live in
+// `crate::shm`). The handles built here are the ordinary `Producer`/`Anchor`/
+// `Observer` types over region pointers — the hot paths are byte-identical
+// to the heap ring's; only the backing seam (registry/keep-alive) differs.
+// ---------------------------------------------------------------------------
+
+/// The byte stride of one shm slot: `size_of::<Slot<T>>()` — the `repr(C)`
+/// `{ seq: AtomicU64, data: T-storage }` layout the region create/open
+/// validate for exact equality (see `crate::broadcast`'s twin for the
+/// layout math; the header's `unit_size` records `size_of::<T>()`).
+#[cfg(all(feature = "shm", target_os = "linux", target_has_atomic = "64"))]
+pub(crate) fn shm_slot_stride<T>() -> usize {
+    size_of::<Slot<T>>()
+}
+
+/// Alignment of one shm slot (see [`shm_slot_stride`]); the shm buffer
+/// offset is 128-aligned, so alignments above 128 are rejected at
+/// construction.
+#[cfg(all(feature = "shm", target_os = "linux", target_has_atomic = "64"))]
+pub(crate) fn shm_slot_align<T>() -> usize {
+    std::mem::align_of::<Slot<T>>()
+}
+
+/// The default-slack policy, shared with the shm constructors so they cannot
+/// drift from the heap ring's.
+#[cfg(all(feature = "shm", target_os = "linux", target_has_atomic = "64"))]
+pub(crate) const fn shm_default_slack(capacity: u64) -> u64 {
+    default_slack(capacity)
+}
+
+#[cfg(all(feature = "shm", target_os = "linux", target_has_atomic = "64"))]
+impl<T, P, C> Producer<T, P, C>
+where
+    T: NoUninit,
+    P: WaitStrategy,
+    C: WaitStrategy,
+{
+    /// Build a producer over a validated shm region. Seeds `next_seq` from
+    /// the live unified cursor and the gating cache with an always-gating
+    /// value — an attached or recovered producer never trusts defaults
+    /// [M-F17] — then runs **one real table rescan** before returning, so
+    /// the seed is only ever the pre-scan value: without it, `&self`
+    /// [`len`](Producer::len)/[`is_empty`](Producer::is_empty)/
+    /// [`is_full`](Producer::is_full) would report a full ring until the
+    /// first push (the `while producer.is_full() {}` livelock the semantics
+    /// guide warns about).
+    ///
+    /// # Safety
+    ///
+    /// The backing's region must be a validated anchored element ring of
+    /// exactly this `T` and `capacity` (`create`/`open` in `crate::shm`),
+    /// and the backing must hold the producer lease.
+    pub(crate) unsafe fn from_shm(
+        backing: Box<crate::shm::AnchShmProducer<C>>,
+        capacity: usize,
+    ) -> Self {
+        let region = backing.region();
+        let tail = NonNull::from(region.bcast_tail());
+        let closed = NonNull::from(region.bcast_closed());
+        let buf = region
+            .anch_buffer(backing.table_offset(), backing.max_anchors())
+            .cast::<Slot<T>>();
+        // SAFETY: `tail` references the live mapping (per contract).
+        let next_seq = unsafe { tail.as_ref() }.load(Ordering::Acquire);
+        let mut producer = Producer {
+            buf,
+            mask: capacity as u64 - 1,
+            next_seq,
+            // Always-gating seed (lag == capacity): the pre-scan value only
+            // — the rescan below replaces it before anything reads it
+            // [M-F17].
+            cached_min: next_seq.wrapping_sub(capacity as u64),
+            cached_cursors: Vec::new(),
+            tail,
+            closed,
+            backing: ProducerBacking::Shm(backing),
+        };
+        // One real registry rescan at construction: the gating view (and
+        // with it `len`/`is_empty`/`is_full`) reflects the live table from
+        // the start instead of lying "full" until the first push.
+        producer.rescan(1);
+        producer
+    }
+}
+
+#[cfg(all(feature = "shm", target_os = "linux", target_has_atomic = "64"))]
+impl<T, P: WaitStrategy, C: WaitStrategy> Anchor<T, P, C> {
+    /// Build an anchor over a claimed table slot. `read_cursor` is the join
+    /// point from the claim choreography (or the recovery resume point,
+    /// which `recover_shm` stores into the slot before calling this).
+    ///
+    /// # Safety
+    ///
+    /// As for [`Producer::from_shm`]; the backing must hold a slot claimed
+    /// by the `crate::shm` claim choreography whose cursor word currently
+    /// holds (the sentinel-guarded image of) `read_cursor`.
+    pub(crate) unsafe fn from_shm(
+        backing: Box<crate::shm::AnchShmAnchor<P, C>>,
+        capacity: usize,
+        read_cursor: u64,
+    ) -> Self {
+        let region = backing.region();
+        let tail = NonNull::from(region.bcast_tail());
+        let closed = NonNull::from(region.bcast_closed());
+        let cursor_slot =
+            NonNull::from(region.anch_slot_cursor(backing.table_offset(), backing.slot()));
+        let buf = region
+            .anch_buffer(backing.table_offset(), backing.max_anchors())
+            .cast::<Slot<T>>();
+        Anchor {
+            buf,
+            mask: capacity as u64 - 1,
+            cursor_slot,
+            tail,
+            closed,
+            read_cursor,
+            published: guard_sentinel(read_cursor),
+            tail_cache: read_cursor,
+            backing: AnchorBacking::Shm(backing),
+        }
+    }
+
+    /// The anchor-table slot this handle occupies in its shared-memory
+    /// region, or `None` for a heap ring (see
+    /// [`shm_slot_epoch`](Self::shm_slot_epoch) for the pair
+    /// [`force_detach_anchor`](RingBuffer::force_detach_anchor) takes).
+    #[cfg_attr(docsrs, doc(cfg(feature = "shm")))]
+    pub fn shm_slot(&self) -> Option<usize> {
+        self.shm_slot_epoch().map(|(slot, _)| slot)
+    }
+
+    /// The anchor-table `(slot, epoch)` this handle occupies in its
+    /// shared-memory region, or `None` for a heap ring. The pair identifies
+    /// this exact *occupancy* — every claim bumps the slot's epoch — and is
+    /// what [`force_detach_anchor`](RingBuffer::force_detach_anchor) takes,
+    /// so a watchdog holding a dead anchor's pair can never retire a
+    /// healthy successor that re-claimed the slot.
+    #[cfg_attr(docsrs, doc(cfg(feature = "shm")))]
+    pub fn shm_slot_epoch(&self) -> Option<(usize, u32)> {
+        match &self.backing {
+            AnchorBacking::Heap { .. } => None,
+            AnchorBacking::Shm(backing) => Some((backing.slot(), backing.epoch())),
+        }
+    }
+}
+
+#[cfg(all(feature = "shm", target_os = "linux", target_has_atomic = "64"))]
+impl<T, P: WaitStrategy, C: WaitStrategy> Observer<T, P, C> {
+    /// Build an observer over a (typically read-only) mapping of a
+    /// validated shm region: pure reader state — no lease, no table slot,
+    /// nothing written, ever. The join point is the unified cursor at this
+    /// call.
+    ///
+    /// # Safety
+    ///
+    /// The region must be a validated anchored element ring of exactly this
+    /// `T`, `capacity`, and `max_anchors`, with `slack` the region's
+    /// create-time slack (validated `< capacity`).
+    pub(crate) unsafe fn from_shm(
+        region: Arc<crate::shm::ShmRegion>,
+        capacity: usize,
+        slack: u64,
+        max_anchors: usize,
+    ) -> Self {
+        let tail = NonNull::from(region.bcast_tail());
+        let closed = NonNull::from(region.bcast_closed());
+        let buf = region
+            .anch_buffer(crate::shm::ANCH_ELEMS_TABLE_OFFSET, max_anchors)
+            .cast::<Slot<T>>();
+        // SAFETY: `tail` references the live mapping (per contract).
+        let pos = unsafe { tail.as_ref() }.load(Ordering::Acquire);
+        Observer {
+            buf,
+            mask: capacity as u64 - 1,
+            slack,
+            pos,
+            tail_cache: pos,
+            wait: C::default(),
+            tail,
+            closed,
+            backing: ObserverBacking::Shm {
+                region,
+                max_anchors,
+            },
+        }
+    }
+}
+
+/// Subscribe an anchor through a live shm handle: the anchor-table claim
+/// choreography (the shm analog of [`subscribe_from`], with the control-word
+/// CAS as the [M-F2] registration event) plus handle construction. The `Arc`
+/// clone precedes the claim, mirroring [A-2.2]; the post-claim generation
+/// re-check (with its generation-conditional rollback) mirrors the attach
+/// path in `crate::shm`.
+///
+/// # Safety
+///
+/// `region` must be the validated anchored element region (element type
+/// `T`, `capacity` slots, `max_anchors` table slots) the calling handle was
+/// built over.
+#[cfg(all(feature = "shm", target_os = "linux", target_has_atomic = "64"))]
+unsafe fn shm_subscribe_anchor<T, P, C>(
+    region: &Arc<crate::shm::ShmRegion>,
+    max_anchors: usize,
+    capacity: u64,
+) -> Result<Anchor<T, P, C>, SubscribeError>
+where
+    P: WaitStrategy,
+    C: WaitStrategy,
+{
+    const TABLE: usize = crate::shm::ANCH_ELEMS_TABLE_OFFSET;
+    let region = Arc::clone(region);
+    // Seqlock snapshot before the claim: an odd generation is a concurrent
+    // `create_shm`/`recover_shm` mid-rewrite — claiming into a table being
+    // reset would keep a slot the reset frees out from under us.
+    let generation = region.generation();
+    if generation & 1 == 1 {
+        return Err(SubscribeError::Closed);
+    }
+    if region.bcast_closed().load(Ordering::Acquire) != 0 {
+        return Err(SubscribeError::Closed);
+    }
+    let claim =
+        crate::shm::anch_claim_slot(&region, TABLE, max_anchors).ok_or(SubscribeError::Full)?;
+    // Post-claim re-check: a generation change means the table was reset
+    // while we claimed. The rollback is itself generation-conditional, so a
+    // re-initialized table is left strictly alone (at worst one leaked slot
+    // until the next `recover_shm` — a leak, never a clobber). The ring
+    // this handle was subscribed from is gone, which is `Closed`.
+    if region.generation() != generation {
+        crate::shm::anch_release_claim(&region, TABLE, &claim, generation);
+        return Err(SubscribeError::Closed);
+    }
+    let joined = claim.joined;
+    let backing = Box::new(crate::shm::AnchShmAnchor::new(
+        region,
+        claim,
+        max_anchors,
+        TABLE,
+    ));
+    // SAFETY: forwarded caller contract; the claim choreography just ran.
+    Ok(unsafe { Anchor::from_shm(backing, capacity as usize, joined) })
 }
 
 #[cfg(test)]
