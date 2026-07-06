@@ -128,6 +128,13 @@
 //!   unbounded lossy [`Observer`](anchored::Observer)s tap the same stream
 //!   with exact [`Lagged`](anchored::PopError::Lagged) accounting; with zero
 //!   anchors the producer free-runs like the lossy broadcast.
+//! - [`anchored_bytes`] — the composed ring for **variable-size byte
+//!   messages** ([`anchored_bytes::BytesRingBuffer`] and its handles):
+//!   required [`BytesAnchor`](anchored_bytes::BytesAnchor)s parse frames
+//!   zero-copy under the lossless gating contract while unbounded lossy
+//!   [`BytesObserver`](anchored_bytes::BytesObserver)s take validated
+//!   copies with exact byte-count
+//!   [`Lagged`](anchored_bytes::PopError::Lagged) accounting.
 //! - [`wait`] — the [`WaitStrategy`] trait and the [`PauseWait`], [`YieldWait`],
 //!   [`NoOpWait`], [`SleepWait`], [`BackoffWait`], and [`CvWait`]
 //!   implementations selected per side as type parameters `P` (producer) and
@@ -183,6 +190,8 @@ mod cursor;
 #[cfg(target_has_atomic = "64")]
 pub mod anchored;
 #[cfg(target_has_atomic = "64")]
+pub mod anchored_bytes;
+#[cfg(target_has_atomic = "64")]
 pub mod broadcast;
 #[cfg(target_has_atomic = "64")]
 pub mod broadcast_bytes;
@@ -191,7 +200,9 @@ pub mod guide;
 #[cfg(all(feature = "shm", target_os = "linux", target_has_atomic = "64"))]
 #[cfg_attr(docsrs, doc(cfg(feature = "shm")))]
 pub mod shm;
+#[cfg(target_has_atomic = "64")]
 pub mod spmc;
+#[cfg(target_has_atomic = "64")]
 pub mod spmc_bytes;
 pub mod spsc;
 pub mod spsc_bytes;

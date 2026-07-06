@@ -77,8 +77,9 @@
 //! * **Adaptive read-cursor publish** per consumer: immediate when caught
 //!   up, batched (`capacity / 8`, max 4096 bytes) while backed up — plus a
 //!   **lag-filtered starving release**: when the producer signals it is
-//!   starving, only a consumer far enough behind to possibly be the gate
-//!   publishes per message (see [`Msg`]); the other N-1 keep batching.
+//!   starving — the flag carries the blocked push's exact byte span — only
+//!   a consumer far enough behind to possibly be the gate publishes per
+//!   message (see [`Msg`]); the other N-1 keep batching.
 //!
 //! # Gotchas
 //!
@@ -165,11 +166,14 @@ const fn max_message_len(capacity: usize) -> usize {
 /// `R = record_len(max_message_len)` bytes, and padding is written only when
 /// the record does not fit before the end of the buffer, so
 /// `pad = to_end < R`. Both are multiples of [`ALIGN`], hence
-/// `pad <= R - ALIGN` and `pad + record <= 2R - ALIGN`. This is what the
-/// consumers' lag filter (see [`Msg`]) is derived from: a blocked producer
-/// implies its gating consumer's published occupancy exceeds
-/// `capacity - max_record_span`, so a consumer below that cannot be the
-/// gate.
+/// `pad <= R - ALIGN` and `pad + record <= 2R - ALIGN`. This bounds the
+/// *actual* span a starving producer publishes in the flag for the
+/// consumers' lag filter (see [`Msg`]): a blocked producer needs exactly
+/// `span <= max_record_span` bytes free, so its gating consumer's published
+/// occupancy exceeds `capacity - span` — a consumer below that cannot be
+/// the gate. (With this ring's `capacity / 2 - 4` message cap the
+/// worst-case bound itself degenerates to `capacity - ALIGN`, which is why
+/// the filter uses the flagged span, not this constant.)
 #[inline(always)]
 const fn max_record_span(capacity: usize) -> usize {
     2 * record_len(max_message_len(capacity)) - ALIGN
@@ -217,10 +221,11 @@ const fn lacks_space(write: usize, needed: usize, read: usize, capacity: usize) 
 /// The producer-published cache line: the write cursor plus, co-located in
 /// the same padded slot, the `closed` flag (written once by
 /// `BytesProducer::drop`, read only on consumer would-block paths) and the
-/// `starving` flag (raised by the producer when a space check fails against
-/// the freshest registry scan, cleared with hysteresis; read by consumers on
-/// message release, behind the lag filter). Consumers already poll this line
-/// for the write cursor, so neither flag adds coherence traffic.
+/// `starving` word (holds the blocked push's required byte span while the
+/// producer starves — the consumers' exact release threshold — and 0
+/// otherwise; written on span change, cleared with hysteresis; read by
+/// consumers on message release). Consumers already poll this line for the
+/// write cursor, so neither flag adds coherence traffic.
 struct WriteSide {
     write_cursor: AtomicUsize,
     /// 0 = open, nonzero = closed. A whole word (not a bool) so the shm
@@ -912,7 +917,12 @@ where
     /// maintains the starving flag with hysteresis (mirrors the SPSC byte
     /// engine): raised once per episode when even a full rescan leaves no
     /// room, kept up while space only appears via rescans, cleared once the
-    /// cached check passes comfortably.
+    /// cached check passes comfortably. The flag carries the blocked push's
+    /// **actual required span** (`needed` = pad + record bytes), which is
+    /// what makes the consumers' release threshold `capacity - span` exact:
+    /// while one push is blocked the write cursor cannot move, so `frame`
+    /// is deterministic and every check of the episode carries the same
+    /// span.
     #[inline(always)]
     fn has_space(&mut self, needed: usize) -> bool {
         if lacks_space(self.next_seq, needed, self.cached_min, self.mask + 1) {
@@ -923,13 +933,18 @@ where
                 return true;
             }
             // Starving: even the freshest registry scan leaves no room.
-            // Raise the flag once per episode (set-if-zero: while starvation
-            // persists this is a read of a line the producer polls anyway)
-            // so the gating consumer's lag-filtered release can free us.
+            // Publish the episode's span once per change (set-if-different:
+            // while one episode persists this is a read of a line the
+            // producer polls anyway) so the gating consumer's lag-filtered
+            // release can free us with an exact threshold.
+            debug_assert!(
+                needed <= max_record_span(self.mask + 1),
+                "a legal frame never exceeds max_record_span"
+            );
             // SAFETY: `starving` points into the live shared state.
             let starving = unsafe { self.starving.as_ref() };
-            if starving.load(Ordering::Relaxed) == 0 {
-                starving.store(1, Ordering::Release);
+            if starving.load(Ordering::Relaxed) != needed {
+                starving.store(needed, Ordering::Release);
             }
             self.raised_starving = true;
             return false;
@@ -1498,29 +1513,28 @@ where
     /// while backed up — plus the **lag-filtered starving release** [M-F8]:
     /// when the producer's starving flag is up, publish immediately, but
     /// only if this consumer could actually be the gate. The filter is
-    /// consumer-local: a blocked producer needs at most
-    /// [`max_record_span`] bytes free, so its gating consumer's *published*
-    /// occupancy exceeds `capacity - max_record_span`; a consumer below
-    /// that threshold provably is not the gate and keeps batching. The
+    /// consumer-local: the flag carries the blocked push's **actual
+    /// required span** (pad + record bytes — constant for the whole
+    /// episode, because the blocked producer's write cursor cannot move and
+    /// the framing is a pure function of it), so the gating consumer's
+    /// *published* occupancy provably exceeds `capacity - span`; a consumer
+    /// below that exact threshold is not the gate and keeps batching. The
     /// check runs against `published` — not the private cursor — so
     /// deferred progress and skipped wrap padding cannot make a true gate
     /// look innocent.
     ///
-    /// Honesty note on the filter's strength: `max_record_span` is derived
-    /// from the *worst-case* record (`2·record_len(max) − ALIGN` =
-    /// `capacity − ALIGN`), so the threshold reduces to `ALIGN` bytes of
-    /// published occupancy — only fully-caught-up consumers are filtered;
-    /// any consumer with one unpublished record reacts during a starvation
-    /// episode. That still stops caught-up consumers from flooding, but a
-    /// tighter filter needs the producer's *actual* required span (tracked
-    /// as a bench-guided refinement in bd).
+    /// The filter stays conservative under staleness: a stale `write_cache`
+    /// can only *under*-state occupancy (defer the flush, never publish a
+    /// wrong cursor), and a deferred gate still flushes on the caught-up or
+    /// batch triggers below, which bounds the producer's extra wait by one
+    /// refresh cycle.
     #[inline(always)]
     fn advance(&mut self, amount: usize) {
         let capacity = self.mask + 1;
         // SAFETY: `starving` points into the live shared state.
-        let publish_now = self.write_cache.wrapping_sub(self.published)
-            >= capacity - max_record_span(capacity)
-            && unsafe { self.starving.as_ref() }.load(Ordering::Acquire) != 0;
+        let span = unsafe { self.starving.as_ref() }.load(Ordering::Acquire);
+        let publish_now =
+            span != 0 && self.write_cache.wrapping_sub(self.published) >= capacity - span;
         self.read_cursor = self.read_cursor.wrapping_add(amount);
         if publish_now
             || self.read_cursor == self.write_cache
@@ -1623,7 +1637,9 @@ impl<P: WaitStrategy, C: WaitStrategy> Drop for Msg<'_, P, C> {
 impl<P: WaitStrategy, C: WaitStrategy> BytesProducer<P, C> {
     /// Build a producer over a validated shm region (see
     /// `crate::spmc::Producer::from_shm` — same always-gating cache seeding
-    /// [M-F17]; the caller has already reset the starving flag, mirroring
+    /// [M-F17] followed by one real construction-time rescan, so
+    /// [`is_empty`](BytesProducer::is_empty) never lies "full" before the
+    /// first push; the caller has already reset the starving flag, mirroring
     /// the SPSC engine's attach).
     ///
     /// # Safety
@@ -1641,11 +1657,12 @@ impl<P: WaitStrategy, C: WaitStrategy> BytesProducer<P, C> {
         let buf = region.spmc_buffer(anchor.max_consumers()).cast::<Word>();
         // SAFETY: `write_cursor` references the live mapping (per contract).
         let next_seq = unsafe { write_cursor.as_ref() }.load(Ordering::Acquire);
-        BytesProducer {
+        let mut producer = BytesProducer {
             buf,
             mask: capacity - 1,
             next_seq,
-            // Always-gating seed: first push rescans the live table [M-F17].
+            // Always-gating seed — the pre-scan value only [M-F17]; the
+            // rescan below replaces it before anything reads it.
             cached_min: next_seq.wrapping_sub(capacity),
             cached_cursors: Vec::new(),
             raised_starving: false,
@@ -1653,7 +1670,12 @@ impl<P: WaitStrategy, C: WaitStrategy> BytesProducer<P, C> {
             closed,
             starving,
             anchor: ProducerAnchor::Shm(anchor),
-        }
+        };
+        // One real registry rescan at construction (see the element twin):
+        // the gating view reflects the live table from the start instead of
+        // lying "full" until the first push.
+        producer.rescan(1);
+        producer
     }
 }
 
@@ -1694,14 +1716,27 @@ impl<P: WaitStrategy, C: WaitStrategy> BytesConsumer<P, C> {
     }
 
     /// The consumer-table slot this handle occupies in its shared-memory
-    /// region, or `None` for a heap ring. Slot indices are what
+    /// region, or `None` for a heap ring (see
+    /// [`shm_slot_epoch`](Self::shm_slot_epoch) for the pair
     /// [`force_detach_consumer`](BytesRingBuffer::force_detach_consumer)
-    /// takes.
+    /// takes).
     #[cfg_attr(docsrs, doc(cfg(feature = "shm")))]
     pub fn shm_slot(&self) -> Option<usize> {
+        self.shm_slot_epoch().map(|(slot, _)| slot)
+    }
+
+    /// The consumer-table `(slot, epoch)` this handle occupies in its
+    /// shared-memory region, or `None` for a heap ring. The pair identifies
+    /// this exact *occupancy* — every claim bumps the slot's epoch — and is
+    /// what
+    /// [`force_detach_consumer`](BytesRingBuffer::force_detach_consumer)
+    /// takes, so a watchdog holding a dead consumer's pair can never retire
+    /// a healthy successor that re-claimed the slot.
+    #[cfg_attr(docsrs, doc(cfg(feature = "shm")))]
+    pub fn shm_slot_epoch(&self) -> Option<(usize, u32)> {
         match &self.anchor {
             ConsumerAnchor::Heap { .. } => None,
-            ConsumerAnchor::Shm(anchor) => Some(anchor.slot()),
+            ConsumerAnchor::Shm(anchor) => Some((anchor.slot(), anchor.epoch())),
         }
     }
 }
@@ -1725,10 +1760,20 @@ where
     C: WaitStrategy,
 {
     let region = Arc::clone(region);
+    // Seqlock snapshot + post-claim re-check, exactly as in
+    // `crate::spmc::shm_subscribe` (see there for the reset-race rationale).
+    let generation = region.generation();
+    if generation & 1 == 1 {
+        return Err(SubscribeError::Closed);
+    }
     if region.spmc_closed().load(Ordering::Acquire) != 0 {
         return Err(SubscribeError::Closed);
     }
     let claim = crate::shm::spmc_claim_slot(&region, max_consumers).ok_or(SubscribeError::Full)?;
+    if region.generation() != generation {
+        crate::shm::spmc_release_claim(&region, &claim, generation);
+        return Err(SubscribeError::Closed);
+    }
     let joined = claim.joined;
     let anchor = Box::new(crate::shm::SpmcConsumerAnchor::new(
         region,

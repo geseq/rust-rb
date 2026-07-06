@@ -4,6 +4,8 @@
 //! (mid-stream subscribe at a record boundary, detach, free-run), the closed
 //! contract, the lag-filtered starving release, and forget-redelivery.
 
+#![cfg(target_has_atomic = "64")]
+
 use rust_rb::spmc_bytes::{BytesConsumer, BytesProducer, BytesRingBuffer, Closed, SubscribeError};
 use rust_rb::wait::{BackoffWait, NoOpWait, PauseWait, SelfTimed, YieldWait};
 
@@ -548,7 +550,10 @@ fn blocking_pop_returns_when_producer_drops() {
 /// padding, via the lag-filtered starving flush — the freed 24 bytes are far
 /// below the 128-byte publish batch, so only the immediate trigger can wake
 /// the producer here (port of the SPSC `pop_releases_producer_blocked_on_
-/// padding` regressions to multi-consumer).
+/// padding` regressions to multi-consumer). The starving flag carries the
+/// blocked push's exact span — pad(16) + record(24) = 40 bytes — so the
+/// release threshold is `capacity - 40 = 984` bytes of published occupancy:
+/// the gate (1008 bytes behind) must pass it and flush immediately.
 #[test]
 fn gating_pop_releases_producer_blocked_on_padding() {
     let (mut tx, mut gate) = BytesRingBuffer::new(1024);

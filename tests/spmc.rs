@@ -4,6 +4,8 @@
 //! detach, free-run), the closed contract, drop-on-overwrite accounting, and
 //! panic injection at every user-code call point.
 
+#![cfg(target_has_atomic = "64")]
+
 use rust_rb::spmc::{Closed, Consumer, Producer, RingBuffer, SubscribeError};
 use rust_rb::wait::{BackoffWait, NoOpWait, PauseWait, SelfTimed, YieldWait};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};

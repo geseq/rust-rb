@@ -828,8 +828,11 @@ impl<T: NoUninit, C: WaitStrategy> Consumer<T, C> {
     #[inline]
     pub fn skip_to_latest(&mut self) -> u64 {
         let tail = self.refresh();
-        let skipped = tail - self.pos;
-        self.pos = tail;
+        let skipped = tail.saturating_sub(self.pos);
+        // Never move backwards (mirrors the byte twin): a position ahead of
+        // a stale tail observation must clamp, not regress — an unchecked
+        // `tail - pos` would also underflow-panic there.
+        self.pos = self.pos.max(tail);
         skipped
     }
 

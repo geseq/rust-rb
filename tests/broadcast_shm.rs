@@ -24,6 +24,7 @@ type BytesRing = BytesRingBuffer<YieldWait>;
 const OFF_CAPACITY: usize = 16;
 const OFF_GENERATION: usize = 56;
 const OFF_TAIL: usize = 128;
+const OFF_CLOSED: usize = 136;
 const OFF_SLACK: usize = 144;
 const OFF_INTENT: usize = 256;
 const OFF_LATEST: usize = 384;
@@ -622,6 +623,60 @@ fn producer_crash_recovery_bytes_heals_intent_and_latest() {
     let mut tx3 = unsafe { BytesRing::recover_shm(fd.as_fd()) }.unwrap();
     tx3.push(b"rec-ok");
     assert_eq!(&*rx.pop().unwrap(), b"rec-ok");
+}
+
+/// A lapped consumer facing a producer that died between its `latest` and
+/// `tail` stores (`latest` is stored first, so it can point past the
+/// committed tail — the never-healed state, no recovery attach here). The
+/// reposition lands at the dead `latest` — past the committed tail — where
+/// the availability check guarantees no read will ever run (no tail covers
+/// the position). The load-bearing regression is the close-out: the
+/// drained check must be `tail <= pos`, not equality — an equality check
+/// never fires for a position stranded past the final tail, and the
+/// consumer's drain would livelock on the dead ring instead of reporting
+/// `Closed`.
+#[test]
+fn dead_producer_latest_past_tail_drains_to_closed() {
+    let fd = memfd("bcast-latest-past-tail").unwrap();
+    // SAFETY: fresh private memfd.
+    let mut tx = unsafe { BytesRing::create_shm(fd.as_fd(), 64) }.unwrap();
+    // The consumer joins at tail 0 and never pops: it will be lapped.
+    // SAFETY: cooperating handles only.
+    let mut rx = unsafe { BytesRing::attach_shm_consumer(fd.as_fd()) }.unwrap();
+    for seq in 0..5u64 {
+        tx.push(&seq.to_le_bytes()); // 16-byte records: tail = 80 (one lap)
+    }
+    std::mem::forget(tx); // crash: lease held, counters as-is
+
+    // Inject the mid-push death: the dead producer declared 16 more bytes
+    // and stored `latest` for the never-committed record (8 bytes of wrap
+    // padding: latest = 88 > tail = 80), then died before the tail store.
+    poke_u64(fd.as_fd(), OFF_INTENT, 96);
+    poke_u64(fd.as_fd(), OFF_LATEST, 88);
+    assert_eq!(peek_u64(fd.as_fd(), OFF_TAIL), 80);
+    // The producer is gone for good; mark the session closed (what its
+    // graceful drop would have stored) so the drain can terminate.
+    poke_u64(fd.as_fd(), OFF_CLOSED, 1);
+
+    // The lap: the jump target is the dead producer's `latest` (88) — 8
+    // declared-but-never-committed bytes past the tail. That is safe (no
+    // read can run there: no tail ever covers the position) and the
+    // accounting stays position-gap-free.
+    match rx.try_pop() {
+        Err(BytesPopError::Lagged { missed_bytes }) => assert_eq!(
+            missed_bytes, 88,
+            "reposition jumps to the dead latest (position accounting stays gap-free)"
+        ),
+        other => panic!("expected the lap, got {other:?}"),
+    }
+    // Position 88 is stranded PAST the final tail (80): only the `<=`
+    // drained check reports Closed here — `==` would spin this drain
+    // forever on the dead ring.
+    assert_eq!(
+        rx.pop().unwrap_err(),
+        BytesPopError::Closed,
+        "the drain must terminate on the dead ring"
+    );
 }
 
 // ---------------------------------------------------------------------------

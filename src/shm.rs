@@ -35,11 +35,15 @@
 //! 136  closed    usize (atomic) SPMC + broadcast kinds: graceful-close flag
 //!                         (in the write-cursor slot — the line consumers
 //!                         poll)
-//! 144  aux       usize (atomic) SPMC kinds: starving flag (byte ring) /
+//! 144  aux       usize (atomic) SPMC kinds: starving word (byte ring) /
 //!                         dropped_through (element ring; unused, `ShmItem`
 //!                         has no drop) — same padded slot.
 //!                         Broadcast element kind: the u64 reposition slack
 //!                         (create-time config, read once at attach).
+//! 152  stride    u64      broadcast kinds only: exact byte stride of one
+//!                         capacity unit (element slot stride; 1 for the
+//!                         byte kind) — written at create, validated for
+//!                         equality on every open; 0 on every other kind
 //! 256  read_cursor   usize (atomic, own 128-byte slot; SPSC kinds only)
 //!                         broadcast BYTE kind: the u64 `tail_intent`
 //!                         (declared write frontier, own padded slot)
@@ -219,6 +223,15 @@ const OFF_BCAST_CLOSED: usize = OFF_WRITE_CURSOR + 8;
 /// in the tail slot's third word — written only at create, so it adds no
 /// write traffic to the polled line.
 const OFF_BCAST_SLACK: usize = OFF_WRITE_CURSOR + 16;
+/// Broadcast kinds: the exact byte stride of one capacity unit in the file
+/// (the element kind's slot stride — seq word + payload, alignment-padded;
+/// 1 for the byte kind). Written only at create, in the tail slot's fourth
+/// word next to `closed`/`slack`; validated for **exact equality** on every
+/// open. `unit_size` alone (`size_of::<T>()`) cannot distinguish two types
+/// of equal size but different alignment, and a length check only rejects
+/// *larger* strides — a lower-alignment `T` would silently misindex every
+/// slot.
+const OFF_BCAST_STRIDE: usize = OFF_WRITE_CURSOR + 24;
 /// Broadcast byte kind: `tail_intent` (the declared write frontier, stored
 /// per push, loaded twice per pop) in its own 128-byte slot — the SPSC
 /// read-cursor slot, which is meaningless for a lossy ring.
@@ -658,6 +671,12 @@ fn create_region(
         region
             .atomic::<AtomicU32>(OFF_ARCH_BITS)
             .store(usize::BITS, Ordering::Relaxed);
+        // The consumer-table size is an SPMC-kind field; keep it
+        // deterministically zero on the SPSC kinds — a reused fd may carry a
+        // previous SPMC ring's non-zero value here.
+        region
+            .atomic::<AtomicU32>(OFF_MAX_CONSUMERS)
+            .store(0, Ordering::Relaxed);
         let pt = lease_token();
         let ct = lease_token();
         region
@@ -674,6 +693,12 @@ fn create_region(
             .store(0, Ordering::Relaxed);
         region
             .atomic::<AtomicUsize>(OFF_STARVING)
+            .store(0, Ordering::Relaxed);
+        // The stride word is a broadcast-kind field; keep it
+        // deterministically zero here too (a reused fd may carry a previous
+        // broadcast ring's stride).
+        region
+            .atomic::<AtomicU64>(OFF_BCAST_STRIDE)
             .store(0, Ordering::Relaxed);
         // Publish the magic last with Release: an attacher that Acquire-loads
         // it sees every header field above.
@@ -843,6 +868,14 @@ impl ShmRegion {
     pub(crate) fn spmc_aux(&self) -> &AtomicUsize {
         // SAFETY: OFF_SPMC_AUX is 8-aligned and inside the mapping.
         unsafe { self.atomic(OFF_SPMC_AUX) }
+    }
+
+    /// The region's seqlock generation (Acquire), for the in-process
+    /// subscribe paths' claim re-check (the shm attach paths read the same
+    /// word through `open_*_region`).
+    pub(crate) fn generation(&self) -> u64 {
+        // SAFETY: OFF_GENERATION is 8-aligned and inside the mapping.
+        unsafe { self.atomic::<AtomicU64>(OFF_GENERATION) }.load(Ordering::Acquire)
     }
 
     /// Byte offset of a consumer-table slot field.
@@ -1406,8 +1439,9 @@ where
 // Consumers hold *per-slot* leases inside the consumer table instead of the
 // single `OFF_CONSUMER_LEASE`: membership is dynamic, so exclusivity is per
 // slot, not per role. The zombie answer [A-4.1] is slot retirement: the
-// control word carries `{epoch | state}`, `force_detach_consumer` bumps the
-// epoch and sets RETIRED, and a retired slot is never re-issued until
+// control word carries `{epoch | state}`, `force_detach_consumer` is a
+// compare-and-retire (`ACTIVE@epoch -> RETIRED@epoch+1`, refusing a
+// mismatched occupancy), and a retired slot is never re-issued until
 // `recover_shm` resets the whole table. A live "zombie" (a wrong death
 // assertion) keeps flushing into a slot no scan reads — the blast radius is
 // one burned slot plus the zombie's own reads losing gating protection
@@ -1449,6 +1483,14 @@ fn create_spmc_region(
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "max_consumers must be at least 1",
+        ));
+    }
+    // The header stores the table size as a u32: reject anything the store
+    // below would silently truncate (before any layout math trusts it).
+    if max_consumers > u32::MAX as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "max_consumers exceeds the header field width (u32)",
         ));
     }
     let len = spmc_region_len(capacity, unit_size, max_consumers)?;
@@ -1504,6 +1546,12 @@ fn create_spmc_region(
             .store(0, Ordering::Relaxed);
         region
             .atomic::<AtomicUsize>(OFF_SPMC_AUX)
+            .store(0, Ordering::Relaxed);
+        // The stride word is a broadcast-kind field; keep it
+        // deterministically zero on the SPMC kinds (a reused fd may carry a
+        // previous broadcast ring's stride).
+        region
+            .atomic::<AtomicU64>(OFF_BCAST_STRIDE)
             .store(0, Ordering::Relaxed);
         // Table + buffer: zero wholesale (leases 0, controls FREE@0; also
         // pre-faults every page and matches the zeroed-buffer guarantee),
@@ -1629,8 +1677,12 @@ pub(crate) struct SlotClaim {
 /// RETIRED slots stay unavailable until `recover_shm`).
 ///
 /// Order (each step before the next):
-/// 1. CAS control `FREE@e -> ACTIVE@e` — the claim and the **registration
-///    event** in one RMW, strictly BEFORE the SeqCst fence: the producer's
+/// 1. CAS control `FREE@e -> ACTIVE@e+1` — the claim and the **registration
+///    event** in one RMW (the epoch bump gives every *occupancy* of a slot
+///    a distinct epoch, which is what lets `force_detach_consumer` prove it
+///    is retiring the occupancy the caller diagnosed dead and not a
+///    successor that re-claimed a gracefully freed slot), strictly BEFORE
+///    the SeqCst fence: the producer's
 ///    rescan observes consumers only through the control word, so this is
 ///    the store the [M-F2] fence dichotomy is about (set after the fence, a
 ///    scan could miss the slot *while* the re-read below returns a stale
@@ -1656,7 +1708,10 @@ pub(crate) fn spmc_claim_slot(region: &ShmRegion, max_consumers: usize) -> Optio
             if control_state(current) != STATE_FREE {
                 continue 'slots;
             }
-            let epoch = control_epoch(current);
+            // Bump the epoch on claim: each occupancy of the slot gets its
+            // own epoch (graceful detach keeps it, so FREE@e means "last
+            // occupied by epoch e").
+            let epoch = control_epoch(current).wrapping_add(1);
             match control.compare_exchange(
                 current,
                 control_word(epoch, STATE_ACTIVE),
@@ -1690,8 +1745,25 @@ pub(crate) fn spmc_claim_slot(region: &ShmRegion, max_consumers: usize) -> Optio
 
 /// Roll a just-made claim back (attach-time seqlock conflict): the graceful
 /// detach sequence minus the flush — sentinel, then availability, then the
-/// lease.
-fn spmc_release_claim(region: &ShmRegion, claim: &SlotClaim) {
+/// lease — **but only while the region generation still equals
+/// `generation`, the one the claim was made under**. A generation change
+/// means a concurrent `create_shm`/`recover_shm` reset the whole table (and
+/// restarted epochs), so the words this claim wrote no longer belong to it:
+/// an unconditional rollback could store the sentinel over a *new* ring's
+/// freshly-claimed cursor and CAS its `ACTIVE@e` control (epochs restart, so
+/// `e` can collide) back to FREE. In that case the only safe move is to
+/// touch nothing — at worst our claim landed after the reset and leaks one
+/// slot in the new table until the next `recover_shm`, which is the safe
+/// direction (a leak, never a clobber). Under an unchanged generation the
+/// claimant still owns the ACTIVE slot exclusively (only `force_detach` can
+/// move it, and the epoch-conditional CAS below fails harmlessly on a
+/// retired slot), so the sentinel store and the CASes are sound.
+pub(crate) fn spmc_release_claim(region: &ShmRegion, claim: &SlotClaim, generation: u64) {
+    // SAFETY: OFF_GENERATION is 8-aligned and inside the mapping.
+    let gen_now = unsafe { region.atomic::<AtomicU64>(OFF_GENERATION) }.load(Ordering::Acquire);
+    if gen_now != generation {
+        return;
+    }
     region
         .slot_cursor(claim.slot)
         .store(SLOT_DETACHED, Ordering::Release);
@@ -1709,20 +1781,33 @@ fn spmc_release_claim(region: &ShmRegion, claim: &SlotClaim) {
     );
 }
 
-/// Retire a consumer-table slot [A-4.1]: bump the epoch, set RETIRED. The
-/// slot is never re-issued until `recover_shm`; the (possibly live) previous
-/// holder's stores land on words nobody reads. The lease and cursor words
-/// are left as-is — they are dead until the table reset.
-fn spmc_force_detach(region: &ShmRegion, slot: usize) {
-    let control = region.slot_control(slot);
-    let mut current = control.load(Ordering::Acquire);
-    loop {
-        let next = control_word(control_epoch(current).wrapping_add(1), STATE_RETIRED);
-        match control.compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire) {
-            Ok(_) => return,
-            Err(fresh) => current = fresh,
-        }
-    }
+/// Retire a consumer-table slot [A-4.1]: one compare-and-retire CAS
+/// `ACTIVE@epoch -> RETIRED@epoch+1`. The epoch is the caller's proof that
+/// it is retiring the *same occupancy it diagnosed dead* (each claim bumps
+/// the epoch, so a healthy consumer that re-claimed the slot after the dead
+/// one gracefully freed it holds a different epoch and the CAS fails instead
+/// of retiring the living). A retired slot is never re-issued until
+/// `recover_shm`; the (possibly live) previous holder's stores land on words
+/// nobody reads. The lease and cursor words are left as-is — they are dead
+/// until the table reset.
+fn spmc_force_detach(region: &ShmRegion, slot: usize, epoch: u32) -> io::Result<()> {
+    region
+        .slot_control(slot)
+        .compare_exchange(
+            control_word(epoch, STATE_ACTIVE),
+            control_word(epoch.wrapping_add(1), STATE_RETIRED),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .map(drop)
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "slot epoch mismatch — the slot no longer belongs to the \
+                 consumer you diagnosed (freed, re-claimed, or already \
+                 retired)",
+            )
+        })
 }
 
 /// Reset the whole consumer table (recover): compute the at-least-once
@@ -1731,7 +1816,19 @@ fn spmc_force_detach(region: &ShmRegion, slot: usize) {
 /// producer had already stopped honoring) — then free every slot with a
 /// bumped epoch, a zeroed lease, and the detached sentinel. Returns the
 /// resume cursor (the write cursor itself when no consumer had registered).
+///
+/// The rewrite is armed with the region seqlock exactly like
+/// `create_spmc_region`'s (odd generation before the first table write,
+/// `+2` close after the last): the reset is a re-initialization event for
+/// the table, and without the bump a concurrent attach/subscribe whose claim
+/// interleaves the rewrite would pass its post-claim generation re-check and
+/// keep a slot the reset just freed out from under it.
 fn spmc_reset_table(region: &ShmRegion, max_consumers: usize, capacity: usize) -> usize {
+    // Seqlock open (see `create_region` for the ordering rationale).
+    // SAFETY: OFF_GENERATION is 8-aligned and inside the mapping.
+    let generation = unsafe { region.atomic::<AtomicU64>(OFF_GENERATION) };
+    let g = generation.load(Ordering::Relaxed);
+    generation.store(g | 1, Ordering::SeqCst);
     let write = region.spmc_write_cursor().load(Ordering::Acquire);
     let mut max_lag = 0usize;
     for slot in 0..max_consumers {
@@ -1760,6 +1857,8 @@ fn spmc_reset_table(region: &ShmRegion, max_consumers: usize, capacity: usize) -
             Ordering::Release,
         );
     }
+    // Seqlock close: even generation, strictly greater than before.
+    generation.store((g | 1).wrapping_add(1), Ordering::Release);
     write.wrapping_sub(max_lag)
 }
 
@@ -1883,6 +1982,12 @@ impl<P, C> SpmcConsumerAnchor<P, C> {
         self.slot
     }
 
+    /// The epoch this handle's slot was claimed at — the occupancy proof
+    /// `force_detach_consumer` takes.
+    pub(crate) fn epoch(&self) -> u32 {
+        self.epoch
+    }
+
     pub(crate) fn max_consumers(&self) -> usize {
         self.max_consumers
     }
@@ -1976,7 +2081,9 @@ fn spmc_attach_consumer_anchor<P: Default, C: Default>(
     // SAFETY: OFF_GENERATION is 8-aligned and inside the mapping.
     let gen_now = unsafe { region.atomic::<AtomicU64>(OFF_GENERATION) }.load(Ordering::Acquire);
     if gen_now != opened.generation {
-        spmc_release_claim(&region, &claim);
+        // Conditional rollback: `spmc_release_claim` re-checks the
+        // generation and leaves a re-initialized table strictly alone.
+        spmc_release_claim(&region, &claim, opened.generation);
         return Err(io::Error::new(
             io::ErrorKind::AddrInUse,
             "ring was re-initialized during attach",
@@ -2179,20 +2286,31 @@ where
     }
 
     /// Retire consumer-table slot `slot` [A-4.1]: bump its epoch and mark it
-    /// RETIRED. The producer's next rescan stops honoring the slot's cursor
-    /// (un-gating a producer blocked on a dead consumer); the slot is
-    /// **never re-issued** until [`recover_shm`](crate::spmc::RingBuffer::recover_shm)
-    /// resets the table.
+    /// RETIRED, **iff it is still `ACTIVE` at `epoch`**. `(slot, epoch)` is
+    /// what the victim's [`Consumer::shm_slot_epoch`](crate::spmc::Consumer::shm_slot_epoch)
+    /// reported: the epoch is how the caller proves it is retiring the same
+    /// occupancy it observed dead — every claim bumps the slot's epoch, so
+    /// if the dead consumer's slot was gracefully freed and re-claimed by a
+    /// healthy consumer in the meantime, the epochs differ and this fails
+    /// with `InvalidInput` instead of retiring the living. The producer's
+    /// next rescan stops honoring a retired slot's cursor (un-gating a
+    /// producer blocked on a dead consumer); the slot is **never re-issued**
+    /// until [`recover_shm`](crate::spmc::RingBuffer::recover_shm) resets
+    /// the table.
     ///
     /// # Safety
     ///
-    /// The caller asserts the slot's holder is **dead**. This is the same
-    /// trust register as `force_attach`: if the holder is actually alive,
-    /// the ring itself stays consistent (the zombie's flushes land on the
-    /// retired slot, which nothing reads), but the zombie's **reads lose all
-    /// gating protection** — the producer may overwrite data it still
+    /// The caller asserts the holder of `(slot, epoch)` is **dead**. This is
+    /// the same trust register as `force_attach`: if the holder is actually
+    /// alive, the ring itself stays consistent (the zombie's flushes land on
+    /// the retired slot, which nothing reads), but the zombie's **reads lose
+    /// all gating protection** — the producer may overwrite data it still
     /// borrows. `force_detach_consumer` revokes the victim's read validity.
-    pub unsafe fn force_detach_consumer(fd: BorrowedFd<'_>, slot: usize) -> io::Result<()> {
+    pub unsafe fn force_detach_consumer(
+        fd: BorrowedFd<'_>,
+        slot: usize,
+        epoch: u32,
+    ) -> io::Result<()> {
         let opened = Self::open(fd)?;
         if slot >= opened.max_consumers {
             return Err(io::Error::new(
@@ -2200,8 +2318,7 @@ where
                 "slot index out of range for this ring's consumer table",
             ));
         }
-        spmc_force_detach(&opened.region, slot);
-        Ok(())
+        spmc_force_detach(&opened.region, slot, epoch)
     }
 
     /// [`recover_shm`](crate::spmc::RingBuffer::recover_shm) with explicit
@@ -2390,14 +2507,20 @@ where
         Ok(unsafe { crate::spmc_bytes::BytesConsumer::from_shm(anchor, opened.capacity, joined) })
     }
 
-    /// Retire consumer-table slot `slot` (see
-    /// [`spmc::RingBuffer::force_detach_consumer`](crate::spmc::RingBuffer::force_detach_consumer)).
+    /// Retire consumer-table slot `slot` iff still `ACTIVE` at `epoch` (see
+    /// [`spmc::RingBuffer::force_detach_consumer`](crate::spmc::RingBuffer::force_detach_consumer);
+    /// `(slot, epoch)` comes from the victim's
+    /// [`BytesConsumer::shm_slot_epoch`](crate::spmc_bytes::BytesConsumer::shm_slot_epoch)).
     ///
     /// # Safety
     ///
-    /// The caller asserts the slot's holder is dead; a live holder's reads
-    /// lose all gating protection (revoked read validity).
-    pub unsafe fn force_detach_consumer(fd: BorrowedFd<'_>, slot: usize) -> io::Result<()> {
+    /// The caller asserts the holder of `(slot, epoch)` is dead; a live
+    /// holder's reads lose all gating protection (revoked read validity).
+    pub unsafe fn force_detach_consumer(
+        fd: BorrowedFd<'_>,
+        slot: usize,
+        epoch: u32,
+    ) -> io::Result<()> {
         let opened = Self::open(fd)?;
         if slot >= opened.max_consumers {
             return Err(io::Error::new(
@@ -2405,8 +2528,7 @@ where
                 "slot index out of range for this ring's consumer table",
             ));
         }
-        spmc_force_detach(&opened.region, slot);
-        Ok(())
+        spmc_force_detach(&opened.region, slot, epoch)
     }
 
     /// [`recover_shm`](crate::spmc_bytes::BytesRingBuffer::recover_shm) with
@@ -2546,6 +2668,12 @@ fn create_bcast_region(
         region
             .atomic::<AtomicU64>(OFF_BCAST_SLACK)
             .store(slack, Ordering::Relaxed);
+        // The exact per-unit stride: open validates it for equality —
+        // `unit_size` cannot distinguish same-size/different-alignment
+        // element types, whose strides (and thus slot offsets) differ.
+        region
+            .atomic::<AtomicU64>(OFF_BCAST_STRIDE)
+            .store(stride as u64, Ordering::Relaxed);
         // Publish the magic last with Release, then close the seqlock.
         region
             .atomic::<AtomicU64>(OFF_MAGIC)
@@ -2626,6 +2754,12 @@ fn open_bcast_region(
     let slack = header.read_u64(OFF_BCAST_SLACK);
     if slack >= capacity as u64 {
         return Err(err("corrupt slack: not below the capacity"));
+    }
+    // Exact-stride check: the length check below only rejects *smaller*
+    // regions, so a `T` with the created type's size but a lower alignment
+    // (smaller stride) would otherwise be accepted and misindex every slot.
+    if header.read_u64(OFF_BCAST_STRIDE) != stride as u64 {
+        return Err(err("element slot stride mismatch"));
     }
     drop(header);
 

@@ -1479,9 +1479,12 @@ where
     /// published but unread. Returns how many messages were skipped.
     #[inline]
     pub fn skip_to_latest(&mut self) -> u64 {
+        // Saturate + never move backwards (mirrors the broadcast twins):
+        // a stale tail observation must not underflow the count or drag
+        // the position back.
         let tail = self.refresh();
-        let skipped = tail - self.pos;
-        self.pos = tail;
+        let skipped = tail.saturating_sub(self.pos);
+        self.pos = self.pos.max(tail);
         skipped
     }
 
@@ -1545,7 +1548,9 @@ where
         // SAFETY: `closed` points into the live shared state.
         if unsafe { self.closed.as_ref() }.load(Ordering::Acquire) != 0 {
             self.refresh();
-            if self.tail_cache == self.pos {
+            // Drained is `<=`, not `==` (mirrors the broadcast twins): a
+            // position past a stale tail must still terminate the drain.
+            if self.tail_cache <= self.pos {
                 return Err(PopError::Closed);
             }
         }

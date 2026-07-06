@@ -83,6 +83,27 @@ impl Pipe {
             1
         );
     }
+
+    /// Send a `u32` payload (the child reports its slot epoch this way — a
+    /// pipe write of 4 bytes is atomic).
+    fn send_u32(&self, v: u32) {
+        let b = v.to_ne_bytes();
+        // SAFETY: valid fd and buffer.
+        assert_eq!(
+            unsafe { libc::write(self.w.as_raw_fd(), b.as_ptr().cast(), 4) },
+            4
+        );
+    }
+
+    fn recv_u32(&self) -> u32 {
+        let mut b = [0u8; 4];
+        // SAFETY: valid fd and buffer.
+        assert_eq!(
+            unsafe { libc::read(self.r.as_raw_fd(), b.as_mut_ptr().cast(), 4) },
+            4
+        );
+        u32::from_ne_bytes(b)
+    }
 }
 
 /// Store a u32 into the region header at `off` through an independent
@@ -398,8 +419,10 @@ fn force_detach_dead_consumer_and_recover() {
     let pid = fork_child(|| {
         // SAFETY: cooperating handles only; a free table slot exists.
         let mut crx = unsafe { RingBuffer::<u64>::attach_shm_consumer(fd.as_fd()) }.unwrap();
-        assert_eq!(crx.shm_slot(), Some(0));
-        ready.send();
+        let (slot, epoch) = crx.shm_slot_epoch().unwrap();
+        assert_eq!(slot, 0);
+        // Report the occupancy epoch: the parent's compare-and-retire proof.
+        ready.send_u32(epoch);
         for i in 0..3u64 {
             assert_eq!(crx.pop(), Ok(i));
         }
@@ -410,7 +433,7 @@ fn force_detach_dead_consumer_and_recover() {
         }
     });
 
-    ready.recv();
+    let child_epoch = ready.recv_u32();
     for i in 0..3u64 {
         tx.push(i);
     }
@@ -433,9 +456,22 @@ fn force_detach_dead_consumer_and_recover() {
         "a dead consumer's slot still gates"
     );
 
+    // A stale epoch must NOT retire the slot: compare-and-retire is the
+    // proof the caller diagnosed THIS occupancy dead, not a successor's.
+    // SAFETY: same trust register as below; the stale CAS fails harmlessly.
+    let err = unsafe {
+        RingBuffer::<u64>::force_detach_consumer(fd.as_fd(), 0, child_epoch.wrapping_add(1))
+    }
+    .unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(
+        tx.try_push(u64::MAX).is_err(),
+        "an epoch-mismatched force_detach must not retire the slot"
+    );
+
     // The caller (who reaped the child) asserts its death: retire the slot.
     // SAFETY: the previous holder of slot 0 is dead (SIGKILLed and reaped).
-    unsafe { RingBuffer::<u64>::force_detach_consumer(fd.as_fd(), 0) }.unwrap();
+    unsafe { RingBuffer::<u64>::force_detach_consumer(fd.as_fd(), 0, child_epoch) }.unwrap();
     assert!(
         tx.try_push(100).is_ok(),
         "retiring the slot un-gates the producer"
@@ -475,7 +511,8 @@ fn force_detach_live_zombie_blast_radius() {
     // The zombie-to-be: a live consumer through a second mapping.
     // SAFETY: cooperating handles only.
     let mut zombie = unsafe { RingBuffer::<u64>::attach_shm_consumer(fd.as_fd()) }.unwrap();
-    assert_eq!(zombie.shm_slot(), Some(0));
+    let (slot, epoch) = zombie.shm_slot_epoch().unwrap();
+    assert_eq!(slot, 0);
 
     for i in 0..4u64 {
         tx.push(i);
@@ -486,8 +523,14 @@ fn force_detach_live_zombie_blast_radius() {
     // Wrongly assert its death: the slot is retired while the handle lives.
     // SAFETY: this is the blast-radius test — the "victim" cooperates by
     // being a handle we control; its read validity is revoked from here on.
-    unsafe { RingBuffer::<u64>::force_detach_consumer(fd.as_fd(), 0) }.unwrap();
+    unsafe { RingBuffer::<u64>::force_detach_consumer(fd.as_fd(), 0, epoch) }.unwrap();
     assert_eq!(tx.consumer_count(), 0, "a retired slot is not counted");
+
+    // Retiring the same occupancy twice fails: the retire bumped the epoch.
+    // SAFETY: as above (the slot is already retired; the CAS just fails).
+    let err =
+        unsafe { RingBuffer::<u64>::force_detach_consumer(fd.as_fd(), 0, epoch) }.unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
 
     // A new consumer lands on a different slot and is unaffected.
     // SAFETY: cooperating handles only.
@@ -519,6 +562,112 @@ fn force_detach_live_zombie_blast_radius() {
         assert_eq!(fresh.pop(), Ok(4 + i));
     }
     assert!(tx.try_push(100).is_ok());
+}
+
+// ---------------------------------------------------------------------------
+// 7b. Compare-and-retire [A-4.1]: a watchdog holding a DEAD consumer's
+//     (slot, epoch) must not retire a healthy successor that re-claimed the
+//     gracefully freed slot — the exact race the epoch parameter exists for.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn force_detach_stale_epoch_spares_the_reclaimed_slot() {
+    let fd = memfd("spmc-stale-epoch").unwrap();
+    // SAFETY: fresh private memfd.
+    let (mut tx, rx0) = unsafe { RingBuffer::<u64>::create_shm(fd.as_fd(), 8, 4) }.unwrap();
+    let (slot0, old_epoch) = rx0.shm_slot_epoch().unwrap();
+    assert_eq!(slot0, 0);
+
+    // The diagnosed-dead consumer frees its slot gracefully...
+    drop(rx0);
+    // ...and a healthy successor re-claims it (claim bumps the epoch).
+    // SAFETY: cooperating handles only.
+    let mut successor = unsafe { RingBuffer::<u64>::attach_shm_consumer(fd.as_fd()) }.unwrap();
+    let (slot1, new_epoch) = successor.shm_slot_epoch().unwrap();
+    assert_eq!(slot1, 0, "a gracefully freed slot is reissued");
+    assert_ne!(new_epoch, old_epoch, "each occupancy gets its own epoch");
+
+    // The watchdog fires with the dead occupancy's pair: refused, and the
+    // successor keeps its slot (and its gate).
+    // SAFETY: trust register as documented — the stale CAS fails harmlessly.
+    let err =
+        unsafe { RingBuffer::<u64>::force_detach_consumer(fd.as_fd(), 0, old_epoch) }.unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    assert_eq!(tx.consumer_count(), 1, "the successor must survive");
+    for i in 0..8u64 {
+        tx.push(i);
+    }
+    assert!(
+        tx.try_push(u64::MAX).is_err(),
+        "the successor's gate must still hold after the stale retire attempt"
+    );
+    for i in 0..8u64 {
+        assert_eq!(successor.pop(), Ok(i));
+    }
+
+    // The byte ring shares the table machinery: same stale-epoch refusal.
+    let bfd = memfd("spmc-stale-epoch-bytes").unwrap();
+    // SAFETY: fresh private memfd.
+    let (mut btx, brx0) = unsafe { BytesRing::create_shm(bfd.as_fd(), 64, 4) }.unwrap();
+    let (bslot, bepoch) = brx0.shm_slot_epoch().unwrap();
+    assert_eq!(bslot, 0);
+    drop(brx0);
+    // SAFETY: cooperating handles only.
+    let mut bsucc = unsafe { BytesRing::attach_shm_consumer(bfd.as_fd()) }.unwrap();
+    assert_eq!(bsucc.shm_slot_epoch().map(|(s, _)| s), Some(0));
+    // SAFETY: as above.
+    let berr = unsafe { BytesRing::force_detach_consumer(bfd.as_fd(), 0, bepoch) }.unwrap_err();
+    assert_eq!(berr.kind(), std::io::ErrorKind::InvalidInput);
+    btx.push(b"kept");
+    assert_eq!(&*bsucc.pop().unwrap(), b"kept");
+}
+
+// ---------------------------------------------------------------------------
+// 7c. A shm-attached producer's gating view is LIVE from construction: the
+//     always-gating seed is replaced by one real rescan before the handle is
+//     returned, so `len`/`is_empty`/`is_full` never report a phantom-full
+//     ring before the first push (the `while producer.is_full()` livelock
+//     the semantics guide warns about).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn attached_producer_gating_view_is_live_before_first_push() {
+    let fd = memfd("spmc-live-view").unwrap();
+    // SAFETY: fresh private memfd.
+    let (mut tx, mut rx) = unsafe { RingBuffer::<u64>::create_shm(fd.as_fd(), 8, 2) }.unwrap();
+    // Fresh ring, one consumer at cursor 0: empty, not full — before any push.
+    assert_eq!(
+        tx.len(),
+        0,
+        "fresh create must not report a phantom backlog"
+    );
+    assert!(tx.is_empty());
+    assert!(!tx.is_full());
+
+    for i in 0..3u64 {
+        tx.push(i);
+    }
+    drop(tx); // graceful close; the attach below re-opens
+
+    // SAFETY: the previous producer is gone (dropped).
+    let tx2 = unsafe { RingBuffer::<u64>::attach_shm_producer(fd.as_fd()) }.unwrap();
+    // The attached producer sees the live table (consumer still at 0, three
+    // unread messages) — not the "full until first push" seed.
+    assert_eq!(tx2.len(), 3, "attach must rescan the live table");
+    assert!(!tx2.is_empty());
+    assert!(!tx2.is_full());
+    for i in 0..3u64 {
+        assert_eq!(rx.pop(), Ok(i));
+    }
+
+    // The byte ring exposes `is_empty` only; same live-view guarantee.
+    let bfd = memfd("spmc-bytes-live-view").unwrap();
+    // SAFETY: fresh private memfd.
+    let (btx, _brx) = unsafe { BytesRing::create_shm(bfd.as_fd(), 64, 2) }.unwrap();
+    assert!(
+        btx.is_empty(),
+        "fresh byte-ring create must not report a phantom backlog"
+    );
 }
 
 // ---------------------------------------------------------------------------

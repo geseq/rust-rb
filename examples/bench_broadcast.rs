@@ -151,7 +151,9 @@ fn run_copy_stream<const L: usize>(iters: u64, capacity: usize, cores: &[usize])
     let stats = consumer.join().unwrap();
 
     let ns_per_op = elapsed.as_nanos() as f64 / iters as f64;
-    let gb_per_s = (iters as usize * L) as f64 / elapsed.as_nanos() as f64;
+    // Multiply in f64: `iters as usize * L` truncates the u64 count and can
+    // overflow on 32-bit targets (bytes = iters * L easily exceeds 2^32).
+    let gb_per_s = iters as f64 * L as f64 / elapsed.as_nanos() as f64;
     println!(
         "BCAST_stream {L:>3}B      {ns_per_op:>6.2} ns/push  {gb_per_s:>6.2} GB/s   {:>5} ms",
         elapsed.as_millis()
@@ -186,7 +188,8 @@ fn run_copy_pingpong<const L: usize>(rounds: usize, capacity: usize, cores: &[us
         pop_ns += t.elapsed().as_nanos();
     }
     std::hint::black_box(sink);
-    let msgs = (rounds * capacity) as f64;
+    // Multiply in f64 (message count can exceed a 32-bit usize).
+    let msgs = rounds as f64 * capacity as f64;
     let pop_gb_per_s = msgs * L as f64 / pop_ns as f64;
     println!(
         "BCAST_pingpong {L:>3}B    push {:>6.2} ns  pop {:>6.2} ns  (pop copy {pop_gb_per_s:>6.2} GB/s)",

@@ -883,6 +883,11 @@ impl<C: WaitStrategy> BytesConsumer<C> {
     /// Errors are as for [`pop`](Self::pop).
     #[inline]
     pub fn pop_into(&mut self, out: &mut Vec<u8>) -> Result<(), PopError> {
+        // Clear at entry, not only in the accept path: the doc promises
+        // "cleared" (and empty-on-`Err`), but a reposition can error out of
+        // `read_record` before its own clear runs, which would leave a
+        // previous pop's payload in `out`.
+        out.clear();
         self.wait_for_item()?;
         self.read_record(out)
     }
@@ -1007,7 +1012,11 @@ impl<C: WaitStrategy> BytesConsumer<C> {
         // SAFETY: `closed` points into shared state the anchor keeps alive.
         if unsafe { self.closed.as_ref() }.load(Ordering::Acquire) != 0 {
             self.refresh();
-            if self.tail_cache == self.pos {
+            // Drained is `<=`, not `==`: a header poke (or a producer crash
+            // observed through stale counters) can transiently leave `pos`
+            // *ahead* of the committed tail, and an equality check would
+            // then never report `Closed` — a drain livelock on a dead ring.
+            if self.tail_cache <= self.pos {
                 return Err(PopError::Closed);
             }
         }
@@ -1149,6 +1158,19 @@ impl<C: WaitStrategy> BytesConsumer<C> {
         self.refresh();
         // SAFETY: `latest` points into shared state the anchor keeps alive.
         let latest = unsafe { self.latest.as_ref() }.load(Ordering::Acquire);
+        // `latest` may transiently exceed the tail loaded above — benignly
+        // (a fresh push's `latest` landed between the two loads; `latest` is
+        // stored first) or terminally (a producer died between its `latest`
+        // and `tail` stores). Do NOT clamp the jump to the refreshed tail:
+        // a tail value is a frame *end*, which is a record start only when
+        // the next frame carries no wrap padding — clamping would land
+        // repositions off record starts under the benign race. Landing
+        // ahead of the tail is safe as-is: the availability check holds
+        // every read back until a tail actually covers the position, and
+        // the `check_closed` drained test is `<=`, so a position stranded
+        // past a dead producer's final tail still terminates the drain
+        // instead of livelocking (a crashed shm producer's counters are
+        // additionally healed at the next recovery attach).
         let new_pos = latest.max(self.pos);
         let missed_bytes = new_pos - self.pos;
         self.pos = new_pos;

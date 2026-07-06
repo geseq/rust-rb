@@ -303,12 +303,17 @@ table is full and `BrokenPipe` when the ring is closed.
 **Zombie consumers and `force_detach_consumer`.** Gating means a dead
 consumer's frozen cursor eventually blocks the producer forever — the
 lossless contract has no way to shrug it off. The escape hatch is
-`force_detach_consumer(fd, slot)`, which *retires* the slot: its epoch is
-bumped and the producer's next rescan stops honoring its cursor, un-gating
-the ring. A retired slot is **never re-issued** (so a straggling zombie
-cannot be confused with a new consumer) until `recover_shm` resets the whole
-table. Each consumer can report its own slot index via `shm_slot()` — publish
-it at startup so an operator or watchdog knows which slot to retire.
+`force_detach_consumer(fd, slot, epoch)`, a *compare-and-retire*: the slot is
+retired **iff** it is still held by the occupancy the caller diagnosed dead
+(every claim bumps the slot's epoch, so if the slot was gracefully freed and
+re-claimed by a healthy consumer in the meantime the epochs differ and the
+call fails with `InvalidInput` instead of retiring the living). A retired
+slot's cursor drops out of the producer's next rescan, un-gating the ring,
+and the slot is **never re-issued** (so a straggling zombie cannot be
+confused with a new consumer) until `recover_shm` resets the whole table.
+Each consumer can report its own `(slot, epoch)` pair via
+`shm_slot_epoch()` — publish it at startup so an operator or watchdog holds
+the exact proof the retire call takes.
 
 `force_detach_consumer` sits in the same trust register as the
 `force_attach_*` constructors: by calling it you assert the slot's holder is

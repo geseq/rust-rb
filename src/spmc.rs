@@ -1569,9 +1569,13 @@ impl<T, P: WaitStrategy, C: WaitStrategy> Drop for PopRef<'_, T, P, C> {
 impl<T, P: WaitStrategy, C: WaitStrategy> Producer<T, P, C> {
     /// Build a producer over a validated shm region. Seeds `next_seq` from
     /// the live write cursor and the gating cache with an always-gating
-    /// value, so the first push runs a real table rescan — an attached or
-    /// recovered producer rebuilds its gating view from the live table and
-    /// never trusts defaults [M-F17].
+    /// value — an attached or recovered producer never trusts defaults
+    /// [M-F17] — then runs **one real table rescan** before returning, so
+    /// the seed is only ever the pre-scan value: without it, `&self`
+    /// [`len`](Producer::len)/[`is_empty`](Producer::is_empty)/
+    /// [`is_full`](Producer::is_full) would report a full ring until the
+    /// first push, and the `while producer.is_full() {}` shape the
+    /// semantics guide warns about would livelock on a fresh attach.
     ///
     /// # Safety
     ///
@@ -1589,13 +1593,14 @@ impl<T, P: WaitStrategy, C: WaitStrategy> Producer<T, P, C> {
         let buf = region.spmc_buffer(anchor.max_consumers()).cast::<Slot<T>>();
         // SAFETY: `write_cursor` references the live mapping (per contract).
         let next_seq = unsafe { write_cursor.as_ref() }.load(Ordering::Acquire);
-        Producer {
+        let mut producer = Producer {
             buf,
             mask: capacity - 1,
             next_seq,
-            // Always-gating seed (lag == capacity): the first space check
-            // must rescan the live table [M-F17]; 0 would be wrong after
-            // cursor wraparound, exactly as for fresh cache blocks.
+            // Always-gating seed (lag == capacity): the pre-scan value only
+            // — the rescan below replaces it before anything reads it; 0
+            // would be wrong after cursor wraparound, exactly as for fresh
+            // cache blocks [M-F17].
             cached_min: next_seq.wrapping_sub(capacity),
             // `T: ShmItem` is `Copy`, so the drop-on-overwrite machinery is
             // const-folded away; the mirror is kept trivially consistent.
@@ -1605,7 +1610,13 @@ impl<T, P: WaitStrategy, C: WaitStrategy> Producer<T, P, C> {
             closed,
             dropped_through,
             anchor: ProducerAnchor::Shm(anchor),
-        }
+        };
+        // One real registry rescan at construction: the gating view (and
+        // with it `len`/`is_empty`/`is_full`) reflects the live table from
+        // the start instead of lying "full" until the first push (see the
+        // function doc for the documented livelock this fixes).
+        producer.rescan(1);
+        producer
     }
 }
 
@@ -1644,13 +1655,25 @@ impl<T, P: WaitStrategy, C: WaitStrategy> Consumer<T, P, C> {
     }
 
     /// The consumer-table slot this handle occupies in its shared-memory
-    /// region, or `None` for a heap ring. Slot indices are what
-    /// [`force_detach_consumer`](RingBuffer::force_detach_consumer) takes.
+    /// region, or `None` for a heap ring (see
+    /// [`shm_slot_epoch`](Self::shm_slot_epoch) for the pair
+    /// [`force_detach_consumer`](RingBuffer::force_detach_consumer) takes).
     #[cfg_attr(docsrs, doc(cfg(feature = "shm")))]
     pub fn shm_slot(&self) -> Option<usize> {
+        self.shm_slot_epoch().map(|(slot, _)| slot)
+    }
+
+    /// The consumer-table `(slot, epoch)` this handle occupies in its
+    /// shared-memory region, or `None` for a heap ring. The pair identifies
+    /// this exact *occupancy* — every claim bumps the slot's epoch — and is
+    /// what [`force_detach_consumer`](RingBuffer::force_detach_consumer)
+    /// takes, so a watchdog holding a dead consumer's pair can never retire
+    /// a healthy successor that re-claimed the slot.
+    #[cfg_attr(docsrs, doc(cfg(feature = "shm")))]
+    pub fn shm_slot_epoch(&self) -> Option<(usize, u32)> {
         match &self.anchor {
             ConsumerAnchor::Heap { .. } => None,
-            ConsumerAnchor::Shm(anchor) => Some(anchor.slot()),
+            ConsumerAnchor::Shm(anchor) => Some((anchor.slot(), anchor.epoch())),
         }
     }
 }
@@ -1676,10 +1699,27 @@ where
     C: WaitStrategy,
 {
     let region = Arc::clone(region);
+    // Seqlock snapshot before the claim (the in-process mirror of
+    // `crate::shm`'s attach choreography): an odd generation is a concurrent
+    // `create_shm`/`recover_shm` mid-rewrite — claiming into a table being
+    // reset would keep a slot the reset frees out from under us.
+    let generation = region.generation();
+    if generation & 1 == 1 {
+        return Err(SubscribeError::Closed);
+    }
     if region.spmc_closed().load(Ordering::Acquire) != 0 {
         return Err(SubscribeError::Closed);
     }
     let claim = crate::shm::spmc_claim_slot(&region, max_consumers).ok_or(SubscribeError::Full)?;
+    // Post-claim re-check: a generation change means the table was reset
+    // while we claimed. The rollback is itself generation-conditional, so a
+    // re-initialized table is left strictly alone (at worst one leaked slot
+    // until the next `recover_shm` — a leak, never a clobber). The ring this
+    // handle was subscribed from is gone, which is `Closed`.
+    if region.generation() != generation {
+        crate::shm::spmc_release_claim(&region, &claim, generation);
+        return Err(SubscribeError::Closed);
+    }
     let joined = claim.joined;
     let anchor = Box::new(crate::shm::SpmcConsumerAnchor::new(
         region,
