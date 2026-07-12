@@ -192,6 +192,8 @@ mod cursor;
 mod padded;
 #[cfg(target_has_atomic = "64")]
 mod registry;
+#[cfg(target_has_atomic = "64")]
+mod seqlock;
 
 #[cfg(target_has_atomic = "64")]
 pub mod anchored;

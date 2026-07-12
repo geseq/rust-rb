@@ -107,7 +107,7 @@ use crate::registry::{
     guard_sentinel, lacks_space, publish_batch_bytes as publish_batch, rescan_gate,
     scan_chunk_registry, subscribe_slot, Chunk, FlushOnDrop, FlushPending, DETACHED,
 };
-use crate::spsc_bytes::{ALIGN, MIN_CAPACITY};
+use crate::spsc_bytes::{max_message_len, record_len, ALIGN, HEADER, MIN_CAPACITY, PADDING};
 use crate::wait::{SelfTimed, WaitStrategy, YieldWait};
 
 pub use crate::spmc::{Closed, SubscribeError};
@@ -120,37 +120,6 @@ pub use crate::spmc::{Closed, SubscribeError};
 /// `WriteSlot`/`Msg` hand out `&[u8]` views into the ring, which would be
 /// instant UB over uninitialized memory.
 type Word = UnsafeCell<u64>;
-
-/// Size of the length header preceding each payload (mirrors
-/// `crate::spsc_bytes` — the framing is normatively identical).
-const HEADER: usize = 4;
-/// Header value marking a padding record that runs to the end of the buffer.
-const PADDING: u32 = u32::MAX;
-
-#[inline(always)]
-const fn align_up(n: usize) -> usize {
-    (n + (ALIGN - 1)) & !(ALIGN - 1)
-}
-
-/// Bytes a record with a `len`-byte payload occupies in the ring.
-#[inline(always)]
-const fn record_len(len: usize) -> usize {
-    align_up(HEADER + len)
-}
-
-#[inline(always)]
-const fn max_message_len(capacity: usize) -> usize {
-    // Records are capped at capacity / 2 (see module docs); the header is
-    // part of the record. Also stay below the u32 header space, where
-    // u32::MAX is reserved for padding.
-    let cap = capacity / 2 - HEADER;
-    let header_space = (PADDING - 1) as usize;
-    if cap < header_space {
-        cap
-    } else {
-        header_space
-    }
-}
 
 /// The widest footprint one push can require free, in bytes: wrap padding
 /// plus a maximum-size record.

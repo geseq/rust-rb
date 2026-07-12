@@ -76,7 +76,7 @@ use std::ptr::NonNull;
 use std::sync::atomic::{fence, AtomicU64, Ordering};
 use std::sync::Arc;
 
-use crate::atomic_copy::{read_payload, write_payload};
+use crate::atomic_copy::write_payload;
 use crate::cache_padded::CachePadded;
 use crate::cursor::round_capacity;
 #[cfg(all(feature = "shm", target_os = "linux", target_has_atomic = "64"))]
@@ -85,6 +85,7 @@ use crate::registry::{
     guard_sentinel, lacks_space, publish_batch_elems as publish_batch, rescan_gate,
     scan_chunk_registry, subscribe_slot, Chunk, FlushOnDrop, FlushPending, DETACHED,
 };
+use crate::seqlock::{read_valid, Slot};
 use crate::wait::{SelfTimed, WaitStrategy, YieldWait};
 
 #[doc(inline)]
@@ -92,40 +93,10 @@ pub use crate::broadcast::{NoUninit, PopError};
 #[doc(inline)]
 pub use crate::spmc::{Closed, SubscribeError};
 
-/// The default reposition slack for observers: `capacity / 8`, clamped to at
-/// least 1 (capacity is at least 2 here, so broadcast's capacity-1 special
-/// case does not arise).
-#[inline]
-const fn default_slack(capacity: u64) -> u64 {
-    let slack = capacity / 8;
-    if slack == 0 {
-        1
-    } else {
-        slack
-    }
-}
-
-/// The observer lap-recovery target: `tail - capacity + slack`, computed
-/// underflow-safe (replicated from the broadcast ring).
-#[inline(always)]
-const fn reposition_target(tail: u64, capacity: u64, slack: u64) -> u64 {
-    tail.saturating_add(slack).saturating_sub(capacity)
-}
-
-/// One ring slot: broadcast's per-slot seqlock, verbatim.
-///
-/// `seq` encodes `2·s + phase` for global sequence `s`: `2s + 1` while
-/// message `s` is being written, `2s + 2` once it is published, `0`
-/// initially. Observers validate against it; anchors never read it (the
-/// gate makes their reads race-free).
-///
-/// `repr(C)` pins the payload at a word-aligned offset, which the word-wise
-/// copy helpers require (and debug-assert).
-#[repr(C)]
-struct Slot<T> {
-    seq: AtomicU64,
-    data: UnsafeCell<MaybeUninit<T>>,
-}
+// The reposition/slack policy is broadcast's, imported — one definition,
+// one test suite, no drift (anchored capacity is at least 2, so broadcast's
+// capacity-1 special case simply never fires here).
+use crate::broadcast::{default_slack, reposition_target};
 
 /// The producer-published cache line: the unified cursor (`tail` ≡ the spmc
 /// `write_cursor` — both roles spin on this one line) plus, co-located, the
@@ -1452,31 +1423,13 @@ where
     #[inline]
     fn read_slot(&mut self) -> Result<T, PopError> {
         let s = self.pos;
-        let slot = self.slot(s);
-        let expected = 2 * s + 2;
-        // Because the unified cursor is Release-stored strictly after the
-        // slot publish (cursor LAST) and we Acquire-read `tail > s`, the
-        // generation here is at least `expected` — a gated (stalled)
+        // The caller established `tail > s`, which is `read_valid`'s
+        // precondition — here the unified cursor is Release-stored strictly
+        // after the slot publish (cursor LAST), so a gated (stalled)
         // producer frontier can never expose an unwritten slot.
-        let v1 = slot.seq.load(Ordering::Acquire);
-        debug_assert!(v1 >= expected, "slot behind the published tail");
-        if v1 == expected {
-            let mut out = MaybeUninit::<T>::uninit();
-            // SAFETY: the slot was published at least once (generation
-            // reached `expected`), so every payload byte is initialized;
-            // torn bytes stay `MaybeUninit` until revalidation below.
-            unsafe { read_payload(slot.data.get(), &mut out) };
-            // Order the payload loads before the revalidating load: fence +
-            // relaxed re-load is the sound shape [M-F11].
-            fence(Ordering::Acquire);
-            let v2 = slot.seq.load(Ordering::Relaxed);
-            if v2 == v1 {
-                self.pos = s + 1;
-                // SAFETY: generation unchanged across the copy — the bytes
-                // are the complete, untorn message `s`; `T: NoUninit` makes
-                // every byte pattern of a published value initialized data.
-                return Ok(unsafe { out.assume_init() });
-            }
+        if let Some(v) = read_valid(self.slot(s), 2 * s + 2) {
+            self.pos = s + 1;
+            return Ok(v);
         }
         // Lapped: the slot moved on to a newer generation (or tore the
         // copy). Reposition first, then report.
@@ -1512,30 +1465,6 @@ where
 // `Observer` types over region pointers — the hot paths are byte-identical
 // to the heap ring's; only the backing seam (registry/keep-alive) differs.
 // ---------------------------------------------------------------------------
-
-/// The byte stride of one shm slot: `size_of::<Slot<T>>()` — the `repr(C)`
-/// `{ seq: AtomicU64, data: T-storage }` layout the region create/open
-/// validate for exact equality (see `crate::broadcast`'s twin for the
-/// layout math; the header's `unit_size` records `size_of::<T>()`).
-#[cfg(all(feature = "shm", target_os = "linux", target_has_atomic = "64"))]
-pub(crate) fn shm_slot_stride<T>() -> usize {
-    size_of::<Slot<T>>()
-}
-
-/// Alignment of one shm slot (see [`shm_slot_stride`]); the shm buffer
-/// offset is 128-aligned, so alignments above 128 are rejected at
-/// construction.
-#[cfg(all(feature = "shm", target_os = "linux", target_has_atomic = "64"))]
-pub(crate) fn shm_slot_align<T>() -> usize {
-    std::mem::align_of::<Slot<T>>()
-}
-
-/// The default-slack policy, shared with the shm constructors so they cannot
-/// drift from the heap ring's.
-#[cfg(all(feature = "shm", target_os = "linux", target_has_atomic = "64"))]
-pub(crate) const fn shm_default_slack(capacity: u64) -> u64 {
-    default_slack(capacity)
-}
 
 #[cfg(all(feature = "shm", target_os = "linux", target_has_atomic = "64"))]
 impl<T, P, C> Producer<T, P, C>
@@ -1764,22 +1693,6 @@ mod tests {
             publish_batch(1 << 20),
             crate::registry::MAX_PUBLISH_BATCH_ELEMS
         );
-    }
-
-    #[test]
-    fn default_slack_policy() {
-        assert_eq!(default_slack(2), 1);
-        assert_eq!(default_slack(8), 1);
-        assert_eq!(default_slack(16), 2);
-        assert_eq!(default_slack(1024), 128);
-    }
-
-    #[test]
-    fn reposition_target_math() {
-        assert_eq!(reposition_target(20, 8, 2), 14);
-        assert_eq!(reposition_target(17, 8, 0), 9);
-        assert_eq!(reposition_target(1, 8, 2), 0);
-        assert_eq!(reposition_target(u64::MAX, 8, 2), u64::MAX - 8);
     }
 
     #[test]

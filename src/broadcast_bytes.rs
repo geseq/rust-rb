@@ -213,21 +213,15 @@ const fn max_message_len(capacity: usize) -> usize {
 }
 
 /// Round a requested minimum capacity to the ring's real capacity: the next
-/// power of two, floor [`MIN_CAPACITY`].
+/// power of two, floor [`MIN_CAPACITY`], via the one crate-wide rounding
+/// policy — shared with the shm constructors so heap and shm cannot round
+/// the same request differently.
 ///
 /// # Panics
 ///
 /// Panics if `min_capacity == 0` or the rounding overflows `usize`.
 fn round_capacity(min_capacity: usize) -> usize {
-    assert!(min_capacity > 0, "capacity must be greater than zero");
-    let capacity = min_capacity
-        .checked_next_power_of_two()
-        .expect("capacity too large to round up to a power of two");
-    if capacity < MIN_CAPACITY {
-        MIN_CAPACITY
-    } else {
-        capacity
-    }
+    crate::cursor::round_capacity(min_capacity, MIN_CAPACITY)
 }
 
 /// Error returned by consumer pops.

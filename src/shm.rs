@@ -2624,7 +2624,7 @@ fn check_bcast_elem_type<T>() -> io::Result<()> {
     if std::mem::size_of::<T>() == 0 {
         return Err(err("zero-sized elements are not supported in shm rings"));
     }
-    if crate::broadcast::shm_slot_align::<T>() > 128 {
+    if crate::seqlock::shm_slot_align::<T>() > 128 {
         return Err(err("element alignment exceeds the buffer offset alignment"));
     }
     Ok(())
@@ -2641,7 +2641,7 @@ fn open_bcast_elems<T: ShmItem + crate::broadcast::NoUninit>(
         fd,
         KIND_BCAST_ELEMS,
         std::mem::size_of::<T>(),
-        crate::broadcast::shm_slot_stride::<T>(),
+        crate::seqlock::shm_slot_stride::<T>(),
         BUFFER_OFFSET,
         1,
         1,
@@ -2737,7 +2737,7 @@ where
             KIND_BCAST_ELEMS,
             capacity,
             std::mem::size_of::<T>(),
-            crate::broadcast::shm_slot_stride::<T>(),
+            crate::seqlock::shm_slot_stride::<T>(),
             BUFFER_OFFSET,
             slack as u64,
         )?;
@@ -3897,7 +3897,7 @@ fn check_anch_elem_type<T>() -> io::Result<()> {
     if std::mem::size_of::<T>() == 0 {
         return Err(err("zero-sized elements are not supported in shm rings"));
     }
-    if crate::anchored::shm_slot_align::<T>() > 128 {
+    if crate::seqlock::shm_slot_align::<T>() > 128 {
         return Err(err("element alignment exceeds the buffer offset alignment"));
     }
     Ok(())
@@ -4008,7 +4008,7 @@ where
             fd,
             KIND_ANCH_ELEMS,
             std::mem::size_of::<T>(),
-            crate::anchored::shm_slot_stride::<T>(),
+            crate::seqlock::shm_slot_stride::<T>(),
             ANCH_ELEMS_TABLE_OFFSET,
             2,
             1,
@@ -4030,7 +4030,7 @@ where
         max_anchors: usize,
     ) -> io::Result<AnchElemPair<T, P, C>> {
         let capacity = crate::cursor::round_capacity(min_capacity, 2);
-        let slack = crate::anchored::shm_default_slack(capacity as u64);
+        let slack = crate::broadcast::shm_default_slack(capacity as u64);
         // SAFETY: forwarded caller contract.
         unsafe { Self::create_shm_with_slack(fd, min_capacity, max_anchors, slack as usize) }
     }
@@ -4068,7 +4068,7 @@ where
             KIND_ANCH_ELEMS,
             capacity,
             std::mem::size_of::<T>(),
-            crate::anchored::shm_slot_stride::<T>(),
+            crate::seqlock::shm_slot_stride::<T>(),
             ANCH_ELEMS_TABLE_OFFSET,
             max_anchors,
             slack as u64,

@@ -107,8 +107,9 @@ use std::ptr::NonNull;
 use std::sync::atomic::{fence, AtomicU64, Ordering};
 use std::sync::Arc;
 
-use crate::atomic_copy::{read_payload, write_payload};
+use crate::atomic_copy::write_payload;
 use crate::cache_padded::CachePadded;
+use crate::seqlock::{read_valid, Slot};
 use crate::wait::{SelfTimed, WaitStrategy, YieldWait};
 
 /// Marker for element types whose value representation has **no padding
@@ -205,24 +206,23 @@ impl core::fmt::Display for PopError {
 impl std::error::Error for PopError {}
 
 /// Round a requested minimum capacity to the ring's real capacity: the next
-/// power of two (floor 1 — there is no gating machinery a tiny ring could
-/// break; capacity 1 is a "latest value" cell).
+/// power of two, via the one crate-wide rounding policy (floor 1 — there is
+/// no gating machinery a tiny ring could break; capacity 1 is a "latest
+/// value" cell). Shared with the shm constructors so heap and shm cannot
+/// round the same request differently.
 ///
 /// # Panics
 ///
 /// Panics if `min_capacity == 0` or the rounding overflows `usize`.
 fn round_capacity(min_capacity: usize) -> usize {
-    assert!(min_capacity > 0, "capacity must be greater than zero");
-    min_capacity
-        .checked_next_power_of_two()
-        .expect("capacity too large to round up to a power of two")
+    crate::cursor::round_capacity(min_capacity, 1)
 }
 
 /// The default reposition slack: `capacity / 8`, clamped to at least 1 (and
 /// to 0 for a capacity-1 ring, where any positive slack would reach the
 /// unwritten future).
 #[inline]
-const fn default_slack(capacity: u64) -> u64 {
+pub(crate) const fn default_slack(capacity: u64) -> u64 {
     if capacity == 1 {
         0
     } else {
@@ -239,25 +239,8 @@ const fn default_slack(capacity: u64) -> u64 {
 /// underflow-safe (a stale tail observation cannot wrap below zero — the
 /// caller additionally clamps to never move backwards).
 #[inline(always)]
-const fn reposition_target(tail: u64, capacity: u64, slack: u64) -> u64 {
+pub(crate) const fn reposition_target(tail: u64, capacity: u64, slack: u64) -> u64 {
     tail.saturating_add(slack).saturating_sub(capacity)
-}
-
-/// One ring slot: a per-slot seqlock.
-///
-/// `seq` encodes `2·s + phase` for global sequence `s`: `2s + 1` while
-/// message `s` is being written, `2s + 2` once it is published, `0`
-/// initially (below every expected value — an untouched slot can never be
-/// accepted). The series one slot takes (`2s+1, 2s+2, 2(s+capacity)+1, …`)
-/// is strictly increasing, so exact-match acceptance is generation-unique.
-///
-/// `repr(C)` pins the payload at offset `max(8, align_of::<T>())` from an
-/// (at least) 8-aligned base — always a multiple of the machine word, which
-/// the word-wise copy helpers require (and debug-assert).
-#[repr(C)]
-struct Slot<T> {
-    seq: AtomicU64,
-    data: UnsafeCell<MaybeUninit<T>>,
 }
 
 /// The producer-published cache line: the tail (count of published
@@ -885,31 +868,11 @@ impl<T: NoUninit, C: WaitStrategy> Consumer<T, C> {
     #[inline]
     fn read_slot(&mut self) -> Result<T, PopError> {
         let s = self.pos;
-        let slot = self.slot(s);
-        let expected = 2 * s + 2;
-        // Because the tail is Release-stored after the slot publish and we
-        // Acquire-read `tail > s`, the generation here is at least
-        // `expected` — an "empty" slot is unobservable past the tail check.
-        let v1 = slot.seq.load(Ordering::Acquire);
-        debug_assert!(v1 >= expected, "slot behind the published tail");
-        if v1 == expected {
-            let mut out = MaybeUninit::<T>::uninit();
-            // SAFETY: the slot was published at least once (generation
-            // reached `expected`), so every payload byte is initialized;
-            // torn bytes stay `MaybeUninit` until revalidation below.
-            unsafe { read_payload(slot.data.get(), &mut out) };
-            // Order the payload loads before the revalidating load: fence +
-            // relaxed re-load is the sound shape (an `Acquire` re-load
-            // would order the wrong direction) [M-F11].
-            fence(Ordering::Acquire);
-            let v2 = slot.seq.load(Ordering::Relaxed);
-            if v2 == v1 {
-                self.pos = s + 1;
-                // SAFETY: generation unchanged across the copy — the bytes
-                // are the complete, untorn message `s`; `T: NoUninit` makes
-                // every byte pattern of a published value initialized data.
-                return Ok(unsafe { out.assume_init() });
-            }
+        // The caller established `tail > s`, which is `read_valid`'s
+        // precondition (tail Release-stored after the slot publish).
+        if let Some(v) = read_valid(self.slot(s), 2 * s + 2) {
+            self.pos = s + 1;
+            return Ok(v);
         }
         // Lapped: the slot moved on to a newer generation (or tore the
         // copy). Reposition first, then report [A-3].
@@ -947,26 +910,6 @@ impl<T: NoUninit, C: WaitStrategy> Consumer<T, C> {
 // mapping: the entire consumer path is loads plus private state, so an
 // accidental store regression is a deterministic SIGSEGV.
 // ---------------------------------------------------------------------------
-
-/// The byte stride of one shm slot: `size_of::<Slot<T>>()`. The `repr(C)`
-/// slot is `{ seq: AtomicU64, data: T-storage }`, so the stride is
-/// `align_up(8 + size_of::<T>(), align_of::<Slot<T>>())` with
-/// `align_of::<Slot<T>>() == max(8, align_of::<T>())` — the layout math the
-/// shm region create/open share (the header's `unit_size` records
-/// `size_of::<T>()` for type validation; the physical region length uses
-/// this stride).
-#[cfg(all(feature = "shm", target_os = "linux", target_has_atomic = "64"))]
-pub(crate) fn shm_slot_stride<T>() -> usize {
-    size_of::<Slot<T>>()
-}
-
-/// Alignment of one shm slot (see [`shm_slot_stride`]); the shm buffer
-/// offset is 128-aligned, so alignments above 128 are rejected at
-/// construction.
-#[cfg(all(feature = "shm", target_os = "linux", target_has_atomic = "64"))]
-pub(crate) fn shm_slot_align<T>() -> usize {
-    std::mem::align_of::<Slot<T>>()
-}
 
 /// The default-slack policy, shared with the shm constructors so they cannot
 /// drift from the heap ring's.
