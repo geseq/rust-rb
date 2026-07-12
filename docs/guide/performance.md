@@ -230,8 +230,15 @@ The multi-consumer numbers were measured on a **different machine** from
 everything above: a GB10 DGX Spark (Cortex-X925 cores, pinned), where the
 SPSC yield-strategy baseline is 2.36 ns/op — *not* the NVIDIA Grace
 (Neoverse V2) box the SPSC figures elsewhere in this guide come from. Do not
-mix the two sets. The benches are `examples/bench_spmc.rs` and
-`examples/bench_broadcast.rs`; as always, read the second (warm) pass.
+mix the two sets. The benches are `examples/bench_spmc.rs` /
+`examples/bench_broadcast.rs` (element), `examples/bench_spmc_bytes.rs` /
+`examples/bench_broadcast_bytes.rs` (byte framing), and
+`examples/bench_anchored.rs` (mixed); as always, read the second (warm)
+pass. Two diagnostic probes, `examples/probe_coherence.rs` (synthetic
+coherence floor, no ring code) and `examples/probe_ring_scaling.rs`
+(shared-layout vs line-isolated elements), split any box's numbers into
+hardware floor and ring overhead — run them first when a number here does
+not reproduce.
 
 What held, on that box:
 
@@ -250,28 +257,52 @@ What held, on that box:
   measured **2.6× slower on pop at 64 B payloads and collapsed at 256 B**,
   so the strict copy won in both directions.
 
-What did not (known, tracked, correctness unaffected):
+What did not hold as pre-registered — now **root-caused** (2026-07-12, both
+probes; correctness unaffected in both):
 
-- **Gating caught-up N-scaling is not flat**: with all consumers caught up
-  and spinning, producer cost rose +24% at N=2 and +114% at N=4
-  (`rust-rb-vio` in the issue tracker).
-- **Lossy caught-up coupling**: caught-up *spinning* broadcast consumers
-  couple the producer — 4.5 ns/push alone, 25.3 with one spinning reader,
-  65.5 with four — while a lagging reader decouples it back to 8.7
-  (`rust-rb-6l0`). The coupling is specific to the caught-up *tight-spinning*
-  regime (the failing bench polled with raw `try_pop` loops); whether
-  gentler consumer strategies dampen it is one of the open questions on the
-  issue.
+- **Gating caught-up N-scaling is not flat** (`rust-rb-vio`): Yield producer
+  2.29 / 3.08 / 4.99 ns at N=1/2/4 (and 20.0 at the mixed-cluster N=8*
+  point). Mechanism: **adjacent-slot false sharing** — eight `i64` slots
+  share a cache line, so N caught-up consumers copying slot `s` keep
+  stealing the line the producer writes at `s+1..s+7`.
+  `probe_ring_scaling` shows the same grid with a line-isolated 64-byte
+  element is flat: 3.89 / 3.90 / 4.11 ns at N=1/2/4. The synthetic floor
+  (`probe_coherence`) confirms the published cursor itself is nearly free
+  (< 2 ns even with 8 spinning readers). Latency-sensitive fan-out
+  workloads can therefore flatten the curve today by padding `T` to a
+  cache line; whether the ring should offer a padded-slot layout knob is a
+  design decision tracked on the issue.
+- **Lossy caught-up coupling** (`rust-rb-6l0`): 4.52 ns/push alone, 24.8
+  with one caught-up spinning reader, 57.3 with four, 150.6 at the
+  mixed-cluster k=8* point — while a lagging reader decouples the producer
+  back to ~8. Attribution (tail-amortization experiment): **the per-push
+  tail store into k spinning readers is the dominant term** — publishing
+  the tail every 8th push instead cut k=1/2/4/8 to 12.7 / 16.6 / 19.6 /
+  53.4 ns — with the remainder being the seqlock slot-line ping-pong
+  (producer: 3 stores, reader: 2 seq loads + copy per message). It is
+  **not** adjacent-slot sharing: line-isolating the 16-byte slots makes it
+  *worse* (43 vs 26 ns at k=1 — the packed layout amortizes transfers), so
+  the layout stays. A batched-tail knob would trade per-push visibility
+  latency for k-independence; the adaptive publish the SPSC ring uses is
+  impossible here (the producer keeps zero consumer knowledge by design).
+  Tracked on the issue as a design decision.
 
-Both findings are performance-shape issues only: accounting stayed exact, no
-torn reads were accepted, and nothing was lost under keep-up in any of the
-failing configurations.
+The **byte** rings (`bench_spmc_bytes`, `bench_broadcast_bytes`): gating
+byte framing at N=1 runs 8.8–9.7 ns/msg at 8 B (drain ≈ pop) rising with
+size to ~18 ns / 14.5 GB/s at 256 B, N-scaling mirrors the element ring's
+shape (64 B pop: 11.4 → 13.9 → 19.4 ns at N=1/2/4 Pause), and the straggler
+is tracked, not amplified. The lossy byte ring couples harder than its
+element sibling (k=1 66.4 vs 24.8 ns/push — the Agrona three-counter
+protocol touches more shared lines per record) and free-runs at 6.97
+ns/push (9.2 GB/s at 64 B) with exact framed-byte lap accounting on the
+tiny-ring lap bench.
 
-The **mixed** rings ([`anchored`](crate::anchored) /
-[`anchored_bytes`](crate::anchored_bytes)) have no dedicated bench yet. They
-run the same engine as the rings above — anchors ride the gating registry and
-gate the producer exactly as spmc consumers do, observers ride the broadcast
-seqlock protocol and cost the producer nothing — so the numbers and the two
-open findings above are the right priors: expect spmc-shaped behaviour from
-the anchor count and broadcast-shaped behaviour from the observers, and with
-zero anchors the producer free-runs like the lossy ring.
+The **mixed** rings (`bench_anchored`): with zero anchors the producer
+free-runs at lossy parity (A=0 K=1 26.2 vs broadcast k=1 24.8 ns), and a
+straggling ~50 ns anchor is tracked (48.8 ns/push) with a riding observer
+staying caught up for free. One prior did **not** survive measurement: a
+single flat-out anchor prices like a *broadcast* reader, not an spmc
+consumer (A=1 K=0 27.7 ns vs spmc N=1 Pause 6.5) — anchors read through
+the same per-slot seqlock protocol observers use, so the k-coupling above,
+not gating parity, is the right prior for anchor count. Mixed regimes
+compose accordingly (A=1 K=1 35.5; A=2 K=2 73.2 ns/push).

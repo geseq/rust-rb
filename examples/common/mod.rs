@@ -131,3 +131,14 @@ pub fn spin_ns_per_iter() -> f64 {
     }
     start.elapsed().as_nanos() as f64 / 1e6
 }
+
+/// Convert a target delay to `spin_delay` iterations, calibrated on the
+/// **current** core. Call from the spinning thread itself, *after* pinning:
+/// on a heterogeneous part a knob calibrated on one cluster is off by the
+/// clusters' spin-cost ratio on the other (`0` stays `0` — no rate limit).
+pub fn spin_iters_for_ns(ns: u32) -> u32 {
+    if ns == 0 {
+        return 0;
+    }
+    ((ns as f64 / spin_ns_per_iter()) as u32).max(1)
+}

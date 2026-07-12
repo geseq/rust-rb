@@ -20,7 +20,7 @@ use std::time::Instant;
 
 #[path = "common/mod.rs"]
 mod common;
-use common::{announce_machine, core_list_announced, pin, spin_delay, spin_ns_per_iter};
+use common::{announce_machine, core_list_announced, pin, spin_delay, spin_iters_for_ns};
 
 use rust_rb::spmc::RingBuffer;
 use rust_rb::wait::{NoOpWait, PauseWait, SelfTimed, YieldWait};
@@ -28,33 +28,38 @@ use rust_rb::wait::{NoOpWait, PauseWait, SelfTimed, YieldWait};
 const NUM_ITERATIONS: i64 = 100_000_000;
 const CAPACITY: usize = 32_768;
 
-/// Push `iters` items through a ring with one consumer per `delays` entry
-/// (0 = flat out, n = spin-delay iterations per pop) and report the
-/// producer's end-to-end throughput plus each consumer's own throughput.
+/// Push `iters` items through a ring with one consumer per `delay_ns` entry
+/// (0 = flat out, n = a ~n ns spin per pop, calibrated on that consumer's
+/// own core) and report the producer's end-to-end throughput plus each
+/// consumer's own throughput.
 ///
 /// Every consumer observes every message (multicast), so each pops `iters`
 /// items. Consumers time themselves from their first pop to strip
 /// startup skew.
-fn run<P, C>(name: &str, iters: i64, capacity: usize, delays: &[u32], cores: &[usize])
+fn run<P, C>(name: &str, iters: i64, capacity: usize, delay_ns: &[u32], cores: &[usize])
 where
     P: SelfTimed + Send + Sync + 'static,
     C: SelfTimed + Send + Sync + 'static,
 {
-    assert!(cores.len() > delays.len(), "not enough consumer cores");
+    assert!(cores.len() > delay_ns.len(), "not enough consumer cores");
     let (mut tx, rx) = RingBuffer::<i64, P, C>::with_wait_strategies(capacity);
-    let mut consumers = Vec::with_capacity(delays.len());
+    let mut consumers = Vec::with_capacity(delay_ns.len());
     consumers.push(rx);
-    for _ in 1..delays.len() {
+    for _ in 1..delay_ns.len() {
         consumers.push(tx.subscribe().expect("subscribe"));
     }
 
     let threads: Vec<_> = consumers
         .into_iter()
-        .zip(delays)
+        .zip(delay_ns)
         .zip(&cores[1..])
-        .map(|((mut rx, &delay), &core)| {
+        .map(|((mut rx, &ns), &core)| {
             std::thread::spawn(move || {
                 pin(core);
+                // Calibrated HERE, on the pinned core: producer-core
+                // calibration is wrong by the clusters' spin-cost ratio
+                // whenever this core sits on a different cluster.
+                let delay = spin_iters_for_ns(ns);
                 let _ = rx.pop().unwrap();
                 let start = Instant::now();
                 for _ in 1..iters {
@@ -95,7 +100,7 @@ where
 /// aarch64 Linux reads the generic timer (a few ns per read), so per-op
 /// sampling is honest at this rate — but it does add ~2 timer reads of
 /// overhead per push, so the run's *throughput* is not quotable.
-fn run_backpressure<P, C>(name: &str, iters: usize, capacity: usize, delay: u32, cores: &[usize])
+fn run_backpressure<P, C>(name: &str, iters: usize, capacity: usize, delay_ns: u32, cores: &[usize])
 where
     P: SelfTimed + Send + Sync + 'static,
     C: SelfTimed + Send + Sync + 'static,
@@ -110,6 +115,9 @@ where
         let barrier = std::sync::Arc::clone(&barrier);
         std::thread::spawn(move || {
             pin(consumer_core);
+            // Per-core calibration, before the barrier so it cannot skew
+            // the producer's latency samples.
+            let delay = spin_iters_for_ns(delay_ns);
             barrier.wait();
             let start = Instant::now();
             for _ in 0..iters {
@@ -147,17 +155,22 @@ where
 
 fn main() {
     announce_machine();
-    let cores = core_list_announced("bench_spmc", &[15, 16, 17, 18, 19]);
+    // Defaults: producer + first four consumers on one X925 cluster of the
+    // GB10 (15-19), the N=8 overflow on the second X925 cluster (5-8). An
+    // N>4 run therefore mixes clusters on this box — labeled below.
+    let cores = core_list_announced("bench_spmc", &[15, 16, 17, 18, 19, 5, 6, 7, 8]);
     assert!(
         cores.len() >= 5,
         "bench_spmc needs a producer core and four consumer cores"
     );
+    let n8 = cores.len() > 8;
+    if !n8 {
+        println!("(pass 8 consumer cores to include the N=8 scaling point)");
+    }
 
-    // Calibrate the rate-limit knob on the (pinned) producer core.
-    pin(cores[0]);
-    let spin_ns = spin_ns_per_iter();
-    let d50 = ((50.0 / spin_ns) as u32).max(1);
-    println!("spin_loop hint: {spin_ns:.2} ns/iter; ~50 ns rate limit = {d50} iters");
+    // Rate limits are given in ns; each rate-limited consumer calibrates
+    // the spin knob on its own (pinned) core.
+    const D50_NS: u32 = 50;
 
     // Run twice, as the other benches do, to let caches/governors settle;
     // quote the second pass.
@@ -167,18 +180,38 @@ fn main() {
         run::<PauseWait, PauseWait>("SPMC_Pause N=1", NUM_ITERATIONS, CAPACITY, &[0], &cores);
         run::<YieldWait, YieldWait>("SPMC_Yield N=1", NUM_ITERATIONS, CAPACITY, &[0], &cores);
         run::<NoOpWait, NoOpWait>("SPMC_NoOp N=1", NUM_ITERATIONS, CAPACITY, &[0], &cores);
-        // 2. N-scaling with all consumers keeping up.
+        // 2. N-scaling with all consumers keeping up (plan §5 item 2:
+        //    N ∈ {2,4,8}; 16 exceeds this box's homogeneous cores. The
+        //    caught-up curve is layout-dominated — see rust-rb-vio: adjacent
+        //    -slot false sharing, flat with line-isolated elements).
         run::<YieldWait, YieldWait>("SPMC_Yield N=2", NUM_ITERATIONS, CAPACITY, &[0; 2], &cores);
         run::<YieldWait, YieldWait>("SPMC_Yield N=4", NUM_ITERATIONS, CAPACITY, &[0; 4], &cores);
         run::<PauseWait, PauseWait>("SPMC_Pause N=2", NUM_ITERATIONS, CAPACITY, &[0; 2], &cores);
         run::<PauseWait, PauseWait>("SPMC_Pause N=4", NUM_ITERATIONS, CAPACITY, &[0; 4], &cores);
+        if n8 {
+            // Mixed-cluster on GB10 (see the core-list note above).
+            run::<YieldWait, YieldWait>(
+                "SPMC_Yield N=8*",
+                NUM_ITERATIONS,
+                CAPACITY,
+                &[0; 8],
+                &cores,
+            );
+            run::<PauseWait, PauseWait>(
+                "SPMC_Pause N=8*",
+                NUM_ITERATIONS,
+                CAPACITY,
+                &[0; 8],
+                &cores,
+            );
+        }
         // 3. Backpressure latency percentiles on a small, permanently-gated
         //    ring.
         run_backpressure::<PauseWait, PauseWait>(
             "SPMC_gated cap=1024",
             2_000_000,
             1024,
-            d50,
+            D50_NS,
             &cores,
         );
         // 4. Straggler: two fast consumers + one rate-limited; the producer
@@ -188,7 +221,7 @@ fn main() {
             "SPMC_straggler N=3",
             20_000_000,
             CAPACITY,
-            &[0, 0, d50],
+            &[0, 0, D50_NS],
             &cores,
         );
     }

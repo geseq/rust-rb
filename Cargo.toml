@@ -62,6 +62,26 @@ name = "bench_broadcast"
 path = "examples/bench_broadcast.rs"
 
 [[example]]
+name = "probe_coherence"
+path = "examples/probe_coherence.rs"
+
+[[example]]
+name = "probe_ring_scaling"
+path = "examples/probe_ring_scaling.rs"
+
+[[example]]
+name = "bench_spmc_bytes"
+path = "examples/bench_spmc_bytes.rs"
+
+[[example]]
+name = "bench_broadcast_bytes"
+path = "examples/bench_broadcast_bytes.rs"
+
+[[example]]
+name = "bench_anchored"
+path = "examples/bench_anchored.rs"
+
+[[example]]
 name = "bench_shm"
 path = "examples/bench_shm.rs"
 required-features = ["shm"]

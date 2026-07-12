@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 
 #[path = "common/mod.rs"]
 mod common;
-use common::{announce_machine, core_list_announced, pin, spin_delay, spin_ns_per_iter};
+use common::{announce_machine, core_list_announced, pin, spin_delay, spin_iters_for_ns};
 
 use rust_rb::broadcast::{Consumer, NoUninit, PopError, RingBuffer};
 use rust_rb::wait::NoOpWait;
@@ -97,6 +97,10 @@ fn run_broadcast(name: &str, iters: u64, capacity: usize, delays: &[u32], cores:
             let barrier = Arc::clone(&barrier);
             std::thread::spawn(move || {
                 pin(core);
+                // Rate limits arrive in ns and are calibrated on this
+                // consumer's own (pinned) core — producer-core calibration
+                // is wrong across clusters on a heterogeneous part.
+                let delay = spin_iters_for_ns(delay);
                 barrier.wait();
                 consume_all(&mut rx, delay)
             })
@@ -208,17 +212,23 @@ fn main() {
             "strict word-wise atomic (default)"
         }
     );
-    let cores = core_list_announced("bench_broadcast", &[15, 16, 17, 18, 19]);
+    // Defaults: producer + first four consumers on one X925 cluster of the
+    // GB10 (15-19), the k=8 overflow on the second X925 cluster (5-8). A
+    // k>4 run therefore mixes clusters on this box — labeled below.
+    let cores = core_list_announced("bench_broadcast", &[15, 16, 17, 18, 19, 5, 6, 7, 8]);
     assert!(
         cores.len() >= 5,
         "bench_broadcast needs a producer core and four consumer cores"
     );
+    let k8 = cores.len() > 8;
+    if !k8 {
+        println!("(pass 8 consumer cores to include the k=8 scaling point)");
+    }
 
-    // Calibrate the rate-limit knob on the (pinned) producer core.
+    // Rate limits are given in ns; each rate-limited consumer calibrates
+    // the spin knob on its own (pinned) core.
+    const D200_NS: u32 = 200;
     pin(cores[0]);
-    let spin_ns = spin_ns_per_iter();
-    let d200 = ((200.0 / spin_ns) as u32).max(1);
-    println!("spin_loop hint: {spin_ns:.2} ns/iter; ~200 ns rate limit = {d200} iters");
 
     // Run twice, as the other benches do, to let caches/governors settle;
     // quote the second pass.
@@ -230,6 +240,10 @@ fn main() {
         run_broadcast("BCAST_i64 k=1", NUM_ITERATIONS, CAPACITY, &[0; 1], &cores);
         run_broadcast("BCAST_i64 k=2", NUM_ITERATIONS, CAPACITY, &[0; 2], &cores);
         run_broadcast("BCAST_i64 k=4", NUM_ITERATIONS, CAPACITY, &[0; 4], &cores);
+        if k8 {
+            // Mixed-cluster on GB10 (see the core-list note above).
+            run_broadcast("BCAST_i64 k=8*", NUM_ITERATIONS, CAPACITY, &[0; 8], &cores);
+        }
         // 6. Copy A/B (this build's side; rebuild with the volatile cfg for
         //    the other side).
         run_copy_stream::<8>(20_000_000, CAPACITY, &cores);
@@ -241,6 +255,6 @@ fn main() {
         // 7. Lap behavior: tiny ring, one deliberately slow consumer — the
         //    producer should be unaffected; loss accounting must be exact
         //    (accepted + missed == pushed).
-        run_broadcast("BCAST_lap cap=64", 20_000_000, 64, &[d200], &cores);
+        run_broadcast("BCAST_lap cap=64", 20_000_000, 64, &[D200_NS], &cores);
     }
 }
