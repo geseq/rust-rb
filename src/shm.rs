@@ -2067,14 +2067,12 @@ where
     pub unsafe fn recover_shm_with(fd: BorrowedFd<'_>) -> io::Result<SpmcElemPair<T, P, C>> {
         let opened = Self::open(fd)?;
         let producer_anchor = spmc_attach_producer_anchor::<C>(&opened, true)?;
-        let resume = reset_gate_table(
+        let (resume, claim) = reset_and_claim_gate_table(
             &opened.region,
             SPMC_TABLE_OFFSET,
             opened.max_consumers,
             opened.capacity as u64,
-        );
-        let claim = claim_table_slot(&opened.region, SPMC_TABLE_OFFSET, opened.max_consumers)
-            .expect("freshly reset table has free slots");
+        )?;
         // Move the fresh slot back to the resume point (a lower cursor only
         // gates the producer more — and the producer is us, not yet pushing).
         opened
@@ -2290,14 +2288,12 @@ where
         let opened = Self::open(fd)?;
         let producer_anchor = spmc_attach_producer_anchor::<C>(&opened, true)?;
         opened.region.spmc_aux().store(0, Ordering::Release);
-        let resume = reset_gate_table(
+        let (resume, claim) = reset_and_claim_gate_table(
             &opened.region,
             SPMC_TABLE_OFFSET,
             opened.max_consumers,
             opened.capacity as u64,
-        );
-        let claim = claim_table_slot(&opened.region, SPMC_TABLE_OFFSET, opened.max_consumers)
-            .expect("freshly reset table has free slots");
+        )?;
         opened
             .region
             .slot_cursor(claim.slot)
@@ -3422,9 +3418,15 @@ pub(crate) fn claim_table_slot(
 /// an unconditional rollback could store the sentinel over a *new* ring's
 /// freshly-claimed cursor and CAS its `ACTIVE@e` control (epochs restart, so
 /// `e` can collide) back to FREE. In that case the only safe move is to
-/// touch nothing — at worst our claim landed after the reset and leaks one
-/// slot in the new table until the next `recover_shm`, which is the safe
-/// direction (a leak, never a clobber). Under an unchanged generation the
+/// touch nothing — the claim landed after the reset and leaves a **phantom**
+/// `ACTIVE` slot owned by no live handle. Touching nothing is the safe
+/// direction (a leak, never a clobber), but the phantom is not free of
+/// consequence: its frozen near-tail cursor **gates the producer** once the
+/// tail laps it (a bounded liveness stall), and on a full table it denies the
+/// recoverer its own slot — the recover path handles that by re-freeing and
+/// retrying (see [`reset_and_claim_gate_table`]) rather than crashing. Either
+/// way the next `recover_shm` frees the phantom. Under an unchanged generation
+/// the
 /// claimant still owns the ACTIVE slot exclusively (only `force_detach` can
 /// move it, and the epoch-conditional CAS below fails harmlessly on a
 /// retired slot), so the sentinel store and the CASes are sound.
@@ -3552,6 +3554,58 @@ fn reset_gate_table(
     // Seqlock close: even generation, strictly greater than before.
     generation.store((g | 1).wrapping_add(1), Ordering::Release);
     tail.wrapping_sub(max_lag)
+}
+
+/// Bound on `reset_and_claim_gate_table`'s retry against a storm of
+/// concurrent attaches. Each concurrent attacher makes at most one claim
+/// attempt per `open()` and then bails on the generation change (it does not
+/// re-attempt), so the racer pool drains and one attempt normally suffices;
+/// the bound only guards a pathological, unbounded attach storm — turning a
+/// would-be `panic!` into a recoverable `io::Error`.
+const RECOVER_CLAIM_ATTEMPTS: usize = 16;
+
+/// Reset a consumer/anchor table (recover) **and** claim the recoverer's own
+/// slot, returning the at-least-once resume cursor and the claim.
+///
+/// The subtlety this closes: [`reset_gate_table`] frees every slot, but a
+/// concurrent `attach`/`subscribe` whose [`claim_table_slot`] CAS interleaves
+/// between our reset and our claim can grab the just-freed slot. Its own
+/// post-claim generation re-check then fails (we bumped the generation) and
+/// [`release_table_claim`] leaves the slot **ACTIVE, untouched** (the
+/// documented "leak, never clobber" path) — a phantom slot owned by no live
+/// handle. On a single-slot table that phantom would leave the recover path
+/// with no free slot; the old code `panic!`ed there. Here we instead re-run
+/// the reset (which unconditionally frees the phantom too) and retry the
+/// claim, keeping the **original** resume cursor (only the first reset sees
+/// the real pre-reset consumer lag; later resets see an already-frozen table
+/// and would compute `tail`, discarding at-least-once progress). After
+/// [`RECOVER_CLAIM_ATTEMPTS`] we surface an `io::Error` rather than crash.
+///
+/// Note this closes the recover-side crash but not the phantom itself: on a
+/// table with two or more slots a racing attach can still strand a phantom in
+/// a *different* slot, which persists (frozen cursor) and gates the producer
+/// until the next `recover_shm` frees it — see [`release_table_claim`].
+fn reset_and_claim_gate_table(
+    region: &ShmRegion,
+    table_offset: usize,
+    max_slots: usize,
+    capacity: u64,
+) -> io::Result<(u64, SlotClaim)> {
+    let resume = reset_gate_table(region, table_offset, max_slots, capacity);
+    for _ in 0..RECOVER_CLAIM_ATTEMPTS {
+        if let Some(claim) = claim_table_slot(region, table_offset, max_slots) {
+            return Ok((resume, claim));
+        }
+        // A concurrent attach claimed the last free slot in our window and
+        // then rolled back to a no-op phantom; re-free every slot (phantom
+        // included) and retry, preserving the original resume point.
+        reset_gate_table(region, table_offset, max_slots, capacity);
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AddrInUse,
+        "recover raced a sustained storm of concurrent attaches for the \
+         last table slot; retry once contention subsides",
+    ))
 }
 
 /// The shm backing for a gating **producer** (SPMC and anchored kinds):
@@ -4181,14 +4235,12 @@ where
     pub unsafe fn recover_shm_with(fd: BorrowedFd<'_>) -> io::Result<AnchElemPair<T, P, C>> {
         let opened = Self::open(fd, false)?;
         let producer_anchor = anch_attach_producer_anchor::<C>(&opened, true)?;
-        let resume = reset_gate_table(
+        let (resume, claim) = reset_and_claim_gate_table(
             &opened.region,
             opened.table_offset,
             opened.max_anchors,
             opened.capacity as u64,
-        );
-        let claim = claim_table_slot(&opened.region, opened.table_offset, opened.max_anchors)
-            .expect("freshly reset table has free slots");
+        )?;
         // Move the fresh slot back to the resume point (a lower cursor only
         // gates the producer more — and the producer is us, not yet pushing).
         opened
@@ -4472,14 +4524,12 @@ where
         // Heal BEFORE the table reset: the floor and the latest repair are
         // producer-session state, independent of the anchor table.
         let floor = bytes_heal_on_attach(&opened.region);
-        let resume = reset_gate_table(
+        let (resume, claim) = reset_and_claim_gate_table(
             &opened.region,
             opened.table_offset,
             opened.max_anchors,
             opened.capacity as u64,
-        );
-        let claim = claim_table_slot(&opened.region, opened.table_offset, opened.max_anchors)
-            .expect("freshly reset table has free slots");
+        )?;
         opened
             .region
             .anch_slot_cursor(opened.table_offset, claim.slot)

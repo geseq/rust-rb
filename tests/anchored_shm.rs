@@ -1183,3 +1183,73 @@ fn bytes_closed_contract() {
         "observer: drained + closed"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Recover must never PANIC when a concurrent attach races its table reset.
+//
+// A `subscribe`/`attach` whose `claim_table_slot` CAS lands between recover's
+// `reset_gate_table` and its own claim grabs the just-freed slot; its
+// post-claim generation re-check then fails and `release_table_claim` leaves
+// the slot ACTIVE-but-ownerless (a phantom). On a single-slot table that
+// phantom used to leave recover with no free slot and a `.expect` panic.
+// The fix re-frees (reset also clears phantoms) and retries, and falls back
+// to an `AddrInUse` error under a sustained storm — never a panic. This test
+// hammers the window; it cannot false-fail (the fixed path is panic-free by
+// construction), it only guards against the panic returning.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn recover_never_panics_racing_concurrent_attach() {
+    use std::sync::atomic::{AtomicBool, Ordering as O};
+    use std::sync::Arc;
+
+    let fd = memfd("anch-recover-race").unwrap();
+    // A single anchor slot maximizes the odds that a racing attach steals the
+    // recoverer's only slot — the case that used to panic.
+    // SAFETY: fresh private memfd.
+    let (tx0, rx0) = unsafe { RingBuffer::<u64>::create_shm(fd.as_fd(), 16, 1) }.unwrap();
+    drop(rx0);
+    drop(tx0);
+
+    let raw = fd.as_raw_fd();
+    let stop = Arc::new(AtomicBool::new(false));
+
+    // Two attacker threads spin attach/detach on the shared fd.
+    let attackers: Vec<_> = (0..8)
+        .map(|_| {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                // SAFETY: `raw` names the live memfd the parent keeps open for
+                // the whole test; each attach makes its own fresh handle.
+                let borrowed = unsafe { BorrowedFd::borrow_raw(raw) };
+                while !stop.load(O::Relaxed) {
+                    if let Ok(a) = unsafe { ElemRing::attach_shm_anchor(borrowed) } {
+                        drop(a);
+                    }
+                }
+            })
+        })
+        .collect();
+
+    // The recoverer loops; every outcome must be Ok or the specific
+    // AddrInUse fallback — reaching either proves no panic fired.
+    for _ in 0..3000 {
+        // SAFETY: cooperating handles only; recover force-claims the producer.
+        match unsafe { RingBuffer::<u64>::recover_shm(fd.as_fd()) } {
+            Ok((tx, rx)) => {
+                drop(tx);
+                drop(rx);
+            }
+            Err(e) => assert_eq!(
+                e.kind(),
+                std::io::ErrorKind::AddrInUse,
+                "recover may only fall back to AddrInUse, never panic or error otherwise"
+            ),
+        }
+    }
+
+    stop.store(true, O::Relaxed);
+    for a in attackers {
+        a.join().unwrap();
+    }
+}
