@@ -189,6 +189,7 @@
 mod atomic_copy;
 mod cache_padded;
 mod cursor;
+mod padded;
 #[cfg(target_has_atomic = "64")]
 mod registry;
 
@@ -216,6 +217,8 @@ pub mod wait;
 #[cfg(target_has_atomic = "64")]
 #[doc(inline)]
 pub use broadcast::NoUninit;
+#[doc(inline)]
+pub use padded::Padded;
 #[doc(inline)]
 pub use spsc::{Consumer, Producer, RingBuffer};
 #[doc(inline)]

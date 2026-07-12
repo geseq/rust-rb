@@ -75,9 +75,19 @@ fn print_consumer_stats(stats: &[(Duration, u64, u64, u64)], pushed: u64) {
 /// consumers attached (one rate-limit knob each) and report the producer's
 /// push throughput — measured over the push loop alone, since a lossy
 /// producer never waits for consumers — plus per-consumer loss accounting.
-fn run_broadcast(name: &str, iters: u64, capacity: usize, delays: &[u32], cores: &[usize]) {
+/// `tail_batch = 1` is the exact per-push default; larger amortizes the
+/// tail publication (`Producer::set_tail_batch`, rust-rb-6l0).
+fn run_broadcast(
+    name: &str,
+    iters: u64,
+    capacity: usize,
+    tail_batch: usize,
+    delays: &[u32],
+    cores: &[usize],
+) {
     assert!(cores.len() > delays.len(), "not enough consumer cores");
     let (mut tx, rx) = RingBuffer::<i64, NoOpWait>::with_wait_strategies(capacity);
+    tx.set_tail_batch(tail_batch);
     let mut consumers = Vec::with_capacity(delays.len());
     if delays.is_empty() {
         drop(rx);
@@ -236,13 +246,60 @@ fn main() {
         println!("--- pass {pass} ---");
         // 5. Producer-throughput independence vs k caught-up spinning
         //    consumers — the tail-spin design's gate: flat-ish vs k.
-        run_broadcast("BCAST_i64 k=0", NUM_ITERATIONS, CAPACITY, &[], &cores);
-        run_broadcast("BCAST_i64 k=1", NUM_ITERATIONS, CAPACITY, &[0; 1], &cores);
-        run_broadcast("BCAST_i64 k=2", NUM_ITERATIONS, CAPACITY, &[0; 2], &cores);
-        run_broadcast("BCAST_i64 k=4", NUM_ITERATIONS, CAPACITY, &[0; 4], &cores);
+        run_broadcast("BCAST_i64 k=0", NUM_ITERATIONS, CAPACITY, 1, &[], &cores);
+        run_broadcast(
+            "BCAST_i64 k=1",
+            NUM_ITERATIONS,
+            CAPACITY,
+            1,
+            &[0; 1],
+            &cores,
+        );
+        run_broadcast(
+            "BCAST_i64 k=2",
+            NUM_ITERATIONS,
+            CAPACITY,
+            1,
+            &[0; 2],
+            &cores,
+        );
+        run_broadcast(
+            "BCAST_i64 k=4",
+            NUM_ITERATIONS,
+            CAPACITY,
+            1,
+            &[0; 4],
+            &cores,
+        );
+        // 5b. The same spinning-consumer grid with the amortized tail
+        //     publication knob (set_tail_batch(8)) — the rust-rb-6l0
+        //     mitigation; compare against the per-push rows above.
+        run_broadcast(
+            "BCAST_i64 k=1 tb=8",
+            NUM_ITERATIONS,
+            CAPACITY,
+            8,
+            &[0; 1],
+            &cores,
+        );
+        run_broadcast(
+            "BCAST_i64 k=4 tb=8",
+            NUM_ITERATIONS,
+            CAPACITY,
+            8,
+            &[0; 4],
+            &cores,
+        );
         if k8 {
             // Mixed-cluster on GB10 (see the core-list note above).
-            run_broadcast("BCAST_i64 k=8*", NUM_ITERATIONS, CAPACITY, &[0; 8], &cores);
+            run_broadcast(
+                "BCAST_i64 k=8*",
+                NUM_ITERATIONS,
+                CAPACITY,
+                1,
+                &[0; 8],
+                &cores,
+            );
         }
         // 6. Copy A/B (this build's side; rebuild with the volatile cfg for
         //    the other side).
@@ -255,6 +312,6 @@ fn main() {
         // 7. Lap behavior: tiny ring, one deliberately slow consumer — the
         //    producer should be unaffected; loss accounting must be exact
         //    (accepted + missed == pushed).
-        run_broadcast("BCAST_lap cap=64", 20_000_000, 64, &[D200_NS], &cores);
+        run_broadcast("BCAST_lap cap=64", 20_000_000, 64, 1, &[D200_NS], &cores);
     }
 }

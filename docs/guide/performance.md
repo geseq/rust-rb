@@ -268,10 +268,9 @@ probes; correctness unaffected in both):
   `probe_ring_scaling` shows the same grid with a line-isolated 64-byte
   element is flat: 3.89 / 3.90 / 4.11 ns at N=1/2/4. The synthetic floor
   (`probe_coherence`) confirms the published cursor itself is nearly free
-  (< 2 ns even with 8 spinning readers). Latency-sensitive fan-out
-  workloads can therefore flatten the curve today by padding `T` to a
-  cache line; whether the ring should offer a padded-slot layout knob is a
-  design decision tracked on the issue.
+  (< 2 ns even with 8 spinning readers). **Mitigation shipped**: wrap the
+  element in [`Padded<T>`](crate::Padded) for line-isolated slots — see the
+  [configuration guide](crate::guide::configuration) for the trade-off.
 - **Lossy caught-up coupling** (`rust-rb-6l0`): 4.52 ns/push alone, 24.8
   with one caught-up spinning reader, 57.3 with four, 150.6 at the
   mixed-cluster k=8* point — while a lagging reader decouples the producer
@@ -282,10 +281,14 @@ probes; correctness unaffected in both):
   (producer: 3 stores, reader: 2 seq loads + copy per message). It is
   **not** adjacent-slot sharing: line-isolating the 16-byte slots makes it
   *worse* (43 vs 26 ns at k=1 — the packed layout amortizes transfers), so
-  the layout stays. A batched-tail knob would trade per-push visibility
-  latency for k-independence; the adaptive publish the SPSC ring uses is
-  impossible here (the producer keeps zero consumer knowledge by design).
-  Tracked on the issue as a design decision.
+  the layout stays. **Mitigation shipped**:
+  [`Producer::set_tail_batch`](crate::broadcast::Producer::set_tail_batch)
+  amortizes the publication (measured with the real knob at `n = 8`: k=1
+  24.6 → 15.2, k=4 50.1 → 19.7 ns/push) at the cost of up to `n - 1`
+  pushed-but-invisible messages until a boundary,
+  [`flush`](crate::broadcast::Producer::flush), or drop; the adaptive
+  publish the SPSC ring uses is impossible here (the producer keeps zero
+  consumer knowledge by design). Default stays exact per-push.
 
 The **byte** rings (`bench_spmc_bytes`, `bench_broadcast_bytes`): gating
 byte framing at N=1 runs 8.8–9.7 ns/msg at 8 B (drain ≈ pop) rising with

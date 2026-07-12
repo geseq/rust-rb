@@ -402,6 +402,8 @@ where
             buf,
             mask: shared.mask,
             next_seq: 0,
+            tail_batch: 1,
+            unpublished: 0,
             tail,
             closed,
             anchor: ProducerAnchor::Heap(shared),
@@ -493,8 +495,14 @@ pub struct Producer<T> {
     /// `capacity - 1` (cached).
     mask: u64,
     /// Next sequence to write (producer-private; equals the published tail
-    /// between pushes).
+    /// between pushes whenever `unpublished == 0`).
     next_seq: u64,
+    /// Publish the tail at least every this many pushes (default 1 —
+    /// per-push, the exact-visibility baseline). See
+    /// [`set_tail_batch`](Self::set_tail_batch).
+    tail_batch: u64,
+    /// Pushes since the last tail publication (always `< tail_batch`).
+    unpublished: u64,
     /// The shared tail (cached raw pointer; heap: into the `Arc`, shm: into
     /// the mapped region — the hot publish path is identical).
     tail: NonNull<AtomicU64>,
@@ -519,6 +527,15 @@ impl<T> Drop for Producer<T> {
         // fork-inherited copy or superseded zombie must not end the
         // successor's session.
         if self.anchor.teardown_allowed() {
+            // Publish any tail debt a `set_tail_batch` window is holding —
+            // closed-and-drained must mean drained of *everything pushed*.
+            // Same guard as the close flag: a superseded zombie or
+            // fork-inherited copy must not touch the successor's tail.
+            if self.unpublished > 0 {
+                // SAFETY: `tail` points into shared state the anchor keeps
+                // alive.
+                unsafe { self.tail.as_ref() }.store(self.next_seq, Ordering::Release);
+            }
             // SAFETY: `closed` points into shared state the anchor keeps
             // alive.
             unsafe { self.closed.as_ref() }.store(1, Ordering::Release);
@@ -551,11 +568,66 @@ impl<T: NoUninit> Producer<T> {
         // Publish the slot: an exact-match reader accepts generation 2s+2.
         slot.seq.store(2 * s + 2, Ordering::Release);
         self.next_seq = s + 1;
-        // Publish the frontier — per push [P-F4]: this is the only line
-        // consumers spin on, and it makes `Lagged` counts and subscribe
-        // join points exact for free.
-        // SAFETY: `tail` points into shared state the anchor keeps alive.
-        unsafe { self.tail.as_ref() }.store(self.next_seq, Ordering::Release);
+        // Publish the frontier: per push by default [P-F4] — the tail is
+        // the only line consumers spin on, and per-push publication makes
+        // visibility, `Lagged` counts, and subscribe join points exact for
+        // free. Under `set_tail_batch(n)` the store is amortized to every
+        // n-th push: caught-up spinning readers steal the tail line on
+        // every store, so each skipped store is a coherence round the
+        // producer does not pay (`rust-rb-6l0`).
+        self.unpublished += 1;
+        if self.unpublished >= self.tail_batch {
+            self.unpublished = 0;
+            // SAFETY: `tail` points into shared state the anchor keeps
+            // alive.
+            unsafe { self.tail.as_ref() }.store(self.next_seq, Ordering::Release);
+        }
+    }
+
+    /// Publish everything pushed so far, making it visible to consumers
+    /// immediately.
+    ///
+    /// A no-op at the default per-push publication; under
+    /// [`set_tail_batch`](Self::set_tail_batch) call this at burst
+    /// boundaries so the tail never trails a quiet producer.
+    #[inline]
+    pub fn flush(&mut self) {
+        if self.unpublished > 0 {
+            self.unpublished = 0;
+            // SAFETY: `tail` points into shared state the anchor keeps
+            // alive.
+            unsafe { self.tail.as_ref() }.store(self.next_seq, Ordering::Release);
+        }
+    }
+
+    /// Publish the tail at least every `batch` pushes instead of on every
+    /// push (clamped to `[1, capacity / 8]`; `1` — the default — restores
+    /// exact per-push visibility). Returns the clamp actually applied.
+    ///
+    /// **The trade**: caught-up *spinning* consumers pull the tail line
+    /// away after every store, so per-push publication couples the
+    /// producer to its readers — on a GB10/X925, 4.5 ns/push alone became
+    /// 25.9/35.6/56.6 ns with 1/2/4 spinning readers, and `batch = 8` cut
+    /// those to 12.7/16.6/19.6 (`rust-rb-6l0`). In exchange, up to
+    /// `batch - 1` already-pushed messages stay invisible until the next
+    /// boundary, [`flush`](Self::flush), or producer drop — so bursty or
+    /// latency-critical streams should keep the default and flush-heavy
+    /// pipelines should call `flush` when going idle.
+    ///
+    /// Everything else is unchanged: consumers never see torn records
+    /// (the per-slot seqlock validates independently of the tail),
+    /// `Lagged` accounting stays exact against the published frontier, and
+    /// a subscriber's join point is the published tail.
+    pub fn set_tail_batch(&mut self, batch: usize) -> usize {
+        let max = ((self.mask + 1) / 8).max(1);
+        let batch = (batch as u64).clamp(1, max);
+        self.tail_batch = batch;
+        // Shrinking the window must not leave an already-oversized debt
+        // pending past the new bound.
+        if self.unpublished >= batch {
+            self.flush();
+        }
+        batch as usize
     }
 
     /// Subscribe a new consumer with wait strategy `C`; its join point is
@@ -589,8 +661,12 @@ impl<T: NoUninit> Producer<T> {
         }
     }
 
-    /// Number of messages published so far (the ring's frontier).
-    /// Producer-local and exact.
+    /// Number of messages **pushed** so far. Producer-local and exact.
+    ///
+    /// This is also the published frontier, except under
+    /// [`set_tail_batch`](Self::set_tail_batch), where the published tail
+    /// may trail it by up to `batch - 1` messages until the next boundary,
+    /// [`flush`](Self::flush), or drop.
     #[inline]
     pub fn tail(&self) -> u64 {
         self.next_seq
@@ -927,6 +1003,8 @@ impl<T> Producer<T> {
             buf,
             mask: capacity as u64 - 1,
             next_seq,
+            tail_batch: 1,
+            unpublished: 0,
             tail,
             closed,
             anchor: ProducerAnchor::Shm(anchor),

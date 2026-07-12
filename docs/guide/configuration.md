@@ -197,6 +197,44 @@ rejected at compile time.
 The SPSC rings accept any [`WaitStrategy`](crate::WaitStrategy), including
 `CvWait`.
 
+## Flat gating fan-out: `Padded<T>`
+
+The gating rings pack elements densely — eight `i64` slots per cache line —
+so N caught-up consumers copying element `s` repeatedly steal the line the
+producer is writing at `s+1..s+7`, and producer cost grows with N (measured
+GB10/X925, same-cluster Yield: 3.66 / 6.95 / 12.65 ns/push at N=1/2/4).
+Wrapping the element in [`Padded<T>`](crate::Padded) gives every slot its
+own line and flattens the curve (3.89 / 3.90 / 4.11 ns on the same grid) at
+the cost of `capacity × 64 B` of footprint:
+
+```rust
+use rust_rb::{spmc, Padded};
+
+let (mut tx, mut rx) = spmc::RingBuffer::<Padded<u64>>::new(1024);
+tx.push(Padded::new(7));
+assert_eq!(*rx.pop().unwrap(), 7);
+```
+
+Reach for it when fan-out scaling dominates; keep plain `T` for N=1 rings.
+Do **not** pad lossy elements — the packed layout measures *faster* there
+(and `Padded<T>` cannot be [`NoUninit`](crate::NoUninit) anyway).
+
+## The broadcast tail batch: `set_tail_batch`
+
+The lossy producer publishes its tail per push by default — exact
+visibility, exact `Lagged` counts. Caught-up *spinning* consumers pull that
+line away after every store, coupling the producer to its readers
+(GB10/X925: 4.5 ns/push alone → 24.6 / 33.9 / 50.1 ns with 1/2/4 spinning
+readers).
+[`Producer::set_tail_batch`](crate::broadcast::Producer::set_tail_batch)
+amortizes the publication to every n-th push (clamped to `capacity / 8`),
+cutting those to **15.2 / — / 19.7** at `n = 8` — in exchange for up to
+`n - 1` pushed-but-invisible messages until the next boundary,
+[`flush`](crate::broadcast::Producer::flush), or producer drop. Keep the
+default for latency-critical or bursty streams; set the knob and `flush` at
+burst boundaries for throughput pipelines. Seqlock validation, loss
+accounting, and subscribe join points are unaffected.
+
 ## The broadcast reposition `slack`
 
 The lossy element ring has one knob of its own:
