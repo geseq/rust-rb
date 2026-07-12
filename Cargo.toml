@@ -87,6 +87,11 @@ path = "examples/bench_shm.rs"
 required-features = ["shm"]
 
 [[example]]
+name = "bench_shm_mc"
+path = "examples/bench_shm_mc.rs"
+required-features = ["shm"]
+
+[[example]]
 name = "ipc_pair"
 path = "examples/ipc_pair.rs"
 required-features = ["shm"]

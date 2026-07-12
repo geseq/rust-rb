@@ -297,6 +297,14 @@ protocol touches more shared lines per record) and free-runs at 6.97
 ns/push (9.2 GB/s at 64 B) with exact framed-byte lap accounting on the
 tiny-ring lap bench.
 
+**Over shared memory, cross-process** (`bench_shm_mc`; parent producer,
+each consumer its own child process): the multi-consumer backings price at
+heap parity — gating N=1/2 at 5.1 / 8.7 ns/push, lossy k=1/2 through
+**read-only** (`PROT_READ`) observer mappings at 23.4 / 41.3 (heap: 24.8 /
+38.2), mixed A=1 K=1 at 34.5 (heap: 35.5) — with zero lag events and exact
+delivery throughout. The shm backing itself adds nothing measurable; the
+coupling shapes above carry over unchanged.
+
 The **mixed** rings (`bench_anchored`): with zero anchors the producer
 free-runs at lossy parity (A=0 K=1 26.2 vs broadcast k=1 24.8 ns), and a
 straggling ~50 ns anchor is tracked (48.8 ns/push) with a riding observer
