@@ -679,6 +679,49 @@ fn dead_producer_latest_past_tail_drains_to_closed() {
     );
 }
 
+#[test]
+fn dead_producer_tail_below_pos_drains_to_closed_element() {
+    // Element twin of `dead_producer_latest_past_tail_drains_to_closed`:
+    // guards the element ring's `check_closed` drained test (`<=`, not `==`).
+    // A crashed producer observed through stale/rolled-back counters can
+    // leave a consumer's `pos` *ahead* of the committed tail; `==` would
+    // never match and spin the drain forever on the dead ring.
+    let fd = memfd("bcast-tail-below-pos").unwrap();
+    // Capacity >= 8 so five pushes never lap: the consumer keeps up exactly.
+    // SAFETY: fresh private memfd; u64 is ShmItem + NoUninit.
+    let mut tx = unsafe { RingBuffer::<u64>::create_shm(fd.as_fd(), 8) }.unwrap();
+    // Join at tail 0, then consume all five: pos advances to tail (5).
+    // SAFETY: cooperating handles only.
+    let mut rx = unsafe { RingBuffer::<u64>::attach_shm_consumer(fd.as_fd()) }.unwrap();
+    for i in 0..5u64 {
+        tx.push(i);
+    }
+    for i in 0..5u64 {
+        assert_eq!(rx.pop(), Ok(i), "keeps up, pos == tail == 5");
+    }
+    std::mem::forget(tx); // crash: lease held, counters as-is
+
+    // Inject the death: a rolled-back / stale tail lands *below* the
+    // consumer's drained position (pos = 5, tail poked to 3), then the
+    // session is marked closed (what a graceful drop would have stored).
+    assert_eq!(peek_u64(fd.as_fd(), OFF_TAIL), 5);
+    poke_u64(fd.as_fd(), OFF_TAIL, 3);
+    poke_u64(fd.as_fd(), OFF_CLOSED, 1);
+
+    // pos (5) is stranded past the committed tail (3): only the `<=` drained
+    // check reports Closed — `==` would spin this drain forever.
+    assert_eq!(
+        rx.pop().unwrap_err(),
+        PopError::Closed,
+        "the drain must terminate on the dead ring"
+    );
+    assert_eq!(
+        rx.try_pop().unwrap_err(),
+        PopError::Closed,
+        "try_pop agrees: closed and drained, not empty-but-open"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 6. Closed across processes: graceful producer drop -> the child drains
 //    then sees Closed; a new producer attach reopens the session.

@@ -769,7 +769,11 @@ impl<T: NoUninit, C: WaitStrategy> Consumer<T, C> {
         // SAFETY: `closed` points into shared state the anchor keeps alive.
         if unsafe { self.closed.as_ref() }.load(Ordering::Acquire) != 0 {
             self.refresh();
-            if self.tail_cache == self.pos {
+            // Drained is `<=`, not `==`: a header poke (or a producer crash
+            // observed through stale counters) can transiently leave `pos`
+            // *ahead* of the committed tail, and an equality check would
+            // then never report `Closed` — a drain livelock on a dead ring.
+            if self.tail_cache <= self.pos {
                 return Err(PopError::Closed);
             }
         }
