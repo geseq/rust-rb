@@ -584,9 +584,20 @@ fn tail_batch_defers_visibility_until_boundary_flush_or_drop() {
 #[test]
 fn tail_batch_is_clamped_and_shrinking_flushes_excess_debt() {
     let (mut tx, mut rx) = RingBuffer::<u64>::new(64);
-    // capacity / 8 = 8 is the ceiling; 0 floors to 1.
+    // capacity / 8 = 8 is the ceiling (default slack is also 8); 0 floors
+    // to 1.
     assert_eq!(tx.set_tail_batch(10_000), 8);
     assert_eq!(tx.set_tail_batch(0), 1);
+
+    // The slack bound: unpublished debt must stay below the reposition
+    // headroom, so batching never outruns the ring's slack — a lapped
+    // consumer would otherwise land in slots the unpublished frontier
+    // already overwrote and spin on Lagged{missed: 0} against an idle
+    // producer.
+    let (mut tx2, _rx2) = RingBuffer::<u64>::with_slack(64, 2);
+    assert_eq!(tx2.set_tail_batch(8), 2, "clamped to the ring's slack");
+    let (mut tx3, _rx3) = RingBuffer::<u64>::with_slack(64, 0);
+    assert_eq!(tx3.set_tail_batch(8), 1, "a slack-0 ring cannot batch");
 
     // Build up debt under a wide window, then shrink the window: the
     // now-oversized debt must flush rather than linger past the new bound.
@@ -603,16 +614,63 @@ fn tail_batch_is_clamped_and_shrinking_flushes_excess_debt() {
 
 #[test]
 fn lagged_accounting_stays_exact_under_tail_batch() {
-    // Tiny ring, wide-ish batch, no consumer progress: laps happen across
-    // batched publications and the loss count must still be exact.
-    let (mut tx, mut rx) = RingBuffer::<u64>::with_slack(8, 2);
-    tx.set_tail_batch(4);
-    for i in 0..40 {
-        tx.push(i);
-    }
-    drop(tx); // publishes the remainder, then closes
+    // The property under test: `Lagged` accounting stays exact while the
+    // published tail TRAILS the pushed frontier — so the schedule must
+    // interleave pops with outstanding publication debt, not drain a
+    // fully-flushed ring (which is indistinguishable from per-push).
+    let (mut tx, mut rx) = RingBuffer::<u64>::with_slack(64, 8);
+    assert_eq!(tx.set_tail_batch(8), 8, "the ring must genuinely batch");
+    let (mut accepted, mut missed, mut pushed) = (0u64, 0u64, 0u64);
 
-    let (mut accepted, mut missed) = (0u64, 0u64);
+    fn drain(rx: &mut Consumer<u64>, accepted: &mut u64, missed: &mut u64) {
+        loop {
+            match rx.try_pop() {
+                Ok(Some(_)) => *accepted += 1,
+                Ok(None) => break,
+                Err(PopError::Lagged { missed: m }) => *missed += m,
+                Err(PopError::Closed) => unreachable!("producer alive"),
+            }
+        }
+    }
+
+    // Phase 1 — lap with outstanding debt: 100 pushes publish only 96
+    // (12 boundaries), so the consumer's reposition runs against a tail
+    // that trails the frontier by 4.
+    for _ in 0..100 {
+        tx.push(pushed);
+        pushed += 1;
+    }
+    drain(&mut rx, &mut accepted, &mut missed);
+    assert_eq!(
+        accepted + missed,
+        96,
+        "exactly the published prefix is accounted; 4 pushed messages \
+         are still invisible debt"
+    );
+    tx.flush();
+    drain(&mut rx, &mut accepted, &mut missed);
+    assert_eq!(accepted + missed, pushed, "flush surfaces the debt");
+
+    // Phase 2 — stepped trailing tails: small bursts drained while the
+    // debt cycles through every residue of the batch window.
+    for _ in 0..50 {
+        for _ in 0..3 {
+            tx.push(pushed);
+            pushed += 1;
+        }
+        drain(&mut rx, &mut accepted, &mut missed);
+    }
+    tx.flush();
+    drain(&mut rx, &mut accepted, &mut missed);
+    assert_eq!(accepted + missed, pushed, "exact across stepped windows");
+
+    // Phase 3 — close with debt outstanding: drop flushes, then closes;
+    // closed-and-drained must deliver everything ever pushed.
+    for _ in 0..70 {
+        tx.push(pushed);
+        pushed += 1;
+    }
+    drop(tx);
     loop {
         match rx.pop() {
             Ok(_) => accepted += 1,
@@ -622,7 +680,7 @@ fn lagged_accounting_stays_exact_under_tail_batch() {
     }
     assert_eq!(
         accepted + missed,
-        40,
-        "exact loss accounting under batching"
+        pushed,
+        "exact loss accounting under batching, end to end"
     );
 }

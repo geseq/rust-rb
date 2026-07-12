@@ -87,7 +87,11 @@ fn run_broadcast(
 ) {
     assert!(cores.len() > delays.len(), "not enough consumer cores");
     let (mut tx, rx) = RingBuffer::<i64, NoOpWait>::with_wait_strategies(capacity);
-    tx.set_tail_batch(tail_batch);
+    assert_eq!(
+        tx.set_tail_batch(tail_batch),
+        tail_batch,
+        "bench config must not be silently clamped"
+    );
     let mut consumers = Vec::with_capacity(delays.len());
     if delays.is_empty() {
         drop(rx);

@@ -29,13 +29,19 @@ All notable changes to this project are documented here. The format follows
 - **Wait strategies**: `SleepWait` and `BackoffWait`; the `SelfTimed` marker
   gates the multi-consumer rings at the type level (`CvWait` rejected at
   compile time).
-- **`Padded<T>`** — cache-line-aligned element wrapper: flattens the gating
-  rings' caught-up fan-out curve (adjacent-slot false sharing) at the cost
-  of footprint.
+- **`Padded<T>`** — cache-line-aligned element wrapper: flattens the
+  **spmc** ring's caught-up fan-out curve (adjacent-slot false sharing) at
+  the cost of footprint; `ShmItem` whenever `T` is, so it works over shm.
+  Not applicable to the seqlock rings (broadcast/anchored need `NoUninit`,
+  and their packed layout measures faster anyway).
 - **`broadcast::Producer::set_tail_batch` / `flush`** — amortized tail
   publication for spinning-reader workloads (measured 24.6 → 15.2 ns/push
   at k=1, 50.1 → 19.7 at k=4 on GB10/X925); default unchanged (exact
-  per-push visibility).
+  per-push visibility). The batch is clamped to `min(capacity/8, slack)`
+  so publication debt can never outrun the reposition headroom; note that
+  batching widens *crash* loss to up to `batch - 1` accepted messages
+  (only a graceful drop flushes) and shrinks post-reposition headroom to
+  `slack - debt`.
 - **Bench + probe suite**: per-ring benchmark examples (element, bytes,
   anchored, cross-process shm) and two diagnostic probes
   (`probe_coherence`, `probe_ring_scaling`) that split any box's numbers

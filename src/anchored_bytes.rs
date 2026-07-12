@@ -139,7 +139,7 @@ use std::sync::atomic::{fence, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::atomic_copy::{copy_in_lanes, copy_out_lanes};
-use crate::broadcast_bytes::ALIGN;
+use crate::broadcast_bytes::{max_message_len, record_len, ALIGN, HEADER, PADDING};
 use crate::cache_padded::CachePadded;
 use crate::cursor::round_capacity;
 #[cfg(all(feature = "shm", target_os = "linux", target_has_atomic = "64"))]
@@ -167,40 +167,12 @@ pub use crate::spmc_bytes::{Closed, SubscribeError};
 type Word = UnsafeCell<u64>;
 
 /// Size of the length header preceding each payload.
-const HEADER: usize = 4;
-/// Header value marking a padding record that runs to the end of the buffer.
-const PADDING: u32 = u32::MAX;
 /// Smallest legal capacity: **16**, one power of two above the other byte
 /// rings' 8. With 8-aligned records an 8-byte ring's only frame needs the
 /// whole capacity, which the normative empty-registry gating default (own
 /// cursor minus one) can never grant — free-run would deadlock (see the
 /// module docs).
 pub(crate) const MIN_CAPACITY: usize = 16;
-
-#[inline(always)]
-const fn align_up(n: usize) -> usize {
-    (n + (ALIGN - 1)) & !(ALIGN - 1)
-}
-
-/// Bytes a record with a `len`-byte payload occupies in the ring.
-#[inline(always)]
-const fn record_len(len: usize) -> usize {
-    align_up(HEADER + len)
-}
-
-/// The largest payload a single message may carry: `capacity / 8` — the
-/// observers' loss-tolerance bound (see the module docs), clamped below the
-/// `u32` header space where `u32::MAX` marks padding.
-#[inline(always)]
-const fn max_message_len(capacity: usize) -> usize {
-    let cap = capacity / 8;
-    let header_space = (PADDING - 1) as usize;
-    if cap < header_space {
-        cap
-    } else {
-        header_space
-    }
-}
 
 /// The widest footprint one push can require free, in bytes: wrap padding
 /// plus a maximum-size record.
@@ -2156,25 +2128,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn record_len_is_8_aligned_header_inclusive() {
-        assert_eq!(record_len(0), 8);
-        assert_eq!(record_len(4), 8);
-        assert_eq!(record_len(5), 16);
-        assert_eq!(record_len(12), 16);
-        assert_eq!(record_len(13), 24);
-    }
-
-    #[test]
-    fn max_message_len_is_capacity_over_8() {
-        assert_eq!(max_message_len(16), 2);
-        assert_eq!(max_message_len(64), 8);
-        assert_eq!(max_message_len(1024), 128);
-        for cap in [16usize, 64, 1024, 4096] {
-            assert!(record_len(max_message_len(cap)) <= cap);
-        }
-    }
 
     /// The free-run soundness bound behind the 16-byte capacity floor: the
     /// empty-registry gating default grants `capacity - 1` bytes, so the

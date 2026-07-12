@@ -52,7 +52,10 @@
 //! producer must advance at least `slack` more before this consumer can lag
 //! again. Larger slack = fewer, bigger loss events; smaller = maximal
 //! salvage. For self-contained streams (market data), skip recovery entirely
-//! with [`Consumer::skip_to_latest`].
+//! with [`Consumer::skip_to_latest`]. (Under
+//! [`Producer::set_tail_batch`] the post-reposition headroom is `slack`
+//! minus the producer's unpublished debt — at least `slack - (batch - 1)`;
+//! the batch clamp keeps that ≥ 1.)
 //!
 //! # Membership
 //!
@@ -84,7 +87,9 @@
 //! * **Consumers spin on the shared `tail`, not the slot generations**: the
 //!   producer writes each slot's seqlock word 2–3× per message, so parking
 //!   spinners there would put per-message stores on a polled line. The tail
-//!   is one cursor line written once per push — the SPSC caught-up profile.
+//!   is one cursor line written once per push by default — the SPSC
+//!   caught-up profile — or once per batch under
+//!   [`Producer::set_tail_batch`].
 //! * **Per-slot seqlock, validate-only**: one generation fetch before the
 //!   copy, one fence + re-check after. Torn bytes are discarded as
 //!   `MaybeUninit` and never materialized as `T`.
@@ -244,7 +249,8 @@ pub(crate) const fn reposition_target(tail: u64, capacity: u64, slack: u64) -> u
 }
 
 /// The producer-published cache line: the tail (count of published
-/// messages, stored once per push) plus, co-located in the same padded slot,
+/// messages, stored once per push by default — amortized under
+/// `Producer::set_tail_batch`) plus, co-located in the same padded slot,
 /// the `closed` flag (written once by `Producer::drop`, read only on
 /// consumer would-block paths — the line consumers already poll).
 ///
@@ -384,6 +390,7 @@ where
         let producer = Producer {
             buf,
             mask: shared.mask,
+            slack: shared.slack,
             next_seq: 0,
             tail_batch: 1,
             unpublished: 0,
@@ -477,6 +484,12 @@ pub struct Producer<T> {
     buf: NonNull<Slot<T>>,
     /// `capacity - 1` (cached).
     mask: u64,
+    /// The ring's reposition slack (cached; ring-wide config). Bounds
+    /// [`set_tail_batch`](Self::set_tail_batch): unpublished debt must stay
+    /// below the headroom a lapped consumer repositions with, or the
+    /// consumer can land in slots the unpublished frontier already
+    /// overwrote (a Lagged{missed: 0} livelock on an idle producer).
+    slack: u64,
     /// Next sequence to write (producer-private; equals the published tail
     /// between pushes whenever `unpublished == 0`).
     next_seq: u64,
@@ -513,16 +526,94 @@ impl<T> Drop for Producer<T> {
             // Publish any tail debt a `set_tail_batch` window is holding —
             // closed-and-drained must mean drained of *everything pushed*.
             // Same guard as the close flag: a superseded zombie or
-            // fork-inherited copy must not touch the successor's tail.
-            if self.unpublished > 0 {
-                // SAFETY: `tail` points into shared state the anchor keeps
-                // alive.
-                unsafe { self.tail.as_ref() }.store(self.next_seq, Ordering::Release);
-            }
+            // fork-inherited copy must not touch the successor's tail
+            // (regressing it behind consumers or past a successor's
+            // frontier would corrupt the ring — see the shm zombie test).
+            self.flush();
             // SAFETY: `closed` points into shared state the anchor keeps
             // alive.
             unsafe { self.closed.as_ref() }.store(1, Ordering::Release);
         }
+    }
+}
+
+// Tail-publication plumbing — deliberately free of the `NoUninit` bound (it
+// never touches `T`), and deliberately the ONLY place the shared tail is
+// stored: push's boundary branch, `flush`, and `Drop` all funnel through
+// `publish_tail`, so an ordering/protocol fix cannot reach one publish path
+// and miss another.
+impl<T> Producer<T> {
+    /// The one Release store of the shared tail.
+    #[inline]
+    fn publish_tail(&mut self) {
+        self.unpublished = 0;
+        // SAFETY: `tail` points into shared state the anchor keeps alive.
+        unsafe { self.tail.as_ref() }.store(self.next_seq, Ordering::Release);
+    }
+
+    /// Publish everything pushed so far, making it visible to consumers
+    /// immediately.
+    ///
+    /// A no-op at the default per-push publication; under
+    /// [`set_tail_batch`](Self::set_tail_batch) call this at burst
+    /// boundaries so the tail never trails a quiet producer.
+    #[inline]
+    pub fn flush(&mut self) {
+        if self.unpublished > 0 {
+            self.publish_tail();
+        }
+    }
+
+    /// Publish the tail at least every `batch` pushes instead of on every
+    /// push. `1` — the default — restores exact per-push visibility.
+    /// Returns the batch actually applied: the request is clamped to
+    /// `[1, min(capacity / 8, slack)]`, so a ring with `capacity < 16` or
+    /// [slack](RingBuffer::with_slack)` < 2` never batches (the return
+    /// value is `1`) — check it.
+    ///
+    /// **The trade**: caught-up *spinning* consumers pull the tail line
+    /// away after every store, so per-push publication couples the
+    /// producer to its readers — on a GB10/X925, 4.5 ns/push alone became
+    /// 24.6 / 33.9 / 50.1 ns with 1/2/4 spinning readers, and `batch = 8`
+    /// cut those to 15.2 and 19.7 at k=1 and k=4 (`rust-rb-6l0`). In
+    /// exchange:
+    ///
+    /// * Up to `batch - 1` already-pushed messages stay invisible until
+    ///   the next boundary, [`flush`](Self::flush), or producer drop —
+    ///   keep the default for latency-critical or bursty streams, or
+    ///   `flush` when going idle.
+    /// * **Crash loss widens**: only a *graceful* drop flushes the debt,
+    ///   so a process that dies mid-window (`SIGKILL`, abort) forfeits up
+    ///   to `batch - 1` messages `push` had already accepted — on a
+    ///   shared-memory ring a recovering producer will overwrite them
+    ///   unseen. Keep the default where crash-tolerance is sized in
+    ///   single messages.
+    /// * A lapped consumer's post-reposition headroom shrinks from the
+    ///   documented `slack` to `slack - debt` — at least
+    ///   `slack - (batch - 1)`, which the clamp keeps ≥ 1. Batching
+    ///   therefore trades some of the slack's lag-storm protection for
+    ///   producer throughput; prefer a larger
+    ///   [`with_slack`](RingBuffer::with_slack) when enabling it.
+    ///
+    /// The rest is unchanged: consumers never see torn records (the
+    /// per-slot seqlock validates independently of the tail), `Lagged`
+    /// accounting stays exact against the published frontier, and a
+    /// subscriber's join point is the published tail.
+    #[must_use = "the request is clamped — a small or low-slack ring may not batch at all"]
+    pub fn set_tail_batch(&mut self, batch: usize) -> usize {
+        // The slack bound is a correctness clamp, not tuning: debt must
+        // stay below the reposition headroom, or a lapped consumer lands
+        // in slots the unpublished frontier already overwrote and spins on
+        // Lagged{missed: 0} until the producer happens to publish.
+        let max = ((self.mask + 1) / 8).min(self.slack).max(1);
+        let batch = (batch as u64).clamp(1, max);
+        self.tail_batch = batch;
+        // Shrinking the window must not leave an already-oversized debt
+        // pending past the new bound.
+        if self.unpublished >= batch {
+            self.publish_tail();
+        }
+        batch as usize
     }
 }
 
@@ -560,57 +651,8 @@ impl<T: NoUninit> Producer<T> {
         // producer does not pay (`rust-rb-6l0`).
         self.unpublished += 1;
         if self.unpublished >= self.tail_batch {
-            self.unpublished = 0;
-            // SAFETY: `tail` points into shared state the anchor keeps
-            // alive.
-            unsafe { self.tail.as_ref() }.store(self.next_seq, Ordering::Release);
+            self.publish_tail();
         }
-    }
-
-    /// Publish everything pushed so far, making it visible to consumers
-    /// immediately.
-    ///
-    /// A no-op at the default per-push publication; under
-    /// [`set_tail_batch`](Self::set_tail_batch) call this at burst
-    /// boundaries so the tail never trails a quiet producer.
-    #[inline]
-    pub fn flush(&mut self) {
-        if self.unpublished > 0 {
-            self.unpublished = 0;
-            // SAFETY: `tail` points into shared state the anchor keeps
-            // alive.
-            unsafe { self.tail.as_ref() }.store(self.next_seq, Ordering::Release);
-        }
-    }
-
-    /// Publish the tail at least every `batch` pushes instead of on every
-    /// push (clamped to `[1, capacity / 8]`; `1` — the default — restores
-    /// exact per-push visibility). Returns the clamp actually applied.
-    ///
-    /// **The trade**: caught-up *spinning* consumers pull the tail line
-    /// away after every store, so per-push publication couples the
-    /// producer to its readers — on a GB10/X925, 4.5 ns/push alone became
-    /// 25.9/35.6/56.6 ns with 1/2/4 spinning readers, and `batch = 8` cut
-    /// those to 12.7/16.6/19.6 (`rust-rb-6l0`). In exchange, up to
-    /// `batch - 1` already-pushed messages stay invisible until the next
-    /// boundary, [`flush`](Self::flush), or producer drop — so bursty or
-    /// latency-critical streams should keep the default and flush-heavy
-    /// pipelines should call `flush` when going idle.
-    ///
-    /// Everything else is unchanged: consumers never see torn records
-    /// (the per-slot seqlock validates independently of the tail),
-    /// `Lagged` accounting stays exact against the published frontier, and
-    /// a subscriber's join point is the published tail.
-    pub fn set_tail_batch(&mut self, batch: usize) -> usize {
-        let max = ((self.mask + 1) / 8).max(1);
-        let batch = (batch as u64).clamp(1, max);
-        self.tail_batch = batch;
-        // Shrinking the window must not leave an already-oversized debt
-        // pending past the new bound.
-        if self.unpublished >= batch {
-            self.flush();
-        }
-        batch as usize
     }
 
     /// Subscribe a new consumer with wait strategy `C`; its join point is
@@ -841,7 +883,8 @@ impl<T: NoUninit, C: WaitStrategy> Consumer<T, C> {
 
     /// Spin/park (per this consumer's wait strategy) until a message is
     /// available or the ring is closed and drained. The wait spins on the
-    /// shared **tail** (one line, stored once per push), never on a slot's
+    /// shared **tail** (one line, stored once per push by default —
+    /// amortized under `Producer::set_tail_batch`), never on a slot's
     /// seqlock word [P-F4]; its predicate also checks `closed` [A-1.2].
     #[inline(always)]
     fn wait_for_item(&mut self) -> Result<(), PopError> {
@@ -940,11 +983,13 @@ impl<T> Producer<T> {
         let tail = NonNull::from(region.bcast_tail());
         let closed = NonNull::from(region.bcast_closed());
         let buf = region.bcast_elem_buffer().cast::<Slot<T>>();
+        let slack = region.bcast_slack();
         // SAFETY: `tail` references the live mapping (per contract).
         let next_seq = unsafe { tail.as_ref() }.load(Ordering::Acquire);
         Producer {
             buf,
             mask: capacity as u64 - 1,
+            slack,
             next_seq,
             tail_batch: 1,
             unpublished: 0,
