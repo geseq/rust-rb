@@ -1034,9 +1034,9 @@ impl ShmRegion {
         unsafe { self.atomic(Self::anch_slot_off(table_offset, slot, SLOT_CONTROL)) }
     }
 
-    /// An anchor slot's published **u64** read cursor (the anchored rings'
-    /// unified-cursor domain — the one field where the anchor table departs
-    /// from the SPMC table's `usize`).
+    /// An anchor slot's published **u64** read cursor, matching the SPMC
+    /// table's [`slot_cursor`](Self::slot_cursor) — both consumer tables share
+    /// the unified `u64` cursor domain.
     pub(crate) fn anch_slot_cursor(&self, table_offset: usize, slot: usize) -> &AtomicU64 {
         // SAFETY: 8-aligned (stride 128, field 16) and inside the mapping
         // for any valid slot index.

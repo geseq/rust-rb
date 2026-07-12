@@ -266,3 +266,12 @@ What did not (known, tracked, correctness unaffected):
 Both findings are performance-shape issues only: accounting stayed exact, no
 torn reads were accepted, and nothing was lost under keep-up in any of the
 failing configurations.
+
+The **mixed** rings ([`anchored`](crate::anchored) /
+[`anchored_bytes`](crate::anchored_bytes)) have no dedicated bench yet. They
+run the same engine as the rings above — anchors ride the gating registry and
+gate the producer exactly as spmc consumers do, observers ride the broadcast
+seqlock protocol and cost the producer nothing — so the numbers and the two
+open findings above are the right priors: expect spmc-shaped behaviour from
+the anchor count and broadcast-shaped behaviour from the observers, and with
+zero anchors the producer free-runs like the lossy ring.

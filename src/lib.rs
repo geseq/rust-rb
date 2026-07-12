@@ -79,22 +79,23 @@
 //! `[u8; N]` — stored by value, no framing) **or variable-length bytes**
 //! (serialized messages, wire frames — length-framed in one contiguous
 //! ring)? Is there **one consumer or many**? And with many: should a slow
-//! consumer **gate the producer (lossless)** or **lose messages and get an
-//! exact count (lossy)**?
+//! consumer **gate the producer (lossless)**, **lose messages and get an
+//! exact count (lossy)**, or a **mix** — a few required consumers gate while
+//! unbounded observers tap losslessly-or-lossily off the same stream?
 //!
-//! | Payload | One consumer | Many — lossless (gating) | Many — lossy |
-//! | --- | --- | --- | --- |
-//! | Fixed `T` | [`RingBuffer<T>`] | [`spmc::RingBuffer`] | [`broadcast::RingBuffer`] |
-//! | Byte messages | [`BytesRingBuffer`] | [`spmc_bytes::BytesRingBuffer`] | [`broadcast_bytes::BytesRingBuffer`] |
+//! | Payload | One consumer | Many — lossless (gating) | Many — lossy | Many — required + observers |
+//! | --- | --- | --- | --- | --- |
+//! | Fixed `T` | [`RingBuffer<T>`] | [`spmc::RingBuffer`] | [`broadcast::RingBuffer`] | [`anchored::RingBuffer`] |
+//! | Byte messages | [`BytesRingBuffer`] | [`spmc_bytes::BytesRingBuffer`] | [`broadcast_bytes::BytesRingBuffer`] | [`anchored_bytes::BytesRingBuffer`] |
 //!
-//! All six can span **two processes** (`shm` feature, Linux) through their
+//! All eight can span **two processes** (`shm` feature, Linux) through their
 //! `create_shm`/`attach_shm_*` constructors; see the
 //! [shared-memory guide](guide::shm_ipc). The
 //! [API guide](guide::api_usage) has a worked snippet per ring.
 //!
 //! Every ring is **single-producer**: each producer half is `Send` but not
 //! `Clone`, so that side of the contract is enforced at compile time. The two
-//! SPSC rings also enforce the **single consumer** the same way; the four
+//! SPSC rings also enforce the **single consumer** the same way; the six
 //! multi-consumer rings instead let consumers `subscribe` dynamically. The
 //! [semantics guide](guide::semantics) carries the full per-machine contract
 //! matrix.
@@ -152,11 +153,11 @@
 //!   strategy (including the `SelfTimed` constraint on the multi-consumer
 //!   rings), and the broadcast reposition slack.
 //! - [API usage](guide::api_usage) — which ring, then which method, per use
-//!   case; worked snippets for all six rings.
+//!   case; worked snippets for all eight rings.
 //! - [Semantics & gotchas](guide::semantics) — the behaviours that surprise
 //!   people (transient `len`/`is_full` over-count, `mem::forget` re-delivery)
 //!   and the per-machine contract matrix (counters / forget / closed / panic
-//!   sites across SPSC, gating, and lossy).
+//!   sites across SPSC, gating, lossy, and mixed).
 //! - [Performance tuning](guide::performance) — core pinning, the adaptive
 //!   read-cursor publish, a reproducible benchmarking recipe, and the honest
 //!   multi-consumer numbers.

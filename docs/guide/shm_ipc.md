@@ -254,11 +254,13 @@ tx.push(b"back in business");
 
 ## The multi-consumer rings over shm
 
-All four multi-consumer rings ([`spmc`](crate::spmc),
+All six multi-consumer rings ([`spmc`](crate::spmc),
 [`spmc_bytes`](crate::spmc_bytes), [`broadcast`](crate::broadcast),
-[`broadcast_bytes`](crate::broadcast_bytes)) have shm backings. The trust
+[`broadcast_bytes`](crate::broadcast_bytes), [`anchored`](crate::anchored),
+[`anchored_bytes`](crate::anchored_bytes)) have shm backings. The trust
 model, fd passing, and producer lease are exactly as above; what changes is
-consumer membership — and the two machines answer it in opposite ways.
+consumer membership — and the two membership machines answer it in opposite
+ways, with the anchored pair carrying both at once.
 
 One shared difference from the SPSC rings up front: on shared memory,
 **`Closed` means end-of-session, not end-of-ring**. A graceful producer drop
@@ -372,10 +374,37 @@ attach time: it floors its declared-write frontier at the dead producer's
 consumer's validation window) and repairs the lap-recovery jump target to the
 last committed record. You call one constructor; the healing is automatic.
 
+### Mixed rings: an anchor table *and* lease-free observers
+
+The anchored pair ([`anchored`](crate::anchored),
+[`anchored_bytes`](crate::anchored_bytes)) is the composition of the two
+membership models on one region — because it composes their two contracts. Its
+[`create_shm`](crate::anchored::RingBuffer::create_shm) takes the same
+**`max_anchors`** sizing argument as the gating constructors, `create_shm(fd,
+capacity, max_anchors)`, and lays out a fixed **anchor table** of that many
+slots: each required anchor claims one with
+[`attach_shm_anchor`](crate::anchored::RingBuffer::attach_shm_anchor),
+publishing a lease + cursor exactly as a gating consumer does, and gates the
+producer from its join point on. A stuck anchor is the same liability as a
+zombie gating consumer and is reclaimed the same way, with
+[`force_detach_anchor`](crate::anchored::RingBuffer::force_detach_anchor)`(fd,
+slot, epoch)` — the identical compare-and-retire on a `(slot, epoch)` pair.
+
+Observers, meanwhile, are exactly the lossy rings' consumers:
+[`attach_shm_observer`](crate::anchored::RingBuffer::attach_shm_observer) maps
+the region **read-only** (`PROT_READ`), keeps no shared state, and joins in
+unbounded numbers — never gating anyone, costing the producer nothing, and
+self-healing through the seqlock validation it always runs. So the anchored
+region is the gating table for its required readers and the lease-free
+read-only fan-out for everyone else, side by side.
+[`recover_shm`](crate::anchored::RingBuffer::recover_shm) resets the anchor
+table exactly like the gating rings; observers need nothing.
+
 ```text
 kind        membership            consumer state in region     consumer mapping
 gating      max_consumers, fixed  lease + cursor per slot      read-write
 lossy       unbounded             none                         read-only (PROT_READ)
+mixed       max_anchors + unbounded  anchors: lease + cursor; observers: none  anchors: read-write; observers: read-only
 ```
 
 ## Full runnable example

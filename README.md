@@ -4,8 +4,9 @@ High-performance **single-producer** ring buffers for Rust: an SPSC queue —
 a faithful port of the one in
 [`cpp-fastchan`](https://github.com/geseq/cpp-fastchan), keeping every design
 choice that makes the original fast and adding compile-time safety on top —
-plus single-producer/**multi-consumer** broadcast rings (lossless and lossy)
-built on the same engine.
+plus single-producer/**multi-consumer** broadcast rings (lossless, lossy, and a
+composed variant with required gating readers alongside lossy observers) built
+on the same engine.
 
 Pushes and pops can each be **blocking** or **non-blocking**, and the blocking
 wait behaviour is selectable: spin with a CPU pause hint, yield the thread, spin
@@ -161,13 +162,14 @@ to the fixed-size ring; the wait strategies are shared between both.
 
 ## Multi-consumer rings
 
-Four more rings broadcast one producer's stream to **many consumers**. Two
+Six more rings broadcast one producer's stream to **many consumers**. Three
 policies × two payload shapes:
 
 |                    | Fixed `T`             | Byte messages                |
 | ------------------ | --------------------- | ---------------------------- |
 | **Gating** (lossless: the slowest consumer gates the producer) | `spmc::RingBuffer` | `spmc_bytes::BytesRingBuffer` |
 | **Lossy** (the producer never blocks; a lapped consumer loses messages and gets an exact count) | `broadcast::RingBuffer` | `broadcast_bytes::BytesRingBuffer` |
+| **Mixed** (required *anchors* gate the producer while unbounded lossy *observers* tap the same stream) | `anchored::RingBuffer` | `anchored_bytes::BytesRingBuffer` |
 
 Every ring stays single-producer (enforced by the types); consumers subscribe
 dynamically. Dropping the producer closes the ring — consumers drain what was
@@ -220,7 +222,7 @@ volatile alternative lost the A/B in both directions (2.6× slower on pop at
 
 ## Shared memory / IPC (feature `shm`, Linux)
 
-All six rings can be backed by a mapped shared region so the producer and
+All eight rings can be backed by a mapped shared region so the producer and
 consumer(s) live in **different processes** — same handle types, same hot
 paths:
 

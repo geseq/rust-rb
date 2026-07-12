@@ -171,7 +171,7 @@ What each one actually does:
 
 ## `SelfTimed`: what the multi-consumer rings require
 
-The four multi-consumer rings constrain the strategy choice with the
+The six multi-consumer rings constrain the strategy choice with the
 [`SelfTimed`](crate::SelfTimed) marker — a strategy that makes progress
 **without ever needing a peer notify**: the pure spins, the yield, the timed
 sleep, and the backoff all qualify; [`CvWait`](crate::CvWait) does not, and is
@@ -188,6 +188,11 @@ rejected at compile time.
   strategy at all: a lossy push never blocks). The producer keeps zero
   consumer knowledge by design, so nobody will ever notify a parked reader —
   a reader's wait must time itself.
+- [`anchored`](crate::anchored) / [`anchored_bytes`](crate::anchored_bytes)
+  require `SelfTimed` on **both** sides — they compose the two contracts, so
+  they inherit both constraints: the gating producer waits on its anchors (as
+  spmc does) and the lossy observers time their own waits (as broadcast does).
+  `CvWait` is rejected on either side.
 
 The SPSC rings accept any [`WaitStrategy`](crate::WaitStrategy), including
 `CvWait`.

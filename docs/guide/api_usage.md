@@ -1,6 +1,6 @@
 # API usage — which ring, then which method
 
-`rust-rb` gives you **six rings**. This guide first helps you pick one, then
+`rust-rb` gives you **eight rings**. This guide first helps you pick one, then
 walks the per-method decisions for the single-consumer (SPSC) pair — an
 **element ring** ([`RingBuffer<T>`](crate::RingBuffer), split into a
 [`Producer<T>`](crate::Producer) / [`Consumer<T>`](crate::Consumer)) and a
@@ -15,21 +15,28 @@ expose, see the [semantics guide](crate::guide::semantics).
 Three questions pick the ring: is the payload **one fixed type `T` or
 variable-length bytes**? Is there **one consumer or many**? And with many —
 when a consumer falls behind, should it **block the producer (lossless,
-gating)** or **lose messages and know exactly how many (lossy)**?
+gating)**, **lose messages and know exactly how many (lossy)**, or **both at
+once — a few required readers gate while unbounded observers tap lossily
+(mixed)**?
 
-| Payload | One consumer | Many — lossless (slow reader gates the producer) | Many — lossy (slow reader loses messages) |
-| --- | --- | --- | --- |
-| Fixed `T` | [`spsc::RingBuffer`](crate::RingBuffer) | [`spmc::RingBuffer`](crate::spmc::RingBuffer) | [`broadcast::RingBuffer`](crate::broadcast::RingBuffer) |
-| Byte messages | [`spsc_bytes::BytesRingBuffer`](crate::BytesRingBuffer) | [`spmc_bytes::BytesRingBuffer`](crate::spmc_bytes::BytesRingBuffer) | [`broadcast_bytes::BytesRingBuffer`](crate::broadcast_bytes::BytesRingBuffer) |
+| Payload | One consumer | Many — lossless (slow reader gates the producer) | Many — lossy (slow reader loses messages) | Many — mixed (required gate + lossy observers) |
+| --- | --- | --- | --- | --- |
+| Fixed `T` | [`spsc::RingBuffer`](crate::RingBuffer) | [`spmc::RingBuffer`](crate::spmc::RingBuffer) | [`broadcast::RingBuffer`](crate::broadcast::RingBuffer) | [`anchored::RingBuffer`](crate::anchored::RingBuffer) |
+| Byte messages | [`spsc_bytes::BytesRingBuffer`](crate::BytesRingBuffer) | [`spmc_bytes::BytesRingBuffer`](crate::spmc_bytes::BytesRingBuffer) | [`broadcast_bytes::BytesRingBuffer`](crate::broadcast_bytes::BytesRingBuffer) | [`anchored_bytes::BytesRingBuffer`](crate::anchored_bytes::BytesRingBuffer) |
 
 The gating/lossy split is a real fork, not a mode flag: **gating** means every
 consumer observes every message and the producer waits for the slowest one
 (backpressure, never loss); **lossy** means the producer never blocks and
 never reads consumer state, and a consumer that gets lapped is told exactly
 what it missed ([`Lagged`](crate::broadcast::PopError::Lagged), an exact
-message count on the element ring, an exact byte count on the byte ring).
-Every ring is single-producer, and all six can also run across two processes
-via the `shm` feature — see the [shared-memory guide](crate::guide::shm_ipc).
+message count on the element ring, an exact byte count on the byte ring). The
+**mixed** rings compose the two on one stream: a few **required** consumers
+(**anchors**) get the lossless gating contract while unbounded lossy
+**observers** tap the same messages and take exact `Lagged` counts on a lap —
+and with **zero** anchors the producer free-runs exactly like the lossy
+broadcast. Every ring is single-producer, and all eight can also run across
+two processes via the `shm` feature — see the
+[shared-memory guide](crate::guide::shm_ipc).
 
 ### Gating multicast: `spmc::RingBuffer`
 
@@ -116,7 +123,42 @@ drop(tx); // producer drop closes the ring
 assert_eq!(rx.pop(), Err(PopError::Closed));
 ```
 
-The method tables and snippets below cover the SPSC pair; the four
+### Mixed: `anchored::RingBuffer`
+
+The composed ring runs both contracts over one stream. Required **anchors**
+subscribe with [`subscribe_anchor`](crate::anchored::Producer::subscribe_anchor)
+(gating, fails on a closed ring) and get the full spmc surface; lossy
+**observers** subscribe with
+[`subscribe_observer`](crate::anchored::Producer::subscribe_observer) (never
+fails) and get the broadcast surface. The producer min-gates on the anchors,
+so an anchor never loses a message, while observers take exact
+[`Lagged`](crate::anchored::PopError::Lagged) counts when lapped:
+
+```rust
+use rust_rb::anchored::{Closed, PopError, RingBuffer};
+
+let (mut tx, mut anchor) = RingBuffer::new(8);
+let mut observer = tx.subscribe_observer(); // lossy tap, never fails
+
+tx.push(1u64);
+assert_eq!(anchor.pop(), Ok(1));   // lossless, gate-protected
+assert_eq!(observer.pop(), Ok(1)); // lossy, validated copy
+
+drop(tx); // producer drop closes the ring
+assert_eq!(anchor.pop(), Err(Closed));
+assert_eq!(observer.pop(), Err(PopError::Closed));
+```
+
+With zero anchors the producer free-runs like the lossy broadcast; add an
+anchor and the ring gains backpressure from that reader on. Element types need
+the [`NoUninit`](crate::NoUninit) bound and must be `Send + Sync`, and wait
+strategies must be [`SelfTimed`](crate::SelfTimed) — see the
+[configuration guide](crate::guide::configuration). The byte variant
+[`anchored_bytes::BytesRingBuffer`](crate::anchored_bytes::BytesRingBuffer)
+mirrors this with `BytesAnchor` / `BytesObserver` over the broadcast byte
+framing.
+
+The method tables and snippets below cover the SPSC pair; the six
 multi-consumer modules carry their own full API walkthroughs in their module
 docs.
 

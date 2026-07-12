@@ -16,8 +16,10 @@ are **gating** (every consumer sees every message; the slowest consumer gates
 the producer) and [`broadcast`](crate::broadcast) /
 [`broadcast_bytes`](crate::broadcast_bytes) are **lossy** (the producer never
 blocks and never reads consumer state; a lapped consumer loses messages and
-gets an exact count). This table is the delta — each byte ring shares its
-element ring's column:
+gets an exact count). The **mixed** rings ([`anchored`](crate::anchored) /
+[`anchored_bytes`](crate::anchored_bytes)) compose the two machines on one
+stream and are covered by the paragraph after the table. This table is the
+delta — each byte ring shares its element ring's column:
 
 | Contract | SPSC (`spsc`, `spsc_bytes`) | Gating (`spmc`, `spmc_bytes`) | Lossy (`broadcast`, `broadcast_bytes`) |
 | --- | --- | --- | --- |
@@ -27,10 +29,28 @@ element ring's column:
 | Closed semantics | None. There is no closed flag: dropping a half is silent, and a blocking `pop` on an abandoned, empty ring waits forever. | Dropping the producer closes the ring. `pop` returns `Err(`[`Closed`](crate::spmc::Closed)`)` only once **closed and drained** (per consumer — every published message is still delivered first). On the heap the close is terminal; over shared memory it is end-of-session — a new producer attach resets the flag and the ring reopens. | The same closed-and-drained contract, via [`PopError::Closed`](crate::broadcast::PopError::Closed); heap terminal, shm end-of-session. |
 | Panic sites | `capacity == 0` at construction; byte-ring `push`/`try_push`/`claim` with a message over `max_message_len` (`capacity / 2 - 4`). | The same two (byte-ring cap is also `capacity / 2 - 4`). | `capacity == 0` at construction; a zero-sized `T` (element ring); [`with_slack`](crate::broadcast::RingBuffer::with_slack) with `slack >= capacity`; byte-ring push over `max_message_len` — which is **`capacity / 8`** here, not `capacity / 2 - 4`. |
 
+The **mixed** rings do not get their own column because they do not have their
+own contract: an [`Anchor`](crate::anchored::Anchor) lives under the **Gating**
+column (`&T` [`pop_ref`](crate::anchored::Anchor::pop_ref) borrows, `drain`,
+`Err(`[`Closed`](crate::anchored::Closed)`)` once closed-and-drained — and the
+same `mem::forget` global stall, which here freezes the observers too once they
+drain to the gated tail), while an [`Observer`](crate::anchored::Observer)
+lives under the **Lossy** column (validated copy-out, exact
+[`Lagged`](crate::anchored::PopError::Lagged) counts, no read guards). The
+genuine deltas: element types need [`NoUninit`](crate::NoUninit) **and**
+`Sync` (observers copy word-atomically while anchors borrow `&T` across
+threads); the write slot is commit-only, so there is no in-place `uninit`
+access; [`subscribe_anchor`](crate::anchored::Producer::subscribe_anchor) is
+refused on a closed ring while
+[`subscribe_observer`](crate::anchored::Producer::subscribe_observer) always
+succeeds; and with zero anchors the producer free-runs exactly like the lossy
+ring.
+
 The rest of this page walks the SPSC behaviours in detail; where a
 multi-consumer ring differs, the matrix above is authoritative, and the
 [`spmc`](crate::spmc), [`spmc_bytes`](crate::spmc_bytes),
-[`broadcast`](crate::broadcast), and [`broadcast_bytes`](crate::broadcast_bytes)
+[`broadcast`](crate::broadcast), [`broadcast_bytes`](crate::broadcast_bytes),
+[`anchored`](crate::anchored), and [`anchored_bytes`](crate::anchored_bytes)
 module docs carry the full per-machine story.
 
 # Producer-side `len`/`is_full` are approximate; the consumer side is exact
