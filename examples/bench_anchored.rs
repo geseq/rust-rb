@@ -132,10 +132,16 @@ fn run(
     for i in 0..iters {
         tx.push(i);
     }
-    let anchor_stats: Vec<_> = anchor_threads.into_iter().map(|t| t.join().unwrap()).collect();
+    let anchor_stats: Vec<_> = anchor_threads
+        .into_iter()
+        .map(|t| t.join().unwrap())
+        .collect();
     let elapsed = start.elapsed();
     drop(tx); // close: observers drain what is reachable and exit
-    let observer_stats: Vec<_> = observer_threads.into_iter().map(|t| t.join().unwrap()).collect();
+    let observer_stats: Vec<_> = observer_threads
+        .into_iter()
+        .map(|t| t.join().unwrap())
+        .collect();
 
     let ns_per_op = elapsed.as_nanos() as f64 / iters as f64;
     let mops = iters as f64 / elapsed.as_secs_f64() / 1e6;
@@ -184,7 +190,15 @@ fn main() {
         // 2. The mixed regimes.
         run("ANCH A=1 K=1", NUM_ITERATIONS, CAPACITY, &[0], 1, 0, &cores);
         run("ANCH A=1 K=3", NUM_ITERATIONS, CAPACITY, &[0], 3, 0, &cores);
-        run("ANCH A=2 K=2", NUM_ITERATIONS, CAPACITY, &[0, 0], 2, 0, &cores);
+        run(
+            "ANCH A=2 K=2",
+            NUM_ITERATIONS,
+            CAPACITY,
+            &[0, 0],
+            2,
+            0,
+            &cores,
+        );
         // 3. Straggling anchor + observer: the producer must track the
         //    rate-limited anchor; the observer stays caught up for free.
         run(
@@ -197,6 +211,14 @@ fn main() {
             &cores,
         );
         // 4. Observer lap on a small free-run ring: exact loss accounting.
-        run("ANCH_lap A=0 K=1 cap=64", NUM_ITERATIONS, 64, &[], 1, 200, &cores);
+        run(
+            "ANCH_lap A=0 K=1 cap=64",
+            NUM_ITERATIONS,
+            64,
+            &[],
+            1,
+            200,
+            &cores,
+        );
     }
 }

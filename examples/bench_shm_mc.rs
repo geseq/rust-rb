@@ -70,14 +70,10 @@ mod bench {
                 std::hint::black_box(first);
                 let start = Instant::now();
                 let mut count = 1u64;
-                loop {
-                    match rx.pop() {
-                        Ok(v) => {
-                            std::hint::black_box(v);
-                            count += 1;
-                        }
-                        Err(spmc::Closed) => break,
-                    }
+                // Closed-and-drained (`Err(spmc::Closed)`) ends the run.
+                while let Ok(v) = rx.pop() {
+                    std::hint::black_box(v);
+                    count += 1;
                 }
                 let ns = start.elapsed().as_nanos() as f64 / (count - 1).max(1) as f64;
                 println!("gating consumer: {count} msgs, {ns:.2} ns/msg");
@@ -119,14 +115,10 @@ mod bench {
                 std::hint::black_box(first);
                 let start = Instant::now();
                 let mut count = 1u64;
-                loop {
-                    match rx.pop() {
-                        Ok(v) => {
-                            std::hint::black_box(v);
-                            count += 1;
-                        }
-                        Err(anchored::Closed) => break,
-                    }
+                // Closed-and-drained (`Err(anchored::Closed)`) ends the run.
+                while let Ok(v) = rx.pop() {
+                    std::hint::black_box(v);
+                    count += 1;
                 }
                 let ns = start.elapsed().as_nanos() as f64 / (count - 1).max(1) as f64;
                 println!("anchor: {count} msgs, {ns:.2} ns/msg");

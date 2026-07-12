@@ -32,13 +32,8 @@ const CAPACITY: usize = 64 * 1024;
 /// message, calibrated on that consumer's own core). Every consumer sees
 /// every message. `drain` selects the batched path (rate-limited consumers
 /// always use `pop` so the limit applies per message).
-fn run<P, C>(
-    name: &str,
-    msg_len: usize,
-    drain: bool,
-    delay_ns: &[u32],
-    cores: &[usize],
-) where
+fn run<P, C>(name: &str, msg_len: usize, drain: bool, delay_ns: &[u32], cores: &[usize])
+where
     P: SelfTimed + Send + Sync + 'static,
     C: SelfTimed + Send + Sync + 'static,
 {
@@ -131,12 +126,6 @@ fn main() {
         }
         // 3. Straggler: two fast + one ~50 ns rate-limited consumer; the
         //    producer should track the straggler, not collapse below it.
-        run::<PauseWait, PauseWait>(
-            "SPMCB_straggler N=3",
-            64,
-            false,
-            &[0, 0, D50_NS],
-            &cores,
-        );
+        run::<PauseWait, PauseWait>("SPMCB_straggler N=3", 64, false, &[0, 0, D50_NS], &cores);
     }
 }

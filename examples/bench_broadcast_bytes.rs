@@ -30,10 +30,7 @@ const CAPACITY: usize = 64 * 1024;
 
 /// Spin on `try_pop_into` until closed and drained; return (elapsed,
 /// accepted msgs, accepted bytes, lag events, missed bytes).
-fn consume_all(
-    rx: &mut BytesConsumer<NoOpWait>,
-    delay: u32,
-) -> (Duration, u64, u64, u64, u64) {
+fn consume_all(rx: &mut BytesConsumer<NoOpWait>, delay: u32) -> (Duration, u64, u64, u64, u64) {
     let mut buf = Vec::with_capacity(4096);
     let start = Instant::now();
     let (mut accepted, mut bytes, mut lag_events, mut missed) = (0u64, 0u64, 0u64, 0u64);
@@ -146,6 +143,13 @@ fn main() {
         //    producer unaffected, byte accounting exact. (Ring must hold
         //    the 64 B messages: broadcast-bytes max_message_len is
         //    capacity/8, so 4 KiB comfortably frames 64 B.)
-        run("BCASTB_lap cap=4K", NUM_MESSAGES, 64, 4096, &[D200_NS], &cores);
+        run(
+            "BCASTB_lap cap=4K",
+            NUM_MESSAGES,
+            64,
+            4096,
+            &[D200_NS],
+            &cores,
+        );
     }
 }
