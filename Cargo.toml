@@ -18,6 +18,13 @@ path = "src/lib.rs"
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
+[lints.rust]
+# `rust_rb_volatile_copy` is a private dev switch (set via RUSTFLAGS, not a
+# cargo feature) that swaps the broadcast ring's strict word-wise atomic
+# payload copy for whole-payload volatile copies — the copy A/B benchmark
+# alternative, never part of the public API.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(rust_rb_volatile_copy)"] }
+
 [features]
 # Shared-memory-backed rings (Linux): memfd/mmap constructors, leases,
 # crash recovery. Adds a `libc` dependency; no effect on other targets.
@@ -47,8 +54,41 @@ name = "bench_bytes"
 path = "examples/bench_bytes.rs"
 
 [[example]]
+name = "bench_spmc"
+path = "examples/bench_spmc.rs"
+
+[[example]]
+name = "bench_broadcast"
+path = "examples/bench_broadcast.rs"
+
+[[example]]
+name = "probe_coherence"
+path = "examples/probe_coherence.rs"
+
+[[example]]
+name = "probe_ring_scaling"
+path = "examples/probe_ring_scaling.rs"
+
+[[example]]
+name = "bench_spmc_bytes"
+path = "examples/bench_spmc_bytes.rs"
+
+[[example]]
+name = "bench_broadcast_bytes"
+path = "examples/bench_broadcast_bytes.rs"
+
+[[example]]
+name = "bench_anchored"
+path = "examples/bench_anchored.rs"
+
+[[example]]
 name = "bench_shm"
 path = "examples/bench_shm.rs"
+required-features = ["shm"]
+
+[[example]]
+name = "bench_shm_mc"
+path = "examples/bench_shm_mc.rs"
 required-features = ["shm"]
 
 [[example]]

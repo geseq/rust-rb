@@ -101,14 +101,16 @@ default for both is [`YieldWait`](crate::YieldWait), matching the `cpp-fastchan`
 template default. Pick others with
 [`RingBuffer::with_wait_strategies`](crate::RingBuffer::with_wait_strategies).
 
-There are four strategies, all implementing [`WaitStrategy`](crate::WaitStrategy):
+There are six strategies, all implementing [`WaitStrategy`](crate::WaitStrategy):
 
-| Strategy                        | Wake latency | CPU cost           | Under oversubscription | Power draw | Cross-process |
-| ------------------------------- | ------------ | ------------------ | ---------------------- | ---------- | ------------- |
-| [`NoOpWait`](crate::NoOpWait)   | lowest       | highest (no hint)  | starves peers          | highest    | yes           |
-| [`PauseWait`](crate::PauseWait) | very low     | high (spins core)  | poor                   | high       | yes           |
-| [`YieldWait`](crate::YieldWait) | low–moderate | moderate           | tolerant               | moderate   | yes           |
-| [`CvWait`](crate::CvWait)       | highest      | lowest (can sleep) | best                   | lowest     | **no**        |
+| Strategy                            | Wake latency                | CPU cost           | Under oversubscription | Power draw | Cross-process | Self-timed |
+| ----------------------------------- | --------------------------- | ------------------ | ---------------------- | ---------- | ------------- | ---------- |
+| [`NoOpWait`](crate::NoOpWait)       | lowest                      | highest (no hint)  | starves peers          | highest    | yes           | yes        |
+| [`PauseWait`](crate::PauseWait)     | very low                    | high (spins core)  | poor                   | high       | yes           | yes        |
+| [`YieldWait`](crate::YieldWait)     | low–moderate                | moderate           | tolerant               | moderate   | yes           | yes        |
+| [`SleepWait`](crate::SleepWait)     | timer-tick (tens of µs)     | very low (sleeps)  | good                   | low        | yes           | yes        |
+| [`BackoffWait`](crate::BackoffWait) | escalates: low → timer-tick | escalates: high → very low | good           | escalates  | yes           | yes        |
+| [`CvWait`](crate::CvWait)           | highest                     | lowest (can sleep) | best                   | lowest     | **no**        | **no**     |
 
 What each one actually does:
 
@@ -123,12 +125,26 @@ What each one actually does:
   iteration. The balanced default: it cooperates with the OS scheduler and
   tolerates oversubscription (more busy threads than cores) far better than a
   pure spin, at the cost of some wake latency.
+- [`SleepWait<NANOS>`](crate::SleepWait) — sleeps a fixed `NANOS` nanoseconds
+  (default 100 µs) each iteration. The lowest-CPU strategy that is still
+  *self-timed*: it never needs the peer to wake it, so — unlike `CvWait` — it
+  works across processes and on the multi-consumer rings. The effective
+  granularity is the OS timer (tens of microseconds on Linux with default
+  timerslack), so treat `NANOS` as a floor, not a promise.
+- [`BackoffWait<SPINS, YIELDS, MIN, MAX>`](crate::BackoffWait) — Aeron-style
+  escalation: spin `SPINS` turns, yield `YIELDS` turns, then sleep with
+  exponential doubling from `MIN` to `MAX` nanoseconds (defaults: 100 spins,
+  100 yields, 1 µs → 1 ms), consulting the wake condition every turn. Each
+  blocking call starts a fresh episode. The right choice when waits are
+  *usually* short but must not burn a core when they are long.
 - [`CvWait`](crate::CvWait) — parks on a `Mutex`/`Condvar` with a ~100 ns timed
-  recheck, and is woken by the peer's `notify()`. The only strategy that lets a
-  blocked side actually **sleep** instead of burning CPU, so it has by far the
-  lowest power draw and behaves best under oversubscription — but the highest
-  wake latency. It is **not** usable cross-process: it is not `CrossProcess`, and
-  the shared-memory rings reject it at compile time.
+  recheck, and is woken by the peer's `notify()`. The only strategy whose sleep
+  is cut short by a peer **notification** rather than a timer, so it combines
+  minimal CPU with the best behaviour under oversubscription — at the highest
+  wake latency. It is **not** usable cross-process (it is not
+  [`CrossProcess`](crate::CrossProcess): its mutex/condvar live in one
+  process's memory) and **not** usable on the multi-consumer rings (it is not
+  [`SelfTimed`](crate::SelfTimed) — see below); both reject it at compile time.
 
 ## Picking a strategy
 
@@ -140,9 +156,73 @@ What each one actually does:
 - Pick [`YieldWait`](crate::YieldWait) — the default — when you are unsure, when
   the ring may run on a machine with more threads than cores, or when you want a
   reasonable latency/CPU balance without pinning.
+- Pick [`BackoffWait`](crate::BackoffWait) when traffic is bursty: it reacts
+  like a spin inside a burst and decays to a timer sleep between bursts,
+  without needing a peer notification. This is the strategy to try first on
+  the multi-consumer rings when you cannot dedicate cores.
+- Pick [`SleepWait`](crate::SleepWait) when a side is expected to be idle for
+  long stretches and a timer-tick wake latency is acceptable — the flat
+  lowest-CPU choice that still works everywhere (cross-process,
+  multi-consumer).
 - Pick [`CvWait`](crate::CvWait) when idle CPU and power matter more than wake
-  latency: bursty or low-rate traffic where a side would otherwise spin for long
-  stretches doing nothing. Not available across processes.
+  latency *and* the ring is an in-process SPSC ring: bursty or low-rate traffic
+  where a side would otherwise spin doing nothing. Not available across
+  processes or on the multi-consumer rings.
+
+## `SelfTimed`: what the multi-consumer rings require
+
+The six multi-consumer rings constrain the strategy choice with the
+[`SelfTimed`](crate::SelfTimed) marker — a strategy that makes progress
+**without ever needing a peer notify**: the pure spins, the yield, the timed
+sleep, and the backoff all qualify; [`CvWait`](crate::CvWait) does not, and is
+rejected at compile time.
+
+- [`spmc`](crate::spmc) / [`spmc_bytes`](crate::spmc_bytes) require `SelfTimed`
+  on **both** sides. With N waiting consumers, a notify-dependent strategy
+  needs per-waiter wake state — `CvWait`'s single shared flag can skip a
+  parked waiter, silently adding its full timeout to the wake latency — and
+  the gating producer's publish path must never pay a lock/signal per
+  consumer flush.
+- [`broadcast`](crate::broadcast) / [`broadcast_bytes`](crate::broadcast_bytes)
+  require `SelfTimed` on the **consumer** side (there is no producer-side
+  strategy at all: a lossy push never blocks). The producer keeps zero
+  consumer knowledge by design, so nobody will ever notify a parked reader —
+  a reader's wait must time itself.
+- [`anchored`](crate::anchored) / [`anchored_bytes`](crate::anchored_bytes)
+  require `SelfTimed` on **both** sides — they compose the two contracts, so
+  they inherit both constraints: the gating producer waits on its anchors (as
+  spmc does) and the lossy observers time their own waits (as broadcast does).
+  `CvWait` is rejected on either side.
+
+The SPSC rings accept any [`WaitStrategy`](crate::WaitStrategy), including
+`CvWait`.
+
+## The broadcast reposition `slack`
+
+The lossy element ring has one knob of its own:
+[`broadcast::RingBuffer::with_slack`](crate::broadcast::RingBuffer::with_slack).
+After a lap, a consumer repositions to `tail - capacity + slack`: `capacity -
+slack` messages are immediately readable, and the producer must advance at
+least `slack` more before that consumer can lag again. The default is
+`capacity / 8` (minimum 1; a capacity-1 "latest value" ring uses 0). Larger
+slack means fewer, bigger loss events;
+`slack == 0` maximizes salvage but allows back-to-back lag events (and a
+transient `Lagged { missed: 0 }` while the producer is overwriting exactly
+one lap ahead). `slack >= capacity` panics.
+
+```rust
+use rust_rb::broadcast::RingBuffer;
+
+// Reposition a lapped reader to tail - 1024 + 256.
+let (tx, rx) = RingBuffer::<u64>::with_slack(1024, 256);
+let _ = (tx, rx);
+```
+
+The byte ring has no slack knob: an arbitrary byte offset is not a record
+boundary, so a lapped [`broadcast_bytes`](crate::broadcast_bytes) consumer
+always jumps to the start of the most recent record instead. On shared-memory
+broadcast rings the slack is a create-time setting stored in the region
+header, inherited by every consumer.
 
 ## Different strategies per side
 

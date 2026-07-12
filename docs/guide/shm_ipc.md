@@ -1,13 +1,18 @@
 # Shared memory / IPC
 
-The shm-backed rings let a single-producer/single-consumer queue span **two
-processes**. The producer and consumer map the *same* region — a `memfd`,
-a POSIX `shm_open` object, or any mappable file descriptor — and push/pop
-through it exactly as they would a heap ring. The handle types
-([`Producer`](crate::Producer), [`Consumer`](crate::Consumer),
-[`BytesProducer`](crate::BytesProducer),
-[`BytesConsumer`](crate::BytesConsumer)) and the hot paths are unchanged; only
-the constructors differ.
+The shm-backed rings let a queue span **multiple processes**. The producer and
+consumer(s) map the *same* region — a `memfd`, a POSIX `shm_open` object, or
+any mappable file descriptor — and push/pop through it exactly as they would a
+heap ring. The handle types ([`Producer`](crate::Producer),
+[`Consumer`](crate::Consumer), [`BytesProducer`](crate::BytesProducer),
+[`BytesConsumer`](crate::BytesConsumer), and their
+[`spmc`](crate::spmc)/[`broadcast`](crate::broadcast) counterparts) and the
+hot paths are unchanged; only the constructors differ.
+
+Most of this page walks the single-producer/single-consumer story; the
+[multi-consumer rings](#the-multi-consumer-rings-over-shm) reuse all of it
+(trust model, fd passing, leases) and add their own membership machinery,
+covered at the end.
 
 This feature is Linux-only and lives behind the `shm` cargo feature. Everything
 below assumes `--features shm` on a 64-bit-atomic target.
@@ -145,20 +150,25 @@ just a matter of getting the fd into both.
 Either way, exactly one process calls `create_shm`; every other process
 `attach_*`s.
 
-## Wait strategies: spin only
+## Wait strategies: self-timed only
 
 Cross-process rings accept only [`CrossProcess`](crate::CrossProcess) wait
-strategies. The three spin strategies qualify and work across address spaces
-as-is:
+strategies — the five self-timed ones, which make progress without a peer
+notification and so work across address spaces as-is:
 
 - [`NoOpWait`](crate::NoOpWait) — tightest spin.
 - [`PauseWait`](crate::PauseWait) — spin with a CPU `pause` hint.
 - [`YieldWait`](crate::YieldWait) — spin yielding to the scheduler; the default
   for `create_shm` / `recover_shm`.
+- [`SleepWait`](crate::SleepWait) — fixed timed sleep per recheck.
+- [`BackoffWait`](crate::BackoffWait) — spin → yield → escalating sleep.
 
 [`CvWait`](crate::CvWait) is **not** `CrossProcess`: its mutex and condvar live
 in process-local memory and cannot coordinate a peer in another address space,
-so it will not compile against the shm constructors. Pick a spin strategy
+so it will not compile against the shm constructors. (The multi-consumer shm
+rings additionally require [`SelfTimed`](crate::SelfTimed), which every
+strategy above already satisfies — see the
+[configuration guide](crate::guide::configuration).) Pick a strategy
 explicitly with the `*_with` constructors
 ([`create_shm_with`](crate::RingBuffer::create_shm_with),
 `recover_shm_with`) when you want something other than the `YieldWait` default:
@@ -240,6 +250,161 @@ tx.push(b"back in business");
 # fn handle(_m: &[u8]) {}
 # Ok(())
 # }
+```
+
+## The multi-consumer rings over shm
+
+All six multi-consumer rings ([`spmc`](crate::spmc),
+[`spmc_bytes`](crate::spmc_bytes), [`broadcast`](crate::broadcast),
+[`broadcast_bytes`](crate::broadcast_bytes), [`anchored`](crate::anchored),
+[`anchored_bytes`](crate::anchored_bytes)) have shm backings. The trust
+model, fd passing, and producer lease are exactly as above; what changes is
+consumer membership — and the two membership machines answer it in opposite
+ways, with the anchored pair carrying both at once.
+
+One shared difference from the SPSC rings up front: on shared memory,
+**`Closed` means end-of-session, not end-of-ring**. A graceful producer drop
+sets the closed flag and consumers drain to `Closed` as on the heap — but a
+new producer attach *resets* the flag and the ring is open again; live
+consumers simply see the new session. (A *crashed* producer never sets the
+flag at all — detecting a dead peer remains your application's job, exactly
+as in the lease discussion above.)
+
+### Gating rings: a fixed consumer table
+
+Heap membership is unbounded, but a mapped layout cannot grow, so the gating
+shm constructors take a **`max_consumers`** argument at creation — a physical
+constraint, not a design choice. The region carries a consumer *table* of
+that many slots; each consumer holds a per-slot lease and publishes its read
+cursor there:
+
+```no_run
+use std::os::fd::AsFd;
+use rust_rb::{memfd, spmc};
+
+# fn main() -> std::io::Result<()> {
+let fd = memfd("orders")?;
+// SAFETY: fresh private memfd, cooperating handles only.
+let (mut tx, mut rx) =
+    unsafe { spmc::RingBuffer::<u64>::create_shm(fd.as_fd(), 1024, 8)? };
+
+// In other processes: claim a free table slot (up to 8 total here).
+// SAFETY: cooperating handles only.
+let mut rx2 = unsafe { spmc::RingBuffer::<u64>::attach_shm_consumer(fd.as_fd())? };
+tx.push(7);
+assert_eq!(rx.pop(), Ok(7));
+assert_eq!(rx2.pop(), Ok(7));
+# Ok(())
+# }
+```
+
+`attach_shm_consumer` is the shm face of `subscribe`: the join point is the
+producer's published cursor at claim time. It fails with `AddrInUse` when the
+table is full and `BrokenPipe` when the ring is closed.
+
+**Zombie consumers and `force_detach_consumer`.** Gating means a dead
+consumer's frozen cursor eventually blocks the producer forever — the
+lossless contract has no way to shrug it off. The escape hatch is
+`force_detach_consumer(fd, slot, epoch)`, a *compare-and-retire*: the slot is
+retired **iff** it is still held by the occupancy the caller diagnosed dead
+(every claim bumps the slot's epoch, so if the slot was gracefully freed and
+re-claimed by a healthy consumer in the meantime the epochs differ and the
+call fails with `InvalidInput` instead of retiring the living). A retired
+slot's cursor drops out of the producer's next rescan, un-gating the ring,
+and the slot is **never re-issued** (so a straggling zombie cannot be
+confused with a new consumer) until `recover_shm` resets the whole table.
+Each consumer can report its own `(slot, epoch)` pair via
+`shm_slot_epoch()` — publish it at startup so an operator or watchdog holds
+the exact proof the retire call takes.
+
+`force_detach_consumer` sits in the same trust register as the
+`force_attach_*` constructors: by calling it you assert the slot's holder is
+**dead**. If it is actually alive, the ring itself stays consistent (the
+zombie's cursor flushes land on a retired slot nothing reads), but the
+zombie's *reads* lose all gating protection — the producer may overwrite data
+it is still reading.
+
+**Full recovery.** `recover_shm` on a gating ring force-takes the producer
+role *and* resets the consumer table (leases zeroed, every slot reissuable at
+a bumped epoch). The returned consumer resumes at the slowest
+previously-registered cursor, so recovery is at-least-once across all dead
+consumers — the idempotence advice above applies with the table-wide bound.
+
+### Lossy rings: read-only, lease-free consumers
+
+The broadcast shm rings take the opposite stance: **consumers keep no shared
+state at all**. `create_shm` returns only the producer (the ring's only role
+and only lease); consumers attach lease-free, in unbounded numbers, and each
+maps the region **read-only** (`PROT_READ`):
+
+```no_run
+use std::os::fd::AsFd;
+use rust_rb::{broadcast, memfd};
+
+# fn main() -> std::io::Result<()> {
+let fd = memfd("prices")?;
+// SAFETY: fresh private memfd, cooperating handles only.
+let mut tx = unsafe { broadcast::RingBuffer::<u64>::create_shm(fd.as_fd(), 1024)? };
+
+// Any number of consumers, each over its own read-only mapping.
+// SAFETY: cooperating handles only.
+let mut rx = unsafe { broadcast::RingBuffer::<u64>::attach_shm_consumer(fd.as_fd())? };
+tx.push(42);
+assert_eq!(rx.pop(), Ok(42));
+# Ok(())
+# }
+```
+
+The read-only mapping is more than hygiene — it is **fault isolation**. A
+consumer *cannot* corrupt the ring, no matter how it crashes: any store a bug
+introduces into the consumer path is a deterministic SIGSEGV rather than
+silent shared-state damage. Dropping (or losing) a consumer is just an
+`munmap`; there is nothing to clean up, no lease to leak, no cursor to gate
+anyone. This is the deployment shape for one trusted publisher feeding many
+untrusted-ish readers.
+
+**Producer crash recovery** is `force_attach_shm_producer` (`recover_shm` is
+the same operation here — with no consumer state there is nothing else to
+reset). Everything published stays drainable throughout, and running
+consumers need no coordination: they self-heal through the same validation
+they always run. On the element ring that is the per-slot generation check.
+On the byte ring, the new producer additionally *heals* a mid-push crash at
+attach time: it floors its declared-write frontier at the dead producer's
+(so the bytes the dead push destroyed stay permanently outside every
+consumer's validation window) and repairs the lap-recovery jump target to the
+last committed record. You call one constructor; the healing is automatic.
+
+### Mixed rings: an anchor table *and* lease-free observers
+
+The anchored pair ([`anchored`](crate::anchored),
+[`anchored_bytes`](crate::anchored_bytes)) is the composition of the two
+membership models on one region — because it composes their two contracts. Its
+[`create_shm`](crate::anchored::RingBuffer::create_shm) takes the same
+**`max_anchors`** sizing argument as the gating constructors, `create_shm(fd,
+capacity, max_anchors)`, and lays out a fixed **anchor table** of that many
+slots: each required anchor claims one with
+[`attach_shm_anchor`](crate::anchored::RingBuffer::attach_shm_anchor),
+publishing a lease + cursor exactly as a gating consumer does, and gates the
+producer from its join point on. A stuck anchor is the same liability as a
+zombie gating consumer and is reclaimed the same way, with
+[`force_detach_anchor`](crate::anchored::RingBuffer::force_detach_anchor)`(fd,
+slot, epoch)` — the identical compare-and-retire on a `(slot, epoch)` pair.
+
+Observers, meanwhile, are exactly the lossy rings' consumers:
+[`attach_shm_observer`](crate::anchored::RingBuffer::attach_shm_observer) maps
+the region **read-only** (`PROT_READ`), keeps no shared state, and joins in
+unbounded numbers — never gating anyone, costing the producer nothing, and
+self-healing through the seqlock validation it always runs. So the anchored
+region is the gating table for its required readers and the lease-free
+read-only fan-out for everyone else, side by side.
+[`recover_shm`](crate::anchored::RingBuffer::recover_shm) resets the anchor
+table exactly like the gating rings; observers need nothing.
+
+```text
+kind        membership            consumer state in region     consumer mapping
+gating      max_consumers, fixed  lease + cursor per slot      read-write
+lossy       unbounded             none                         read-only (PROT_READ)
+mixed       max_anchors + unbounded  anchors: lease + cursor; observers: none  anchors: read-write; observers: read-only
 ```
 
 ## Full runnable example

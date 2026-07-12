@@ -6,6 +6,53 @@ is quietly in charge of when a slot is released. This page collects those sharp
 edges. Every one of them is a deliberate, memory-safe design choice; the goal
 here is that none of them bites you by surprise.
 
+# Per-machine contract matrix
+
+The detailed sections below were written for the **SPSC rings**
+([`RingBuffer`](crate::RingBuffer) / [`BytesRingBuffer`](crate::BytesRingBuffer))
+and remain exact for them. The multi-consumer machines change what several of
+those statements mean: [`spmc`](crate::spmc) / [`spmc_bytes`](crate::spmc_bytes)
+are **gating** (every consumer sees every message; the slowest consumer gates
+the producer) and [`broadcast`](crate::broadcast) /
+[`broadcast_bytes`](crate::broadcast_bytes) are **lossy** (the producer never
+blocks and never reads consumer state; a lapped consumer loses messages and
+gets an exact count). The **mixed** rings ([`anchored`](crate::anchored) /
+[`anchored_bytes`](crate::anchored_bytes)) compose the two machines on one
+stream and are covered by the paragraph after the table. This table is the
+delta — each byte ring shares its element ring's column:
+
+| Contract | SPSC (`spsc`, `spsc_bytes`) | Gating (`spmc`, `spmc_bytes`) | Lossy (`broadcast`, `broadcast_bytes`) |
+| --- | --- | --- | --- |
+| Producer `len` / `is_full` | Occupancy against the one consumer's published cursor. May over-count by up to one publish window (`capacity / 8`, max 64 elements / 4096 bytes); never under-counts. | Occupancy against the producer's **cached minimum over all consumers** — the slowest reader. The cache refreshes only on gate misses, so the over-count bound is up to a full capacity of already-consumed elements; still never under-counts. (The byte ring's producer exposes only `is_empty`, with the same caveat.) | Not exposed at all. The producer free-runs and never reads consumer state, so producer-side occupancy has no meaning; you get [`tail`](crate::broadcast::Producer::tail) (total published) and per-consumer [`lag`](crate::broadcast::Consumer::lag) instead. |
+| `mem::forget` on a read guard | Benign self-redelivery: the read cursor never advances, and the same element/message is delivered to the same (only) consumer again. | Redelivery to that consumer **plus a global stall**: the un-advanced cursor gates the producer, so one forgotten guard on an otherwise-idle consumer eventually blocks the producer and starves every other consumer. | N/A — there are no read guards. Every accepted pop is a validated *copy-out* of the payload, so there is nothing to forget and nothing to redeliver. |
+| Who enforces single-vs-multi consumer | The types: both halves are `Send` but not `Clone` — exactly one `Producer` and one `Consumer` can exist. | The types enforce the **single producer** (not `Clone`); consumers are **dynamic**: [`subscribe`](crate::spmc::Producer::subscribe) from either handle, unbounded on the heap (shared-memory rings fix a `max_consumers` table size at creation). | Same: single producer by type; consumers dynamic and unbounded — [`subscribe`](crate::broadcast::Consumer::subscribe) never fails, even on a closed ring. |
+| Closed semantics | None. There is no closed flag: dropping a half is silent, and a blocking `pop` on an abandoned, empty ring waits forever. | Dropping the producer closes the ring. `pop` returns `Err(`[`Closed`](crate::spmc::Closed)`)` only once **closed and drained** (per consumer — every published message is still delivered first). On the heap the close is terminal; over shared memory it is end-of-session — a new producer attach resets the flag and the ring reopens. | The same closed-and-drained contract, via [`PopError::Closed`](crate::broadcast::PopError::Closed); heap terminal, shm end-of-session. |
+| Panic sites | `capacity == 0` at construction; byte-ring `push`/`try_push`/`claim` with a message over `max_message_len` (`capacity / 2 - 4`). | The same two (byte-ring cap is also `capacity / 2 - 4`). | `capacity == 0` at construction; a zero-sized `T` (element ring); [`with_slack`](crate::broadcast::RingBuffer::with_slack) with `slack >= capacity`; byte-ring push over `max_message_len` — which is **`capacity / 8`** here, not `capacity / 2 - 4`. |
+
+The **mixed** rings do not get their own column because they do not have their
+own contract: an [`Anchor`](crate::anchored::Anchor) lives under the **Gating**
+column (`&T` [`pop_ref`](crate::anchored::Anchor::pop_ref) borrows, `drain`,
+`Err(`[`Closed`](crate::anchored::Closed)`)` once closed-and-drained — and the
+same `mem::forget` global stall, which here freezes the observers too once they
+drain to the gated tail), while an [`Observer`](crate::anchored::Observer)
+lives under the **Lossy** column (validated copy-out, exact
+[`Lagged`](crate::anchored::PopError::Lagged) counts, no read guards). The
+genuine deltas: element types need [`NoUninit`](crate::NoUninit) **and**
+`Sync` (observers copy word-atomically while anchors borrow `&T` across
+threads); the write slot is commit-only, so there is no in-place `uninit`
+access; [`subscribe_anchor`](crate::anchored::Producer::subscribe_anchor) is
+refused on a closed ring while
+[`subscribe_observer`](crate::anchored::Producer::subscribe_observer) always
+succeeds; and with zero anchors the producer free-runs exactly like the lossy
+ring.
+
+The rest of this page walks the SPSC behaviours in detail; where a
+multi-consumer ring differs, the matrix above is authoritative, and the
+[`spmc`](crate::spmc), [`spmc_bytes`](crate::spmc_bytes),
+[`broadcast`](crate::broadcast), [`broadcast_bytes`](crate::broadcast_bytes),
+[`anchored`](crate::anchored), and [`anchored_bytes`](crate::anchored_bytes)
+module docs carry the full per-machine story.
+
 # Producer-side `len`/`is_full` are approximate; the consumer side is exact
 
 The single most surprising counter behaviour: **the producer's view of how full
@@ -108,7 +155,10 @@ drop(again); // normal drop -> cursor advances, slot released to the producer
 The normal path — letting the guard fall out of scope — is what advances the
 cursor and hands the slot back. `mem::forget` is the only way to *not* consume
 after taking a guard, and it is occasionally useful (peek-and-retry), but it is
-never automatic and never accidental.
+never automatic and never accidental. (On the gating multi-consumer rings the
+same forget also **stalls the producer** — and therefore, eventually, every
+other consumer — because the un-advanced cursor is the gate; see the contract
+matrix above.)
 
 **Practical rule:** a guard consumes on drop; `mem::forget` means "deliver this
 again." Only reach for it when re-delivery is exactly what you want.
@@ -160,14 +210,15 @@ the whole interrupted drain; see the
 closure; the ring stays consistent and never silently re-delivers within the
 process. Just keep `drain` closures short.
 
-# There is exactly one producer and one consumer — the type system enforces it
+# The SPSC rings have exactly one producer and one consumer — the type system enforces it
 
-`rust-rb` is a single-producer, single-consumer ring, and the SPSC invariant is
-not a documentation promise you have to uphold — it is enforced by the types.
-The two halves are `Send`, so each can move to its own thread, but they are
-deliberately **not `Clone`**. There is no way to manufacture a second
-`Producer` or a second `Consumer` from a ring, so two writers or two readers
-simply cannot exist.
+[`RingBuffer`](crate::RingBuffer) and
+[`BytesRingBuffer`](crate::BytesRingBuffer) are single-producer,
+single-consumer rings, and the SPSC invariant is not a documentation promise
+you have to uphold — it is enforced by the types. The two halves are `Send`,
+so each can move to its own thread, but they are deliberately **not `Clone`**.
+There is no way to manufacture a second `Producer` or a second `Consumer` from
+an SPSC ring, so two writers or two readers simply cannot exist.
 
 ```rust,no_run
 use rust_rb::RingBuffer;
@@ -191,23 +242,32 @@ writer.join().unwrap();
 reader.join().unwrap();
 ```
 
-If you need more than one producer or consumer, you need a different data
-structure — this ring will not give you one. If you need the ring to span two
-*processes* rather than two threads, that is the shared-memory story, which
-still keeps one producer and one consumer, one per process; see the
+If you need more than one **consumer**, that is exactly what the
+multi-consumer rings are for: [`spmc`](crate::spmc) /
+[`spmc_bytes`](crate::spmc_bytes) (lossless, gating) and
+[`broadcast`](crate::broadcast) / [`broadcast_bytes`](crate::broadcast_bytes)
+(lossy) keep the single producer enforced by the types and let consumers
+`subscribe` dynamically. More than one **producer** is not supported by any
+ring in this crate. If you need a ring to span two *processes* rather than two
+threads, that is the shared-memory story; see the
 [shared-memory guide](crate::guide::shm_ipc).
 
-**Practical rule:** move one half to each thread; there is no supported way to
-have two of either side, and the compiler will stop you from trying.
+**Practical rule:** on the SPSC rings, move one half to each thread; there is
+no supported way to have two of either side, and the compiler will stop you
+from trying. For fan-out, switch machines rather than fighting the types.
 
 # Wrap-around is invisible, but cursor indices are opaque
 
-Internally the ring's cursors are monotonic counters that keep incrementing and
-wrap around the `usize` range; they are never reset to zero. Every occupancy
-check compares the **wrapped difference** `write.wrapping_sub(read)` — the true
-number of units in flight — never the absolute cursor values. That is why
-correctness holds even when a cursor rolls over the top of `usize` (on a 32-bit
-target this happens after 2^32 units; on 64-bit it is effectively unreachable).
+Internally the ring's cursors are monotonic counters that keep incrementing;
+they are never reset to zero. Every occupancy check compares the **wrapped
+difference** `write.wrapping_sub(read)` — the true number of units in flight —
+never the absolute cursor values. That is why correctness holds even when a
+cursor rolls over the top of its type (on a 32-bit target an SPSC `usize`
+cursor wraps after 2^32 units; on 64-bit it is effectively unreachable). The
+multi-consumer rings keep all positions in `u64` on every target — the lossy
+rings' lap detection relies on a strictly increasing generation series, and
+the gating rings share one registry engine in the same cursor domain — and a
+`u64` takes ~29 years to wrap at 10 G msgs/s.
 
 You never see any of this: the public API exposes occupancy through
 `len()`/`is_empty()`/`is_full()`/`capacity()`, all of which are already

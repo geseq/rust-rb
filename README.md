@@ -1,9 +1,12 @@
 # rust-rb
 
-High-performance **single-producer / single-consumer** (SPSC) ring buffer for
-Rust. A faithful port of the SPSC queue from
+High-performance **single-producer** ring buffers for Rust: an SPSC queue —
+a faithful port of the one in
 [`cpp-fastchan`](https://github.com/geseq/cpp-fastchan), keeping every design
-choice that makes the original fast and adding compile-time safety on top.
+choice that makes the original fast and adding compile-time safety on top —
+plus single-producer/**multi-consumer** broadcast rings (lossless, lossy, and a
+composed variant with required gating readers alongside lossy observers) built
+on the same engine.
 
 Pushes and pops can each be **blocking** or **non-blocking**, and the blocking
 wait behaviour is selectable: spin with a CPU pause hint, yield the thread, spin
@@ -67,12 +70,18 @@ must finish with the element before continuing.
 
 ### Wait strategies
 
-| Type         | Behaviour while waiting                          | Trade-off                       |
-| ------------ | ----------------------------------------------- | ------------------------------- |
-| `PauseWait`  | spin with `PAUSE`/`YIELD` hint                  | lowest latency, burns a core    |
-| `YieldWait`  | `thread::yield_now()` (default)                 | friendly to oversubscription    |
-| `NoOpWait`   | tight spin, no hint                             | lowest latency, most power      |
-| `CvWait`     | park on a condvar, recheck every 100 ns         | lowest CPU, highest latency     |
+| Type          | Behaviour while waiting                             | Trade-off                       |
+| ------------- | --------------------------------------------------- | ------------------------------- |
+| `PauseWait`   | spin with `PAUSE`/`YIELD` hint                      | lowest latency, burns a core    |
+| `YieldWait`   | `thread::yield_now()` (default)                     | friendly to oversubscription    |
+| `NoOpWait`    | tight spin, no hint                                 | lowest latency, most power      |
+| `SleepWait`   | fixed timed sleep (const `NANOS`, default 100 µs)   | lowest CPU that still works everywhere; timer-tick latency |
+| `BackoffWait` | spin → yield → escalating sleep (Aeron-style)       | fast in bursts, cheap when idle |
+| `CvWait`      | park on a condvar, recheck every 100 ns             | lowest CPU, highest latency; **SPSC in-process only** |
+
+All but `CvWait` are *self-timed* (`SelfTimed`): they make progress without a
+peer notification, which is why they — and only they — are accepted by the
+multi-consumer rings and the shared-memory constructors.
 
 ## What makes it fast
 
@@ -151,10 +160,71 @@ the producer when it drops.
 The framing, cursor caching, padding, and memory-ordering design is identical
 to the fixed-size ring; the wait strategies are shared between both.
 
+## Multi-consumer rings
+
+Six more rings broadcast one producer's stream to **many consumers**. Three
+policies × two payload shapes:
+
+|                    | Fixed `T`             | Byte messages                |
+| ------------------ | --------------------- | ---------------------------- |
+| **Gating** (lossless: the slowest consumer gates the producer) | `spmc::RingBuffer` | `spmc_bytes::BytesRingBuffer` |
+| **Lossy** (the producer never blocks; a lapped consumer loses messages and gets an exact count) | `broadcast::RingBuffer` | `broadcast_bytes::BytesRingBuffer` |
+| **Mixed** (required *anchors* gate the producer while unbounded lossy *observers* tap the same stream) | `anchored::RingBuffer` | `anchored_bytes::BytesRingBuffer` |
+
+Every ring stays single-producer (enforced by the types); consumers subscribe
+dynamically. Dropping the producer closes the ring — consumers drain what was
+published, then see `Closed`.
+
+**Gating** — every consumer sees every message; backpressure, never loss:
+
+```rust
+use rust_rb::spmc::{Closed, RingBuffer};
+
+let (mut tx, mut rx) = RingBuffer::new(1024);
+let mut rx2 = tx.subscribe().unwrap();   // dynamic membership
+
+tx.push(1u64);
+assert_eq!(rx.pop(), Ok(1));             // every consumer
+assert_eq!(rx2.pop(), Ok(1));            // sees every message
+
+drop(tx);                                // closes the ring
+assert_eq!(rx.pop(), Err(Closed));
+```
+
+**Lossy** — the producer free-runs; a lapped consumer is repositioned and told
+exactly how many messages it missed:
+
+```rust
+use rust_rb::broadcast::{PopError, RingBuffer};
+
+let (mut tx, mut rx) = RingBuffer::<u64>::with_slack(8, 2);
+for i in 0..20 {
+    tx.push(i);                          // never blocks
+}
+// Lapped: repositioned to tail - capacity + slack = 14, exact loss count.
+assert_eq!(rx.pop(), Err(PopError::Lagged { missed: 14 }));
+assert_eq!(rx.pop(), Ok(14));
+```
+
+Over shared memory, the lossy rings' consumers attach **lease-free over a
+read-only (`PROT_READ`) mapping** — a consumer cannot corrupt the ring no
+matter how it crashes, and dropping one is just an `munmap`.
+
+Honest performance notes (GB10 DGX Spark, Cortex-X925, pinned): a gating ring
+with one consumer runs at **0.99–1.06× SPSC** — the machinery is free until
+you fan out — and a straggling consumer is tracked, not amplified. Two
+caught-up-regime scaling findings are open and tracked (`rust-rb-vio`: gating
+producer +114% at N=4 caught-up consumers; `rust-rb-6l0`: tight-spinning
+caught-up broadcast readers couple the producer); correctness is unaffected.
+The broadcast rings' word-wise atomic payload copy is permanent — the
+volatile alternative lost the A/B in both directions (2.6× slower on pop at
+64 B, collapsing at 256 B).
+
 ## Shared memory / IPC (feature `shm`, Linux)
 
-Both rings can be backed by a mapped shared region so the producer and
-consumer live in **different processes** — same handle types, same hot paths:
+All eight rings can be backed by a mapped shared region so the producer and
+consumer(s) live in **different processes** — same handle types, same hot
+paths:
 
 ```rust,ignore
 use rust_rb::{memfd, BytesRingBuffer};
