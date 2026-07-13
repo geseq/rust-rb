@@ -66,8 +66,10 @@ impl SlotCleanup for Word {
     unsafe fn cleanup(&self) {}
 }
 
-/// Size of the length header preceding each payload.
-const HEADER: usize = 4;
+/// Size of the length header preceding each payload. Shared with
+/// `spmc_bytes` — the two rings' framing is normatively identical, so the
+/// constants and helpers have exactly one definition.
+pub(crate) const HEADER: usize = 4;
 /// Record alignment. Keeps every header read/write naturally aligned. Also
 /// the alignment shm attach validation enforces on stored cursors.
 pub(crate) const ALIGN: usize = 4;
@@ -76,16 +78,16 @@ pub(crate) const ALIGN: usize = 4;
 /// arithmetic underflows (shared with shm attach validation).
 pub(crate) const MIN_CAPACITY: usize = 8;
 /// Header value marking a padding record that runs to the end of the buffer.
-const PADDING: u32 = u32::MAX;
+pub(crate) const PADDING: u32 = u32::MAX;
 
 #[inline(always)]
-const fn align_up(n: usize) -> usize {
+pub(crate) const fn align_up(n: usize) -> usize {
     (n + (ALIGN - 1)) & !(ALIGN - 1)
 }
 
 /// Bytes a record with a `len`-byte payload occupies in the ring.
 #[inline(always)]
-const fn record_len(len: usize) -> usize {
+pub(crate) const fn record_len(len: usize) -> usize {
     align_up(HEADER + len)
 }
 
@@ -125,7 +127,7 @@ unsafe fn decode_record(base: *const u8, mask: usize, mut cur: usize) -> (usize,
 const MAX_PUBLISH_BATCH_BYTES: usize = 4096;
 
 #[inline(always)]
-const fn max_message_len(capacity: usize) -> usize {
+pub(crate) const fn max_message_len(capacity: usize) -> usize {
     // Records are capped at capacity / 2 (see module docs); the header is
     // part of the record. Also stay below the u32 header space, where
     // u32::MAX is reserved for padding.

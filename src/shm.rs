@@ -415,6 +415,15 @@ shm_item!(u8, u16, u32, u64, u128, usize, i8, i16, i32, i64, i128, isize, f32, f
 // SAFETY: arrays of plain data are plain data.
 unsafe impl<T: ShmItem, const N: usize> ShmItem for [T; N] {}
 
+// SAFETY: `Padded<T>` is a `repr(align(64))` newtype over `T` — the value
+// is the inner `T` plus trailing padding. Any bit pattern a peer writes
+// decodes as (any bit pattern of `T` — valid by `T: ShmItem`) plus padding
+// bytes, which carry no validity requirement. Provided here (not by the
+// user) because the orphan rule would otherwise seal `Padded` out of the
+// shm rings entirely — the gating shm rings are exactly where its fan-out
+// isolation applies.
+unsafe impl<T: ShmItem> ShmItem for crate::Padded<T> {}
+
 /// Create a memfd suitable for backing a shared ring.
 ///
 /// Created with close-on-exec set (the safe default — the fd does not leak
@@ -2616,15 +2625,16 @@ fn bcast_attach_producer_anchor(
     Ok(Box::new(BcastProducerAnchor::new(region, token)))
 }
 
-/// Element-type invariants for the broadcast element ring, enforced on
+/// Element-type invariants for every seqlock-slot ring (broadcast and
+/// anchored share the slot layout, so they share this check), enforced on
 /// create AND attach (as errors — fallible paths). The slot carries the seq
 /// word in front of the payload, so the alignment bound is the *slot's*.
-fn check_bcast_elem_type<T>() -> io::Result<()> {
+fn check_seqlock_elem_type<T>() -> io::Result<()> {
     let err = |m: &str| io::Error::new(io::ErrorKind::InvalidInput, m.to_string());
     if std::mem::size_of::<T>() == 0 {
         return Err(err("zero-sized elements are not supported in shm rings"));
     }
-    if crate::broadcast::shm_slot_align::<T>() > 128 {
+    if crate::seqlock::shm_slot_align::<T>() > 128 {
         return Err(err("element alignment exceeds the buffer offset alignment"));
     }
     Ok(())
@@ -2636,12 +2646,12 @@ fn open_bcast_elems<T: ShmItem + crate::broadcast::NoUninit>(
     fd: BorrowedFd<'_>,
     read_only: bool,
 ) -> io::Result<BcastOpened> {
-    check_bcast_elem_type::<T>()?;
+    check_seqlock_elem_type::<T>()?;
     open_bcast_region(
         fd,
         KIND_BCAST_ELEMS,
         std::mem::size_of::<T>(),
-        crate::broadcast::shm_slot_stride::<T>(),
+        crate::seqlock::shm_slot_stride::<T>(),
         BUFFER_OFFSET,
         1,
         1,
@@ -2724,7 +2734,7 @@ where
         min_capacity: usize,
         slack: usize,
     ) -> io::Result<crate::broadcast::Producer<T>> {
-        check_bcast_elem_type::<T>()?;
+        check_seqlock_elem_type::<T>()?;
         let capacity = crate::cursor::round_capacity(min_capacity, 1);
         if slack >= capacity {
             return Err(io::Error::new(
@@ -2737,7 +2747,7 @@ where
             KIND_BCAST_ELEMS,
             capacity,
             std::mem::size_of::<T>(),
-            crate::broadcast::shm_slot_stride::<T>(),
+            crate::seqlock::shm_slot_stride::<T>(),
             BUFFER_OFFSET,
             slack as u64,
         )?;
@@ -3889,20 +3899,6 @@ pub type AnchBytesPair<P, C> = (
     crate::anchored_bytes::BytesAnchor<P, C>,
 );
 
-/// Element-type invariants for the anchored element ring, enforced on
-/// create AND attach (as errors — fallible paths). The slot carries the seq
-/// word in front of the payload, so the alignment bound is the *slot's*.
-fn check_anch_elem_type<T>() -> io::Result<()> {
-    let err = |m: &str| io::Error::new(io::ErrorKind::InvalidInput, m.to_string());
-    if std::mem::size_of::<T>() == 0 {
-        return Err(err("zero-sized elements are not supported in shm rings"));
-    }
-    if crate::anchored::shm_slot_align::<T>() > 128 {
-        return Err(err("element alignment exceeds the buffer offset alignment"));
-    }
-    Ok(())
-}
-
 impl<T> crate::anchored::RingBuffer<T>
 where
     // All four bounds pull their weight: `ShmItem` asserts every bit pattern
@@ -4000,7 +3996,7 @@ where
     C: CrossProcess + SelfTimed + Send + Sync,
 {
     fn open(fd: BorrowedFd<'_>, read_only: bool) -> io::Result<AnchOpened> {
-        check_anch_elem_type::<T>()?;
+        check_seqlock_elem_type::<T>()?;
         // Capacity floor 2 = the heap constructor's floor (the empty-registry
         // gating default `next_seq - 1` needs it); element cursors are always
         // decodable, so no alignment constraint (align 1).
@@ -4008,7 +4004,7 @@ where
             fd,
             KIND_ANCH_ELEMS,
             std::mem::size_of::<T>(),
-            crate::anchored::shm_slot_stride::<T>(),
+            crate::seqlock::shm_slot_stride::<T>(),
             ANCH_ELEMS_TABLE_OFFSET,
             2,
             1,
@@ -4030,7 +4026,7 @@ where
         max_anchors: usize,
     ) -> io::Result<AnchElemPair<T, P, C>> {
         let capacity = crate::cursor::round_capacity(min_capacity, 2);
-        let slack = crate::anchored::shm_default_slack(capacity as u64);
+        let slack = crate::broadcast::shm_default_slack(capacity as u64);
         // SAFETY: forwarded caller contract.
         unsafe { Self::create_shm_with_slack(fd, min_capacity, max_anchors, slack as usize) }
     }
@@ -4055,7 +4051,7 @@ where
         max_anchors: usize,
         slack: usize,
     ) -> io::Result<AnchElemPair<T, P, C>> {
-        check_anch_elem_type::<T>()?;
+        check_seqlock_elem_type::<T>()?;
         let capacity = crate::cursor::round_capacity(min_capacity, 2);
         if slack >= capacity {
             return Err(io::Error::new(
@@ -4068,7 +4064,7 @@ where
             KIND_ANCH_ELEMS,
             capacity,
             std::mem::size_of::<T>(),
-            crate::anchored::shm_slot_stride::<T>(),
+            crate::seqlock::shm_slot_stride::<T>(),
             ANCH_ELEMS_TABLE_OFFSET,
             max_anchors,
             slack as u64,

@@ -174,27 +174,29 @@ use crate::wait::{SelfTimed, WaitStrategy, YieldWait};
 /// legitimately loads bytes the producer never wrote.
 type Word = UnsafeCell<u64>;
 
-/// Size of the length header preceding each payload.
-const HEADER: usize = 4;
+/// Size of the length header preceding each payload. (`pub(crate)`: shared
+/// with `anchored_bytes` — the two lossy byte rings' framing is normatively
+/// identical, so the constants and helpers have exactly one definition.)
+pub(crate) const HEADER: usize = 4;
 /// Record alignment: every record (and padding) start is 8-aligned, so
 /// headers are naturally aligned lanes and capacity multiples are record
 /// boundaries on every lap. (`pub(crate)`: the shm attach validates the
 /// region's tail against it.)
 pub(crate) const ALIGN: usize = 8;
 /// Header value marking a padding record that runs to the end of the buffer.
-const PADDING: u32 = u32::MAX;
+pub(crate) const PADDING: u32 = u32::MAX;
 /// Smallest legal capacity: one 8-byte record (an empty message).
 /// (`pub(crate)`: shared with the shm constructors so they cannot drift.)
 pub(crate) const MIN_CAPACITY: usize = 8;
 
 #[inline(always)]
-const fn align_up(n: usize) -> usize {
+pub(crate) const fn align_up(n: usize) -> usize {
     (n + (ALIGN - 1)) & !(ALIGN - 1)
 }
 
 /// Bytes a record with a `len`-byte payload occupies in the ring.
 #[inline(always)]
-const fn record_len(len: usize) -> usize {
+pub(crate) const fn record_len(len: usize) -> usize {
     align_up(HEADER + len)
 }
 
@@ -202,7 +204,7 @@ const fn record_len(len: usize) -> usize {
 /// Aeron bound — see the module docs; loss tolerance, not framing, binds),
 /// clamped below the `u32` header space where `u32::MAX` marks padding.
 #[inline(always)]
-const fn max_message_len(capacity: usize) -> usize {
+pub(crate) const fn max_message_len(capacity: usize) -> usize {
     let cap = capacity / 8;
     let header_space = (PADDING - 1) as usize;
     if cap < header_space {
@@ -213,21 +215,15 @@ const fn max_message_len(capacity: usize) -> usize {
 }
 
 /// Round a requested minimum capacity to the ring's real capacity: the next
-/// power of two, floor [`MIN_CAPACITY`].
+/// power of two, floor [`MIN_CAPACITY`], via the one crate-wide rounding
+/// policy — shared with the shm constructors so heap and shm cannot round
+/// the same request differently.
 ///
 /// # Panics
 ///
 /// Panics if `min_capacity == 0` or the rounding overflows `usize`.
 fn round_capacity(min_capacity: usize) -> usize {
-    assert!(min_capacity > 0, "capacity must be greater than zero");
-    let capacity = min_capacity
-        .checked_next_power_of_two()
-        .expect("capacity too large to round up to a power of two");
-    if capacity < MIN_CAPACITY {
-        MIN_CAPACITY
-    } else {
-        capacity
-    }
+    crate::cursor::round_capacity(min_capacity, MIN_CAPACITY)
 }
 
 /// Error returned by consumer pops.

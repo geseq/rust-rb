@@ -1,13 +1,13 @@
 [package]
 name = "rust-rb"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.70"
-description = "High-performance SPSC ring buffers — fixed-size items and variable-size byte messages — with selectable wait strategies. A faithful Rust port of cpp-fastchan."
+description = "High-performance single-producer ring buffers: SPSC, gating SPMC, lossy broadcast, and mixed anchored rings — element and byte-message variants, heap or shared-memory (IPC) backed, with selectable wait strategies."
 license = "MIT"
 repository = "https://github.com/geseq/rust-rb"
 readme = "README.md"
-keywords = ["spsc", "ipc", "ringbuffer", "queue", "lockfree"]
+keywords = ["spsc", "spmc", "ipc", "ringbuffer", "lockfree"]
 categories = ["concurrency", "data-structures"]
 
 [lib]

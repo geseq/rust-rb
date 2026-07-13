@@ -52,7 +52,10 @@
 //! producer must advance at least `slack` more before this consumer can lag
 //! again. Larger slack = fewer, bigger loss events; smaller = maximal
 //! salvage. For self-contained streams (market data), skip recovery entirely
-//! with [`Consumer::skip_to_latest`].
+//! with [`Consumer::skip_to_latest`]. (Under
+//! [`Producer::set_tail_batch`] the post-reposition headroom is `slack`
+//! minus the producer's unpublished debt — at least `slack - (batch - 1)`;
+//! the batch clamp keeps that ≥ 1.)
 //!
 //! # Membership
 //!
@@ -84,7 +87,9 @@
 //! * **Consumers spin on the shared `tail`, not the slot generations**: the
 //!   producer writes each slot's seqlock word 2–3× per message, so parking
 //!   spinners there would put per-message stores on a polled line. The tail
-//!   is one cursor line written once per push — the SPSC caught-up profile.
+//!   is one cursor line written once per push by default — the SPSC
+//!   caught-up profile — or once per batch under
+//!   [`Producer::set_tail_batch`].
 //! * **Per-slot seqlock, validate-only**: one generation fetch before the
 //!   copy, one fence + re-check after. Torn bytes are discarded as
 //!   `MaybeUninit` and never materialized as `T`.
@@ -107,8 +112,9 @@ use std::ptr::NonNull;
 use std::sync::atomic::{fence, AtomicU64, Ordering};
 use std::sync::Arc;
 
-use crate::atomic_copy::{read_payload, write_payload};
+use crate::atomic_copy::write_payload;
 use crate::cache_padded::CachePadded;
+use crate::seqlock::{read_valid, Slot};
 use crate::wait::{SelfTimed, WaitStrategy, YieldWait};
 
 /// Marker for element types whose value representation has **no padding
@@ -205,24 +211,23 @@ impl core::fmt::Display for PopError {
 impl std::error::Error for PopError {}
 
 /// Round a requested minimum capacity to the ring's real capacity: the next
-/// power of two (floor 1 — there is no gating machinery a tiny ring could
-/// break; capacity 1 is a "latest value" cell).
+/// power of two, via the one crate-wide rounding policy (floor 1 — there is
+/// no gating machinery a tiny ring could break; capacity 1 is a "latest
+/// value" cell). Shared with the shm constructors so heap and shm cannot
+/// round the same request differently.
 ///
 /// # Panics
 ///
 /// Panics if `min_capacity == 0` or the rounding overflows `usize`.
 fn round_capacity(min_capacity: usize) -> usize {
-    assert!(min_capacity > 0, "capacity must be greater than zero");
-    min_capacity
-        .checked_next_power_of_two()
-        .expect("capacity too large to round up to a power of two")
+    crate::cursor::round_capacity(min_capacity, 1)
 }
 
 /// The default reposition slack: `capacity / 8`, clamped to at least 1 (and
 /// to 0 for a capacity-1 ring, where any positive slack would reach the
 /// unwritten future).
 #[inline]
-const fn default_slack(capacity: u64) -> u64 {
+pub(crate) const fn default_slack(capacity: u64) -> u64 {
     if capacity == 1 {
         0
     } else {
@@ -239,29 +244,13 @@ const fn default_slack(capacity: u64) -> u64 {
 /// underflow-safe (a stale tail observation cannot wrap below zero — the
 /// caller additionally clamps to never move backwards).
 #[inline(always)]
-const fn reposition_target(tail: u64, capacity: u64, slack: u64) -> u64 {
+pub(crate) const fn reposition_target(tail: u64, capacity: u64, slack: u64) -> u64 {
     tail.saturating_add(slack).saturating_sub(capacity)
 }
 
-/// One ring slot: a per-slot seqlock.
-///
-/// `seq` encodes `2·s + phase` for global sequence `s`: `2s + 1` while
-/// message `s` is being written, `2s + 2` once it is published, `0`
-/// initially (below every expected value — an untouched slot can never be
-/// accepted). The series one slot takes (`2s+1, 2s+2, 2(s+capacity)+1, …`)
-/// is strictly increasing, so exact-match acceptance is generation-unique.
-///
-/// `repr(C)` pins the payload at offset `max(8, align_of::<T>())` from an
-/// (at least) 8-aligned base — always a multiple of the machine word, which
-/// the word-wise copy helpers require (and debug-assert).
-#[repr(C)]
-struct Slot<T> {
-    seq: AtomicU64,
-    data: UnsafeCell<MaybeUninit<T>>,
-}
-
 /// The producer-published cache line: the tail (count of published
-/// messages, stored once per push) plus, co-located in the same padded slot,
+/// messages, stored once per push by default — amortized under
+/// `Producer::set_tail_batch`) plus, co-located in the same padded slot,
 /// the `closed` flag (written once by `Producer::drop`, read only on
 /// consumer would-block paths — the line consumers already poll).
 ///
@@ -401,7 +390,10 @@ where
         let producer = Producer {
             buf,
             mask: shared.mask,
+            slack: shared.slack,
             next_seq: 0,
+            tail_batch: 1,
+            unpublished: 0,
             tail,
             closed,
             anchor: ProducerAnchor::Heap(shared),
@@ -492,9 +484,21 @@ pub struct Producer<T> {
     buf: NonNull<Slot<T>>,
     /// `capacity - 1` (cached).
     mask: u64,
+    /// The ring's reposition slack (cached; ring-wide config). Bounds
+    /// [`set_tail_batch`](Self::set_tail_batch): unpublished debt must stay
+    /// below the headroom a lapped consumer repositions with, or the
+    /// consumer can land in slots the unpublished frontier already
+    /// overwrote (a Lagged{missed: 0} livelock on an idle producer).
+    slack: u64,
     /// Next sequence to write (producer-private; equals the published tail
-    /// between pushes).
+    /// between pushes whenever `unpublished == 0`).
     next_seq: u64,
+    /// Publish the tail at least every this many pushes (default 1 —
+    /// per-push, the exact-visibility baseline). See
+    /// [`set_tail_batch`](Self::set_tail_batch).
+    tail_batch: u64,
+    /// Pushes since the last tail publication (always `< tail_batch`).
+    unpublished: u64,
     /// The shared tail (cached raw pointer; heap: into the `Arc`, shm: into
     /// the mapped region — the hot publish path is identical).
     tail: NonNull<AtomicU64>,
@@ -519,10 +523,97 @@ impl<T> Drop for Producer<T> {
         // fork-inherited copy or superseded zombie must not end the
         // successor's session.
         if self.anchor.teardown_allowed() {
+            // Publish any tail debt a `set_tail_batch` window is holding —
+            // closed-and-drained must mean drained of *everything pushed*.
+            // Same guard as the close flag: a superseded zombie or
+            // fork-inherited copy must not touch the successor's tail
+            // (regressing it behind consumers or past a successor's
+            // frontier would corrupt the ring — see the shm zombie test).
+            self.flush();
             // SAFETY: `closed` points into shared state the anchor keeps
             // alive.
             unsafe { self.closed.as_ref() }.store(1, Ordering::Release);
         }
+    }
+}
+
+// Tail-publication plumbing — deliberately free of the `NoUninit` bound (it
+// never touches `T`), and deliberately the ONLY place the shared tail is
+// stored: push's boundary branch, `flush`, and `Drop` all funnel through
+// `publish_tail`, so an ordering/protocol fix cannot reach one publish path
+// and miss another.
+impl<T> Producer<T> {
+    /// The one Release store of the shared tail.
+    #[inline]
+    fn publish_tail(&mut self) {
+        self.unpublished = 0;
+        // SAFETY: `tail` points into shared state the anchor keeps alive.
+        unsafe { self.tail.as_ref() }.store(self.next_seq, Ordering::Release);
+    }
+
+    /// Publish everything pushed so far, making it visible to consumers
+    /// immediately.
+    ///
+    /// A no-op at the default per-push publication; under
+    /// [`set_tail_batch`](Self::set_tail_batch) call this at burst
+    /// boundaries so the tail never trails a quiet producer.
+    #[inline]
+    pub fn flush(&mut self) {
+        if self.unpublished > 0 {
+            self.publish_tail();
+        }
+    }
+
+    /// Publish the tail at least every `batch` pushes instead of on every
+    /// push. `1` — the default — restores exact per-push visibility.
+    /// Returns the batch actually applied: the request is clamped to
+    /// `[1, min(capacity / 8, slack)]`, so a ring with `capacity < 16` or
+    /// [slack](RingBuffer::with_slack)` < 2` never batches (the return
+    /// value is `1`) — check it.
+    ///
+    /// **The trade**: caught-up *spinning* consumers pull the tail line
+    /// away after every store, so per-push publication couples the
+    /// producer to its readers — on a GB10/X925, 4.5 ns/push alone became
+    /// 24.6 / 33.9 / 50.1 ns with 1/2/4 spinning readers, and `batch = 8`
+    /// cut those to 15.2 and 19.7 at k=1 and k=4 (`rust-rb-6l0`). In
+    /// exchange:
+    ///
+    /// * Up to `batch - 1` already-pushed messages stay invisible until
+    ///   the next boundary, [`flush`](Self::flush), or producer drop —
+    ///   keep the default for latency-critical or bursty streams, or
+    ///   `flush` when going idle.
+    /// * **Crash loss widens**: only a *graceful* drop flushes the debt,
+    ///   so a process that dies mid-window (`SIGKILL`, abort) forfeits up
+    ///   to `batch - 1` messages `push` had already accepted — on a
+    ///   shared-memory ring a recovering producer will overwrite them
+    ///   unseen. Keep the default where crash-tolerance is sized in
+    ///   single messages.
+    /// * A lapped consumer's post-reposition headroom shrinks from the
+    ///   documented `slack` to `slack - debt` — at least
+    ///   `slack - (batch - 1)`, which the clamp keeps ≥ 1. Batching
+    ///   therefore trades some of the slack's lag-storm protection for
+    ///   producer throughput; prefer a larger
+    ///   [`with_slack`](RingBuffer::with_slack) when enabling it.
+    ///
+    /// The rest is unchanged: consumers never see torn records (the
+    /// per-slot seqlock validates independently of the tail), `Lagged`
+    /// accounting stays exact against the published frontier, and a
+    /// subscriber's join point is the published tail.
+    #[must_use = "the request is clamped — a small or low-slack ring may not batch at all"]
+    pub fn set_tail_batch(&mut self, batch: usize) -> usize {
+        // The slack bound is a correctness clamp, not tuning: debt must
+        // stay below the reposition headroom, or a lapped consumer lands
+        // in slots the unpublished frontier already overwrote and spins on
+        // Lagged{missed: 0} until the producer happens to publish.
+        let max = ((self.mask + 1) / 8).min(self.slack).max(1);
+        let batch = (batch as u64).clamp(1, max);
+        self.tail_batch = batch;
+        // Shrinking the window must not leave an already-oversized debt
+        // pending past the new bound.
+        if self.unpublished >= batch {
+            self.publish_tail();
+        }
+        batch as usize
     }
 }
 
@@ -551,11 +642,17 @@ impl<T: NoUninit> Producer<T> {
         // Publish the slot: an exact-match reader accepts generation 2s+2.
         slot.seq.store(2 * s + 2, Ordering::Release);
         self.next_seq = s + 1;
-        // Publish the frontier — per push [P-F4]: this is the only line
-        // consumers spin on, and it makes `Lagged` counts and subscribe
-        // join points exact for free.
-        // SAFETY: `tail` points into shared state the anchor keeps alive.
-        unsafe { self.tail.as_ref() }.store(self.next_seq, Ordering::Release);
+        // Publish the frontier: per push by default [P-F4] — the tail is
+        // the only line consumers spin on, and per-push publication makes
+        // visibility, `Lagged` counts, and subscribe join points exact for
+        // free. Under `set_tail_batch(n)` the store is amortized to every
+        // n-th push: caught-up spinning readers steal the tail line on
+        // every store, so each skipped store is a coherence round the
+        // producer does not pay (`rust-rb-6l0`).
+        self.unpublished += 1;
+        if self.unpublished >= self.tail_batch {
+            self.publish_tail();
+        }
     }
 
     /// Subscribe a new consumer with wait strategy `C`; its join point is
@@ -589,8 +686,12 @@ impl<T: NoUninit> Producer<T> {
         }
     }
 
-    /// Number of messages published so far (the ring's frontier).
-    /// Producer-local and exact.
+    /// Number of messages **pushed** so far. Producer-local and exact.
+    ///
+    /// This is also the published frontier, except under
+    /// [`set_tail_batch`](Self::set_tail_batch), where the published tail
+    /// may trail it by up to `batch - 1` messages until the next boundary,
+    /// [`flush`](Self::flush), or drop.
     #[inline]
     pub fn tail(&self) -> u64 {
         self.next_seq
@@ -782,7 +883,8 @@ impl<T: NoUninit, C: WaitStrategy> Consumer<T, C> {
 
     /// Spin/park (per this consumer's wait strategy) until a message is
     /// available or the ring is closed and drained. The wait spins on the
-    /// shared **tail** (one line, stored once per push), never on a slot's
+    /// shared **tail** (one line, stored once per push by default —
+    /// amortized under `Producer::set_tail_batch`), never on a slot's
     /// seqlock word [P-F4]; its predicate also checks `closed` [A-1.2].
     #[inline(always)]
     fn wait_for_item(&mut self) -> Result<(), PopError> {
@@ -809,31 +911,11 @@ impl<T: NoUninit, C: WaitStrategy> Consumer<T, C> {
     #[inline]
     fn read_slot(&mut self) -> Result<T, PopError> {
         let s = self.pos;
-        let slot = self.slot(s);
-        let expected = 2 * s + 2;
-        // Because the tail is Release-stored after the slot publish and we
-        // Acquire-read `tail > s`, the generation here is at least
-        // `expected` — an "empty" slot is unobservable past the tail check.
-        let v1 = slot.seq.load(Ordering::Acquire);
-        debug_assert!(v1 >= expected, "slot behind the published tail");
-        if v1 == expected {
-            let mut out = MaybeUninit::<T>::uninit();
-            // SAFETY: the slot was published at least once (generation
-            // reached `expected`), so every payload byte is initialized;
-            // torn bytes stay `MaybeUninit` until revalidation below.
-            unsafe { read_payload(slot.data.get(), &mut out) };
-            // Order the payload loads before the revalidating load: fence +
-            // relaxed re-load is the sound shape (an `Acquire` re-load
-            // would order the wrong direction) [M-F11].
-            fence(Ordering::Acquire);
-            let v2 = slot.seq.load(Ordering::Relaxed);
-            if v2 == v1 {
-                self.pos = s + 1;
-                // SAFETY: generation unchanged across the copy — the bytes
-                // are the complete, untorn message `s`; `T: NoUninit` makes
-                // every byte pattern of a published value initialized data.
-                return Ok(unsafe { out.assume_init() });
-            }
+        // The caller established `tail > s`, which is `read_valid`'s
+        // precondition (tail Release-stored after the slot publish).
+        if let Some(v) = read_valid(self.slot(s), 2 * s + 2) {
+            self.pos = s + 1;
+            return Ok(v);
         }
         // Lapped: the slot moved on to a newer generation (or tore the
         // copy). Reposition first, then report [A-3].
@@ -872,26 +954,6 @@ impl<T: NoUninit, C: WaitStrategy> Consumer<T, C> {
 // accidental store regression is a deterministic SIGSEGV.
 // ---------------------------------------------------------------------------
 
-/// The byte stride of one shm slot: `size_of::<Slot<T>>()`. The `repr(C)`
-/// slot is `{ seq: AtomicU64, data: T-storage }`, so the stride is
-/// `align_up(8 + size_of::<T>(), align_of::<Slot<T>>())` with
-/// `align_of::<Slot<T>>() == max(8, align_of::<T>())` — the layout math the
-/// shm region create/open share (the header's `unit_size` records
-/// `size_of::<T>()` for type validation; the physical region length uses
-/// this stride).
-#[cfg(all(feature = "shm", target_os = "linux", target_has_atomic = "64"))]
-pub(crate) fn shm_slot_stride<T>() -> usize {
-    size_of::<Slot<T>>()
-}
-
-/// Alignment of one shm slot (see [`shm_slot_stride`]); the shm buffer
-/// offset is 128-aligned, so alignments above 128 are rejected at
-/// construction.
-#[cfg(all(feature = "shm", target_os = "linux", target_has_atomic = "64"))]
-pub(crate) fn shm_slot_align<T>() -> usize {
-    std::mem::align_of::<Slot<T>>()
-}
-
 /// The default-slack policy, shared with the shm constructors so they cannot
 /// drift from the heap ring's.
 #[cfg(all(feature = "shm", target_os = "linux", target_has_atomic = "64"))]
@@ -921,12 +983,16 @@ impl<T> Producer<T> {
         let tail = NonNull::from(region.bcast_tail());
         let closed = NonNull::from(region.bcast_closed());
         let buf = region.bcast_elem_buffer().cast::<Slot<T>>();
+        let slack = region.bcast_slack();
         // SAFETY: `tail` references the live mapping (per contract).
         let next_seq = unsafe { tail.as_ref() }.load(Ordering::Acquire);
         Producer {
             buf,
             mask: capacity as u64 - 1,
+            slack,
             next_seq,
+            tail_batch: 1,
+            unpublished: 0,
             tail,
             closed,
             anchor: ProducerAnchor::Shm(anchor),

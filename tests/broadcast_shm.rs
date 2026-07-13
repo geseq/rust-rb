@@ -722,6 +722,44 @@ fn dead_producer_tail_below_pos_drains_to_closed_element() {
     );
 }
 
+#[test]
+fn superseded_zombie_drop_never_flushes_tail_debt() {
+    // The drop-flush of set_tail_batch debt sits behind the SAME teardown
+    // guard as the close flag: a superseded zombie's exit must not
+    // Release-store its stale frontier over the live session's tail
+    // (regressing it behind consumers or past the successor's own writes).
+    let fd = memfd("bcast-zombie-debt").unwrap();
+    // SAFETY: fresh private memfd; u64 is ShmItem.
+    let mut tx = unsafe { RingBuffer::<u64>::create_shm(fd.as_fd(), 64) }.unwrap();
+    assert_eq!(tx.set_tail_batch(8), 8, "default slack 8 permits batch 8");
+    for i in 0..10u64 {
+        tx.push(i); // published 8 (one boundary), debt 2
+    }
+    assert_eq!(peek_u64(fd.as_fd(), OFF_TAIL), 8);
+
+    // The operator declares the producer dead and recovers; the old handle
+    // is now a superseded zombie still holding 2 messages of debt.
+    // SAFETY: the old handle is treated as dead from here on (it only
+    // drops).
+    let tx2 = unsafe { RingBuffer::<u64>::force_attach_shm_producer(fd.as_fd()) }.unwrap();
+    assert_eq!(tx2.tail(), 8, "successor resumes from the published tail");
+
+    drop(tx); // zombie drop: must touch NOTHING
+    assert_eq!(
+        peek_u64(fd.as_fd(), OFF_TAIL),
+        8,
+        "a superseded zombie must not flush its tail debt"
+    );
+    assert_eq!(
+        peek_u64(fd.as_fd(), OFF_CLOSED),
+        0,
+        "a superseded zombie must not close the session"
+    );
+
+    drop(tx2); // the live lease holder closes gracefully
+    assert_eq!(peek_u64(fd.as_fd(), OFF_CLOSED), 1);
+}
+
 // ---------------------------------------------------------------------------
 // 6. Closed across processes: graceful producer drop -> the child drains
 //    then sees Closed; a new producer attach reopens the session.

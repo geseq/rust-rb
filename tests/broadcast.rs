@@ -543,3 +543,144 @@ fn custom_no_uninit_struct_round_trips() {
     assert_eq!(rx.pop(), Ok(Tick { price: 102, qty: 9 }));
     assert_eq!(rx.try_pop(), Ok(None));
 }
+
+// -----------------------------------------------------------------------------
+// 12. BATCHED TAIL PUBLICATION (set_tail_batch / flush)
+// -----------------------------------------------------------------------------
+
+#[test]
+fn tail_batch_defers_visibility_until_boundary_flush_or_drop() {
+    let (mut tx, mut rx) = RingBuffer::<u64>::new(64);
+    assert_eq!(tx.set_tail_batch(4), 4);
+
+    // Below the boundary: pushed but unpublished — invisible.
+    tx.push(0);
+    tx.push(1);
+    assert_eq!(rx.try_pop(), Ok(None));
+
+    // flush publishes the debt immediately.
+    tx.flush();
+    assert_eq!(rx.pop(), Ok(0));
+    assert_eq!(rx.pop(), Ok(1));
+
+    // Crossing the boundary publishes automatically (4 pushes since flush).
+    tx.push(2);
+    tx.push(3);
+    tx.push(4);
+    assert_eq!(rx.try_pop(), Ok(None), "3 < batch: still deferred");
+    tx.push(5);
+    for want in 2..=5 {
+        assert_eq!(rx.pop(), Ok(want));
+    }
+
+    // Drop publishes the remainder before closing: closed-and-drained
+    // must deliver everything pushed.
+    tx.push(6);
+    drop(tx);
+    assert_eq!(rx.pop(), Ok(6));
+    assert_eq!(rx.pop(), Err(PopError::Closed));
+}
+
+#[test]
+fn tail_batch_is_clamped_and_shrinking_flushes_excess_debt() {
+    let (mut tx, mut rx) = RingBuffer::<u64>::new(64);
+    // capacity / 8 = 8 is the ceiling (default slack is also 8); 0 floors
+    // to 1.
+    assert_eq!(tx.set_tail_batch(10_000), 8);
+    assert_eq!(tx.set_tail_batch(0), 1);
+
+    // The slack bound: unpublished debt must stay below the reposition
+    // headroom, so batching never outruns the ring's slack — a lapped
+    // consumer would otherwise land in slots the unpublished frontier
+    // already overwrote and spin on Lagged{missed: 0} against an idle
+    // producer.
+    let (mut tx2, _rx2) = RingBuffer::<u64>::with_slack(64, 2);
+    assert_eq!(tx2.set_tail_batch(8), 2, "clamped to the ring's slack");
+    let (mut tx3, _rx3) = RingBuffer::<u64>::with_slack(64, 0);
+    assert_eq!(tx3.set_tail_batch(8), 1, "a slack-0 ring cannot batch");
+
+    // Build up debt under a wide window, then shrink the window: the
+    // now-oversized debt must flush rather than linger past the new bound.
+    assert_eq!(tx.set_tail_batch(8), 8);
+    for i in 0..5 {
+        tx.push(i);
+    }
+    assert_eq!(rx.try_pop(), Ok(None), "5 < 8: deferred");
+    assert_eq!(tx.set_tail_batch(2), 2);
+    for want in 0..5 {
+        assert_eq!(rx.pop(), Ok(want), "shrink flushed the oversized debt");
+    }
+}
+
+#[test]
+fn lagged_accounting_stays_exact_under_tail_batch() {
+    // The property under test: `Lagged` accounting stays exact while the
+    // published tail TRAILS the pushed frontier — so the schedule must
+    // interleave pops with outstanding publication debt, not drain a
+    // fully-flushed ring (which is indistinguishable from per-push).
+    let (mut tx, mut rx) = RingBuffer::<u64>::with_slack(64, 8);
+    assert_eq!(tx.set_tail_batch(8), 8, "the ring must genuinely batch");
+    let (mut accepted, mut missed, mut pushed) = (0u64, 0u64, 0u64);
+
+    fn drain(rx: &mut Consumer<u64>, accepted: &mut u64, missed: &mut u64) {
+        loop {
+            match rx.try_pop() {
+                Ok(Some(_)) => *accepted += 1,
+                Ok(None) => break,
+                Err(PopError::Lagged { missed: m }) => *missed += m,
+                Err(PopError::Closed) => unreachable!("producer alive"),
+            }
+        }
+    }
+
+    // Phase 1 — lap with outstanding debt: 100 pushes publish only 96
+    // (12 boundaries), so the consumer's reposition runs against a tail
+    // that trails the frontier by 4.
+    for _ in 0..100 {
+        tx.push(pushed);
+        pushed += 1;
+    }
+    drain(&mut rx, &mut accepted, &mut missed);
+    assert_eq!(
+        accepted + missed,
+        96,
+        "exactly the published prefix is accounted; 4 pushed messages \
+         are still invisible debt"
+    );
+    tx.flush();
+    drain(&mut rx, &mut accepted, &mut missed);
+    assert_eq!(accepted + missed, pushed, "flush surfaces the debt");
+
+    // Phase 2 — stepped trailing tails: small bursts drained while the
+    // debt cycles through every residue of the batch window.
+    for _ in 0..50 {
+        for _ in 0..3 {
+            tx.push(pushed);
+            pushed += 1;
+        }
+        drain(&mut rx, &mut accepted, &mut missed);
+    }
+    tx.flush();
+    drain(&mut rx, &mut accepted, &mut missed);
+    assert_eq!(accepted + missed, pushed, "exact across stepped windows");
+
+    // Phase 3 — close with debt outstanding: drop flushes, then closes;
+    // closed-and-drained must deliver everything ever pushed.
+    for _ in 0..70 {
+        tx.push(pushed);
+        pushed += 1;
+    }
+    drop(tx);
+    loop {
+        match rx.pop() {
+            Ok(_) => accepted += 1,
+            Err(PopError::Lagged { missed: m }) => missed += m,
+            Err(PopError::Closed) => break,
+        }
+    }
+    assert_eq!(
+        accepted + missed,
+        pushed,
+        "exact loss accounting under batching, end to end"
+    );
+}

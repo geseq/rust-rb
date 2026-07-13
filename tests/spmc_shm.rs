@@ -179,6 +179,22 @@ fn peek_u64(fd: BorrowedFd<'_>, off: usize) -> u64 {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn padded_element_ring_round_trips_in_shm() {
+    // Padded<T> is the spmc fan-out mitigation and must work over shm:
+    // ShmItem is provided in-crate (the orphan rule would otherwise seal
+    // it out entirely).
+    let fd = memfd("spmc-padded-roundtrip").unwrap();
+    // SAFETY: fresh private memfd; Padded<u64> is ShmItem via u64.
+    let (mut tx, mut rx) =
+        unsafe { RingBuffer::<rust_rb::Padded<u64>>::create_shm(fd.as_fd(), 64, 4) }.unwrap();
+    for i in 0..200u64 {
+        tx.push(rust_rb::Padded::new(i));
+        assert_eq!(rx.pop().map(|v| *v), Ok(i));
+    }
+    assert_eq!(rx.try_pop().map(|o| o.map(|v| *v)), Ok(None));
+}
+
+#[test]
 fn element_ring_round_trips_in_shm() {
     let fd = memfd("spmc-elem-roundtrip").unwrap();
     // SAFETY: fresh private memfd; u64 is ShmItem.
