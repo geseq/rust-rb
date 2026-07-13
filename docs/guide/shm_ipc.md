@@ -374,6 +374,13 @@ attach time: it floors its declared-write frontier at the dead producer's
 consumer's validation window) and repairs the lap-recovery jump target to the
 last committed record. You call one constructor; the healing is automatic.
 
+One sizing note for the element ring: under
+[`set_tail_batch`](crate::broadcast::Producer::set_tail_batch) a crash
+forfeits not just the push in flight but the whole unpublished window — up
+to `batch - 1` messages `push` had already accepted (only a *graceful* drop
+flushes the debt; a dead producer's successor overwrites them unseen). Keep
+the per-push default where crash-tolerance is sized in single messages.
+
 ### Mixed rings: an anchor table *and* lease-free observers
 
 The anchored pair ([`anchored`](crate::anchored),

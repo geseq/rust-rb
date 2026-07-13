@@ -299,6 +299,10 @@ producer, writing message s into slot (s & mask):
                                      //  compiler-hoistable above the fence
   seq.store(2s+2, Release)          // publish slot
   tail.store(s, Release)            // publish frontier — PER PUSH [P-F4]
+                                     //  (0.2.0 addendum: amortizable via
+                                     //  the opt-in set_tail_batch knob —
+                                     //  clamped to slack; default stays
+                                     //  per-push. See rust-rb-6l0.)
 
 consumer at position s (hot path):
   spin on tail (Acquire) until tail >= s      // NOT on the slot seq!

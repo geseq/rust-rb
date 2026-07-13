@@ -212,13 +212,16 @@ matter how it crashes, and dropping one is just an `munmap`.
 
 Honest performance notes (GB10 DGX Spark, Cortex-X925, pinned): a gating ring
 with one consumer runs at **0.99–1.06× SPSC** — the machinery is free until
-you fan out — and a straggling consumer is tracked, not amplified. Two
-caught-up-regime scaling findings are open and tracked (`rust-rb-vio`: gating
-producer +114% at N=4 caught-up consumers; `rust-rb-6l0`: tight-spinning
-caught-up broadcast readers couple the producer); correctness is unaffected.
-The broadcast rings' word-wise atomic payload copy is permanent — the
-volatile alternative lost the A/B in both directions (2.6× slower on pop at
-64 B, collapsing at 256 B).
+you fan out — and a straggling consumer is tracked, not amplified. The two
+caught-up-regime scaling shapes were root-caused and each ships a mitigation
+knob: gating N-scaling is adjacent-slot false sharing — wrap the element in
+`Padded<T>` and the curve is flat (3.9/3.9/4.1 ns at N=1/2/4 vs
+3.7/7.0/12.7); lossy k-coupling is the per-push tail store into spinning
+readers — `Producer::set_tail_batch(8)` cuts k=1/4 from 24.6/50.1 to
+15.2/19.7 ns/push at a documented visibility/crash-loss trade (defaults
+unchanged: exact per-push). The broadcast rings' word-wise atomic payload
+copy is permanent — the volatile alternative lost the A/B in both directions
+(2.6× slower on pop at 64 B, collapsing at 256 B).
 
 ## Shared memory / IPC (feature `shm`, Linux)
 

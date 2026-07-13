@@ -63,6 +63,11 @@ Consumers read in place ([`pop_ref`](crate::spmc::Consumer::pop_ref) borrows
 consumer that stops consuming eventually blocks the producer — that is the
 gating contract.
 
+Fan-out-heavy rings (several caught-up consumers) scale flat when the
+element is wrapped in [`Padded<T>`](crate::Padded) — one cache line per
+slot; see the [configuration guide](crate::guide::configuration) for the
+footprint trade.
+
 ### Gating multicast, byte messages: `spmc_bytes::BytesRingBuffer`
 
 The same contract for variable-length byte messages, with the SPSC byte
@@ -101,7 +106,12 @@ assert_eq!(rx.pop(), Ok(14));
 Element types need the [`NoUninit`](crate::NoUninit) bound (no padding bytes:
 payloads are copied word-wise atomically), and consumer wait strategies must
 be [`SelfTimed`](crate::SelfTimed) — see the
-[configuration guide](crate::guide::configuration).
+[configuration guide](crate::guide::configuration). Throughput pipelines
+with caught-up *spinning* readers can amortize the producer's tail
+publication with
+[`set_tail_batch`](crate::broadcast::Producer::set_tail_batch)/[`flush`](crate::broadcast::Producer::flush)
+— a measured 1.6–2.5× producer win with documented visibility and
+crash-loss trades; the configuration guide covers when (not) to.
 
 ### Lossy broadcast, byte messages: `broadcast_bytes::BytesRingBuffer`
 
